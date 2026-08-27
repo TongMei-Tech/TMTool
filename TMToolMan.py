@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # 以下为您编写的“同美档案工具集合”Python代码。代码采用PyQt5框架构建，界面采用深色科技感配色，左侧为菜单栏，右侧为动态切换的功能区。
 #
 # 请确保在运行前安装依赖库：`pip
@@ -6,6 +7,60 @@
 # `
 #
 # ```python
+
+# ============================ 版本与修改记录 ============================
+# 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
+# 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
+# 便于区分不同打包版本。
+VERSION = "3.8"
+
+CHANGELOG = [
+    # 新版本记录追加在此列表头部(最新在前)
+    {
+        "version": "3.8",
+        "date": "2026-08-27",
+        "changes": [
+            "新增生成档案馆标准目录功能: 解析编码子目录名(全宗-类型·年度-期限代码-项目-卷号, 如J380-ZY·2021-Y-FGC-0001)按模板xlsx批量生成案卷级标准目录; 案卷级档号=目录名, 期限代码Y/D30/D10映射永久/30年/10年(代码与中文两列), 总页数=子目录xlsx序号最大行页码列最大值; 编码目录递归查找, 按上级目录名分组输出; 输出目录可选缺省为数据目录下档案馆标准目录子目录; 模板列名自适应", 
+        ],
+    },
+    {
+        "version": "3.7",
+        "date": "2026-08-27",
+        "changes": [
+            "修复JPG转双层PDF开启GPU的OCR时生成单层PDF(同样文件CPU模式为双层)的问题：① GPU模式OCR初始化失败(抛异常而非挂死)时原逻辑不做CPU回退直接降级仅图像单层PDF，现改为强制CPU重建后重试；② OCR初始化内部GPU配置全部失败时新增显式CPU(use_gpu=False)配置重试(原部分兜底配置未带use_gpu参数，paddleocr 2.x缺省use_gpu=True，GPU环境异常时会连带全部失败)。修复后GPU模式异常时自动降级CPU推理，输出与CPU模式一致(双层)",
+        ],
+    },
+    {
+        "version": "3.6",
+        "date": "2026-08-27",
+        "changes": [
+            "文件头部新增显式UTF-8编码声明(# -*- coding: utf-8 -*-)：修复编辑器偶发将文件保存为非UTF-8(GBK)编码时运行报“SyntaxError: Non-UTF-8 code… but no encoding declared”的问题(已验证当前文件为合法UTF-8且可编译，项目缺省编码同步锁定为UTF-8)",
+        ],
+    },
+    {
+        "version": "3.5",
+        "date": "2026-08-26",
+        "changes": [
+            "修复JPG转双层PDF在计算机同时运行其他任务时直接崩溃 、页面消失且无任何错误记录的问题：① 新增全局崩溃日志机制(faulthandler捕获段错误等致命错误+主线程/工作线程未捕获异常钩子)，任何崩溃均写入程序目录下 TMToolMan_崩溃日志_日期.txt，不再无声消失；② 仅图像PDF合并改用fitz流式逐页写盘(不再将整目录图像一次性全量解码驻留内存，内存峰值与页数无关)，降低系统内存紧张时被操作系统终止进程的概率；③ 新增QThread终止兜底：处理线程意外死亡未发完成信号时，界面自动恢复并弹窗提示崩溃原因，不再永久卡在“处理中”",
+        ],
+    },
+    {
+        "version": "3.4",
+        "date": "2026-08-26",
+        "changes": [
+            "修复文件批量替换误报“源文件编号不连续…跳过本组”：改为源文件从最小编号起连续占位(最小编号处覆盖目标同名文件，源编号不连续时也自动归位不再跳过)，目标中编号大于最小编号的现有文件从最小编号+N起按升序重新编号(如源0002/0003替换目标0002后，目标原0003改名0004、后续依次类推)，保证替换后编号连续",
+        ],
+    },
+    {
+        "version": "3.3",
+        "date": "2026-08-26",
+        "changes": [
+            "建立版本号与修改记录管理机制：新增模块级常量 VERSION 与 CHANGELOG 修改记录，窗口标题显示当前版本号(同美档案工具集合 v3.3)，便于区分不同打包版本",
+        ],
+    },
+]
+# ========================================================================
+
 import sys
 import re
 import os
@@ -29,6 +84,62 @@ import time
 import threading
 from datetime import datetime
 from pathlib import Path
+
+
+# ============================ 崩溃日志机制(v3.5) ============================
+# 背景: JPG转双层PDF在计算机多任务运行时曾出现整窗口消失且无任何错误记录的崩溃——
+# C库(paddle/PyMuPDF)段错误与进程被操作系统因内存不足终止都不经过Python异常流，
+# 打包程序又无控制台，堆栈全部丢失。此处建立三层记录:
+#   ① faulthandler 捕获段错误/栈溢出等致命错误并写入C级堆栈;
+#   ② sys.excepthook 捕获主线程(含Qt事件循环槽函数)未捕获异常;
+#   ③ threading.excepthook 捕获工作线程未捕获异常。
+# 统一追加写入程序目录下「TMToolMan_崩溃日志_日期.txt」，崩溃后可凭日志定位原因。
+def _setup_crash_log():
+    """启用全局崩溃日志(程序启动时调用一次)，返回崩溃日志文件路径。"""
+    import faulthandler
+    import traceback as _tb
+    if getattr(sys, 'frozen', False):
+        app_dir = os.path.dirname(sys.executable)
+    else:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+    crash_path = os.path.join(
+        app_dir, f"TMToolMan_崩溃日志_{datetime.now().strftime('%Y%m%d')}.txt")
+
+    def _write(header, lines):
+        try:
+            with open(crash_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n{'=' * 80}\n{header} "
+                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.writelines(lines)
+        except Exception:
+            pass
+
+    # ① 致命错误(段错误/栈溢出等, 是“无声消失”类崩溃的常见直接原因)。
+    # 文件句柄须常驻打开(段错误发生时无机会再打开文件), 并保留引用防被GC关闭。
+    try:
+        _fh = open(crash_path, 'a', encoding='utf-8')
+        faulthandler.enable(file=_fh, all_threads=True)
+        _setup_crash_log._fh = _fh
+    except Exception:
+        pass
+
+    # ② 主线程未捕获异常
+    _old_hook = sys.excepthook
+    def _excepthook(exc_type, exc_value, exc_tb):
+        _write("主线程未捕获异常:",
+               _tb.format_exception(exc_type, exc_value, exc_tb))
+        _old_hook(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
+    # ③ 工作线程未捕获异常(后台线程异常不会中断主程序, 但必须留痕)
+    def _threadhook(args):
+        _write(f"线程[{args.thread.name}]未捕获异常:",
+               _tb.format_exception(args.exc_type, args.exc_value,
+                                    args.exc_traceback))
+    threading.excepthook = _threadhook
+
+    return crash_path
+# ========================================================================
 
 
 class TechStyle:
@@ -240,9 +351,121 @@ class FileSplitWorker(QThread):
                                            # (并发构造会内存暴涨/死锁——低配机卡死根因)
 
     # ---------- OCR ----------
+    # ---------- OCR服务线程: 串行化+超时看门狗+挂死后CPU重建 ----------
+    def _ocr_svc_loop(self, q):
+        """OCR服务线程主循环: 串行执行提交的任务。
+        队列元素 (fn, ev, box): fn=待执行函数, ev=threading.Event,
+        box=list([ok, value])。任务挂起时本线程卡死(孤儿), 调用方靠超时脱身。"""
+        while True:
+            try:
+                item = q.get()
+            except Exception:
+                continue
+            if item is None:  # 退役信号(服务线程换新时给旧线程的善意尝试)
+                return
+            fn, ev, box = item
+            try:
+                val = fn()
+                box[0], box[1] = True, val
+            except Exception as e:
+                box[0], box[1] = False, e
+            finally:
+                try:
+                    ev.set()
+                except Exception:
+                    pass
+
+    def _ensure_ocr_service(self):
+        """惰性启动/重启OCR服务线程。线程数恒定(挂死线程换新队列后退出)。"""
+        with self._svc_lock:
+            import queue as _queue
+            import threading as _th
+            if self._svc_q is not None:
+                return self._svc_q
+            q = _queue.Queue()
+            self._svc_q = q
+            t = _th.Thread(target=self._ocr_svc_loop, args=(q,),
+                           name='OcrSvc', daemon=True)
+            t.start()
+            return q
+
+    def _ocr_svc_call(self, fn, timeout):
+        """提交OCR任务到服务线程并限时等待。
+        返回 (ok, value): ok=True时value为结果; ok=False时value为异常对象。
+        返回 ('timeout', None): 服务线程超时未响应(判定挂死)——丢弃该线程,
+        换新队列重启服务, 调用方据此决定是否CPU重建。"""
+        import threading as _th
+        q = self._ensure_ocr_service()
+        ev = _th.Event()
+        box = [False, None]
+        q.put((fn, ev, box))
+        if ev.wait(timeout):
+            return ('ok' if box[0] else 'error'), box[1]
+        # 超时: 服务线程挂死 → 换新队列重启(孤儿线程不再被引用, 无法强制终止)
+        with self._svc_lock:
+            try:
+                q.put_nowait(None)  # 若线程只是队列异常仍会退出(挂死时无害)
+            except Exception:
+                pass
+            self._svc_q = None
+        self._ensure_ocr_service()
+        return 'timeout', None
+
+    def _rebuild_ocr_cpu(self):
+        """GPU推理挂死后强制CPU重建: 丢弃挂死实例, 全程锁保护(每轮只做一次)。
+        返回 True=已切换为CPU配置(新服务线程首次推理时将重新初始化)。
+        paddle构造成功后无法改已有predictor的use_gpu → 只能置空实例,
+        由 _init_ocr_locked 按新的 use_gpu_ocr=False 重新构造。"""
+        import threading as _th
+        if not hasattr(self, '_rebuild_lock'):
+            with self._svc_lock:
+                if not hasattr(self, '_rebuild_lock'):
+                    self._rebuild_lock = _th.Lock()
+        with self._rebuild_lock:
+            if self._svc_rebuilt:
+                return True
+            self.log_signal.emit("  → OCR引擎切换为CPU重建(丢弃挂死的GPU实例)")
+            self.use_gpu_ocr = False
+            self._ocr = None
+            # 全局paddle place已设为GPU, 强制切回CPU(失败不影响重建——
+            # 新实例构造时 use_gpu=False 会以CPU place创建)
+            try:
+                import paddle as _pd
+                _pd.set_device('cpu')
+            except Exception:
+                pass
+            # 换新服务线程(旧线程可能挂死在GPU调用上)
+            with self._svc_lock:
+                self._svc_q = None
+            self._ensure_ocr_service()
+            self._svc_rebuilt = True
+            self._ocr_probed = False
+            return True
+
+    def _svc_empty_cache(self):
+        """在OCR服务线程内释放GPU缓存(与推理串行, 避免并发CUDA操作挂死)。
+        服务未启动/已挂死时跳过——此时已无存活推理, 释放无意义。"""
+        try:
+            with self._svc_lock:
+                alive = self._svc_q is not None
+            if not alive:
+                return
+            def _do():
+                try:
+                    import paddle
+                    if hasattr(paddle.device, 'cuda'):
+                        paddle.device.cuda.empty_cache()
+                except Exception:
+                    pass
+            self._ocr_svc_call(_do, timeout=30)
+        except Exception:
+            pass
+
     def _get_ocr(self):
         """
         延迟初始化 PaddleOCR(中文, 带方向分类)。失败返回 None。
+        ★ 必须经由OCR服务线程调用(见 _ocr_svc_call): GPU路径初始化/推理可能永久挂起,
+        服务线程+超时看门狗是唯一可脱身的隔离方式; 直接在工作线程调用会永久卡死。
         模型文件随程序打包(ocr_models/)，显式指定路径，避免在用户机器上
         联网下载模型(内网环境会静默失败导致 OCR 无结果)。
         """
@@ -340,6 +563,27 @@ class FileSplitWorker(QThread):
                 except Exception as e:
                     last_err = e
                     self.log_signal.emit(f"  (配置#{i} 不适用: {str(e)[:80]}, 尝试下一配置)")
+            # v3.7修复: 请求GPU时部分“兜底”配置(#3/#6/#7)未带use_gpu参数,
+            # 而paddleocr 2.x缺省use_gpu=True → GPU环境异常时兜底配置连带全部失败,
+            # 最终OCR为None→单层PDF。此处GPU配置全失败后用显式CPU配置再试一轮。
+            if self._ocr is None and want_gpu and gpu_ok:
+                self.log_signal.emit("  × GPU配置全部失败, 改用显式CPU配置重试")
+                try:
+                    import paddle as _pd2
+                    _pd2.set_device('cpu')
+                except Exception:
+                    pass
+                for i, kw in enumerate(configs, 1):
+                    kw = dict(kw)
+                    if 'use_angle_cls' in kw:
+                        kw['use_gpu'] = False  # 2.x风格: 显式CPU(覆盖2.7缺省GPU)
+                    try:
+                        self._ocr = PaddleOCR(**kw)
+                        self.log_signal.emit(f"  (OCR初始化成功: CPU兜底配置#{i})")
+                        break
+                    except Exception as e:
+                        last_err = e
+                        self.log_signal.emit(f"  (CPU兜底配置#{i} 不适用: {str(e)[:80]})")
             if self._ocr is None:
                 raise last_err or RuntimeError('所有OCR配置均失败')
         except Exception as e:
@@ -2110,19 +2354,28 @@ def _rename_db_init(conn):
         new_name TEXT,
         renamed_at TEXT,
         PRIMARY KEY (src_path, src_name))""")
+    # 兼容升级: 旧表无 done_path/done_name 列时补上(记录新名判重用)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(renamed_files)").fetchall()]
+    if 'done_path' not in cols:
+        conn.execute("ALTER TABLE renamed_files ADD COLUMN done_path TEXT DEFAULT ''")
+    if 'done_name' not in cols:
+        conn.execute("ALTER TABLE renamed_files ADD COLUMN done_name TEXT DEFAULT ''")
     conn.commit()
 
 def _rename_db_record_many(records):
-    """批量写入改名记录(原路径+原名→新名)。失败静默。"""
+    """批量写入改名记录(原路径+原名→新路径+新名, 原名与新名都参与判重)。"""
     import sqlite3
     try:
         conn = sqlite3.connect(_rename_db_path())
         try:
             _rename_db_init(conn)
             conn.executemany(
-                "INSERT OR REPLACE INTO renamed_files VALUES (?,?,?,?)",
+                "INSERT OR REPLACE INTO renamed_files "
+                "(src_path, src_name, new_name, renamed_at, done_path, done_name) "
+                "VALUES (?,?,?,?,?,?)",
                 [(r['src_path'], r['src_name'], r.get('new_name', ''),
-                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                  r.get('done_path', ''), r.get('done_name', ''))
                  for r in records])
             conn.commit()
         finally:
@@ -2131,15 +2384,23 @@ def _rename_db_record_many(records):
         pass
 
 def _rename_db_processed_set():
-    """已记录改名的 (原路径, 原文件名) 集合。"""
+    """已处理过的 (路径, 文件名) 集合 —— 原名与新名都计入:
+    改名后的文件(新名)再次扫描时不被误判为「新增」而重复改名。"""
     import sqlite3
     try:
         if not os.path.exists(_rename_db_path()):
             return set()
         conn = sqlite3.connect(_rename_db_path())
         try:
-            rows = conn.execute("SELECT src_path, src_name FROM renamed_files").fetchall()
-            return {(r[0].lower(), r[1].lower()) for r in rows}
+            _rename_db_init(conn)
+            rows = conn.execute(
+                "SELECT src_path, src_name, done_path, done_name FROM renamed_files").fetchall()
+            done = set()
+            for sp, sn, dp, dn in rows:
+                done.add((sp.lower(), sn.lower()))          # 原名
+                if dp and dn:
+                    done.add((dp.lower(), dn.lower()))      # 新名
+            return done
         finally:
             conn.close()
     except Exception:
@@ -2229,7 +2490,9 @@ class FileRenameWorker(QThread):
                         results["renamed_files"] += 1
                         ok_records.append({'src_path': str(file.parent),
                                            'src_name': file.name,
-                                           'new_name': new_name.name})
+                                           'new_name': new_name.name,
+                                           'done_path': str(new_name.parent),
+                                           'done_name': new_name.name})
 
                         # 如果需要修改DPI且是JPG文件，则修改DPI
                         if self.modify_dpi and new_name.suffix.lower() in ['.jpg', '.jpeg']:
@@ -2280,7 +2543,9 @@ class FileRenameWorker(QThread):
                             results["renamed_files"] += 1
                             ok_records.append({'src_path': str(file.parent),
                                                'src_name': file.name,
-                                               'new_name': new_name.name})
+                                               'new_name': new_name.name,
+                                               'done_path': str(new_name.parent),
+                                               'done_name': new_name.name})
                             
                             # 如果需要修改DPI且是JPG文件，则修改DPI
                             if self.modify_dpi and new_name.suffix.lower() in ['.jpg', '.jpeg']:
@@ -2501,6 +2766,14 @@ class FileRenamePage(FunctionPage):
         self.modify_dpi_check.setChecked(False)
         form.addRow("选项:", self.modify_dpi_check)
 
+        # 只修改新增: 勾选后, 与本地记录库「原路径+原文件名」完全相同的文件跳过
+        self.only_new_check = QCheckBox("只修改新增（跳过已改名过的文件，按路径+文件名判重）")
+        self.only_new_check.setChecked(False)
+        self.only_new_check.setToolTip(
+            "程序在本地数据库记录每次实际改名过的文件(原路径+原文件名)。\n"
+            "勾选后，与历史记录完全相同的文件不再重复处理；未勾选则全部重新处理。")
+        form.addRow("", self.only_new_check)
+
         # 功能1的操作按钮(放在分组内)
         btn_layout = QHBoxLayout()
         self.preview_btn = QPushButton("预览操作")
@@ -2698,7 +2971,8 @@ class FileRenamePage(FunctionPage):
         
         # 创建工作线程
         modify_dpi = self.modify_dpi_check.isChecked()
-        self.worker = FileRenameWorker(base_dir=d, modify_dpi=modify_dpi)
+        self.worker = FileRenameWorker(base_dir=d, modify_dpi=modify_dpi,
+                                       only_new=self.only_new_check.isChecked())
         
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
@@ -4258,11 +4532,21 @@ class JpgToPdfWorker(QThread):
         self.gpu_render = gpu_render      # GPU渲染: 图像加速路径(MKL-DNN+无损直传)
         self.use_gpu_ocr = use_gpu_ocr    # OCR用GPU推理(不可用自动回退CPU)
         self.is_stopped = False
+        self._done = False  # 是否已发出完成信号(界面层线程意外终止兜底判断用)
         import threading
         self._ofd_lock = threading.Lock()
-        self._ocr_lock = threading.Lock()   # PaddleOCR 推理非线程安全, 串行化
-        self._ocr_init_lock = threading.Lock()  # OCR初始化锁(4线程并发首次初始化防重复构造)
         self._ocr = None  # PaddleOCR 延迟初始化(与分件共享同一初始化逻辑)
+        # --- OCR服务线程机制(防GPU推理挂死) ---
+        # PaddleOCR predictor 非线程安全且GPU路径存在首推理永久挂起的可能。
+        # 所有OCR操作(初始化/探测/逐页推理/显存释放)统一提交到单一daemon服务
+        # 线程串行执行, 调用方带超时等待: 超时=判定该服务线程挂死, 丢弃后以
+        # CPU配置重启新服务线程(孤儿线程后台泄漏但不再阻塞任何处理)。
+        self._svc_lock = threading.Lock()   # 服务线程生命周期管理锁(惰性初始化并发)
+        self._svc_q = None                  # 当前服务线程任务队列(挂死后换新)
+        self._svc_rebuilt = False           # 是否已做过GPU挂死→CPU重建(每轮只做一次)
+        self._probe_lock = threading.Lock()  # 首推理探测全局只做一次(其余线程等结果)
+        self._ocr_probed = False            # 探测是否完成(含重建后的重探测)
+        self._ocr_broken = False            # OCR彻底不可用(探测+CPU重建均失败)→仅图像PDF
         
         # 检查 OFD 转换库是否可用（用于生成双层OFD）
         # 使用自建 ofd_writer（基于 PyMuPDF，生成图像层+文本层的双层OFD，
@@ -4296,6 +4580,14 @@ class JpgToPdfWorker(QThread):
                         os.environ['CUDA_VISIBLE_DEVICES'] = ''
             except Exception:
                 pass
+            # GPU显存安全限制(必须在 paddle 首次导入之前设置):
+            # auto_growth=显存按需增长(默认会预占绝大部分显存, 与显示输出/
+            #   其他应用争抢 → 长时间多线程运行后整机死机的根因之一);
+            # workspace上限64MB=限制cuDNN卷积工作区, 防单次推理吃满显存;
+            # 关闭cuDNN穷举搜索=避免首推理长耗时选算法(表现为探测超时)。
+            os.environ.setdefault('FLAGS_allocator_strategy', 'auto_growth')
+            os.environ.setdefault('FLAGS_conv_workspace_size_limit', '64')
+            os.environ.setdefault('FLAGS_cudnn_exhaustive_search', '0')
 
             # 输出目录不存在则创建(缺省为 源目录/PDF, 可能尚不存在)
             if self.output_dir:
@@ -4303,7 +4595,7 @@ class JpgToPdfWorker(QThread):
             # 收集所有目录下的JPG文件
             dir_jpgs_map = self.collect_jpg_files()
             if not dir_jpgs_map:
-                self.finished_signal.emit(False, f"在目录 {self.directory_path} 及其子目录中没有找到JPG文件")
+                self._emit_finished(False, f"在目录 {self.directory_path} 及其子目录中没有找到JPG文件")
                 return
             
             total_dirs = len(dir_jpgs_map)
@@ -4375,15 +4667,22 @@ class JpgToPdfWorker(QThread):
                 if success_rate >= 90:
                     rate_msg += "\n提示：单线程处理可能获得更高成功率！"
                 
-                self.finished_signal.emit(True, rate_msg)
+                self._emit_finished(True, rate_msg)
             else:
-                self.finished_signal.emit(False, "处理已停止")
+                self._emit_finished(False, "处理已停止")
                 
-        except Exception as e:
-            self.finished_signal.emit(False, f"处理出错: {str(e)}")
+        except BaseException as e:
+            # BaseException: SystemExit/KeyboardInterrupt 等也须发出完成信号,
+            # 否则界面永久卡死; 具体堆栈由全局崩溃日志机制记录。
+            self._emit_finished(False, f"处理出错: {str(e)}")
     
     def stop(self):
         self.is_stopped = True
+
+    def _emit_finished(self, ok, msg):
+        """统一经此发出完成信号并置位标记, 供界面层区分「正常结束」与「意外终止」。"""
+        self._done = True
+        self.finished_signal.emit(ok, msg)
     
     def collect_jpg_files(self):
         """收集目录及子目录下所有JPG文件（按目录分组）"""
@@ -4403,9 +4702,54 @@ class JpgToPdfWorker(QThread):
         return dir_jpgs_map
     
     def jpgs_to_pdf(self, jpg_paths, output_dir, pdf_filename):
-        """将多个 JPG 文件合并为一个 PDF（仅图像层）"""
+        """将多个 JPG 文件合并为一个 PDF（仅图像层）。
+        优先 fitz 流式逐页写盘: 逐页直接嵌入文件、不全量解码图像, 内存峰值与页数无关;
+        旧版 PIL 方式会把整目录图像全量解码驻留内存, 系统内存紧张(如同时运行其他任务)
+        时进程会被操作系统直接终止且无任何错误记录。仅在缺 fitz 时回退 PIL 合并。"""
         pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
-        
+        Image.MAX_IMAGE_PIXELS = None
+        try:
+            import fitz
+        except ImportError:
+            fitz = None
+        if fitz is not None:
+            doc = fitz.open()
+            # 分段写盘: 与双层路径同款策略, 超大目录分段保存后合并, doc峰值恒定
+            CHUNK = 50
+            seg_paths = []
+            page_no = 0
+            for jpg_path in jpg_paths:
+                # 仅取尺寸(头信息), 不全量解码
+                img = Image.open(jpg_path)
+                w_px, h_px = img.size
+                img.close()
+                w_pt = w_px * 72.0 / self.resolution
+                h_pt = h_px * 72.0 / self.resolution
+                page = doc.new_page(width=w_pt, height=h_pt)
+                page.insert_image(fitz.Rect(0, 0, w_pt, h_pt), filename=jpg_path)
+                page_no += 1
+                if page_no % CHUNK == 0 and page_no < len(jpg_paths):
+                    _seg = pdf_path + f'.imgpart{page_no // CHUNK}'
+                    doc.save(_seg, garbage=3, deflate=True)
+                    doc.close()
+                    seg_paths.append(_seg)
+                    doc = fitz.open()
+            if seg_paths:
+                _last = pdf_path + f'.imgpart{len(seg_paths) + 1}'
+                doc.save(_last, garbage=3, deflate=True)
+                doc.close()
+                seg_paths.append(_last)
+                merged = fitz.open()
+                for sp in seg_paths:
+                    merged.insert_pdf(fitz.open(sp))
+                    os.remove(sp)
+                merged.save(pdf_path, garbage=3, deflate=True)
+                merged.close()
+            else:
+                doc.save(pdf_path, garbage=3, deflate=True)
+                doc.close()
+            return pdf_path
+
         images = []
         for jpg_path in jpg_paths:
             image = Image.open(jpg_path)
@@ -4427,6 +4771,13 @@ class JpgToPdfWorker(QThread):
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _ocr_page = FileSplitWorker._ocr_page
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
+    # OCR服务线程机制(定义在 FileSplitWorker 内, 两处共享同一实现):
+    # 串行化推理+超时看门狗+GPU挂死后CPU重建, 依赖 __init__ 中的 _svc_* 属性
+    _ocr_svc_loop = FileSplitWorker._ocr_svc_loop
+    _ensure_ocr_service = FileSplitWorker._ensure_ocr_service
+    _ocr_svc_call = FileSplitWorker._ocr_svc_call
+    _rebuild_ocr_cpu = FileSplitWorker._rebuild_ocr_cpu
+    _svc_empty_cache = FileSplitWorker._svc_empty_cache
 
     def _ocr_local_available(self):
         """本地OCR是否可用(初始化一次)。"""
@@ -4439,53 +4790,98 @@ class JpgToPdfWorker(QThread):
           逐图OCR取文本+坐标 → PyMuPDF 逐页插图与不可见文本层。
         """
         Image.MAX_IMAGE_PIXELS = None
-        ocr = self._get_ocr()
+        # --- OCR引擎初始化(走服务线程, 带超时看门狗) ---
+        # GPU模式下构造成功≠能推理: 首推理可能永久挂起。初始化本身也可能在
+        # 加载模型阶段挂起 → 全部提交服务线程执行, 超时即判定异常转CPU重建。
+        status, ocr = self._ocr_svc_call(lambda: self._get_ocr(), timeout=300)
+        if status == 'timeout':
+            self.log_signal.emit("  × OCR初始化超时(300秒), GPU引擎异常")
+            self._rebuild_ocr_cpu()
+            status, ocr = self._ocr_svc_call(lambda: self._get_ocr(), timeout=300)
+        elif ocr is None and getattr(self, 'use_gpu_ocr', False):
+            # v3.7修复: GPU模式初始化失败(异常而非挂死)时原逻辑直接降级单层PDF——
+            # 这是“GPU出单层、CPU出双层”的直接原因。现强制CPU重建后重试一次。
+            self.log_signal.emit("  × OCR初始化失败(GPU模式异常), 切换CPU重建重试")
+            self._rebuild_ocr_cpu()
+            status, ocr = self._ocr_svc_call(lambda: self._get_ocr(), timeout=300)
         if ocr is None:
-            # 本地OCR不可用: 回退仅图像PDF
+            # 本地OCR不可用: 回退仅图像PDF(保留旧状态字符串供上层展示)
             temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
             return temp_pdf_path, "仅图像PDF（本地OCR不可用）"
 
-        # --- 首次推理看门狗: 构造成功≠能推理 ---
-        # 部分 3.x 环境构造(含旧模型路径)成功, 但首次 predict 时尝试联网
-        # 下载/校验模型 → 内网 requests 无超时 → 永久挂起(无异常无日志)。
-        # 用小图做一次 120s 超时探测: 失败则本目录降级为仅图像PDF, 不卡死。
-        # ★ 探测必须持有 ocr_lock(与其他线程的真实推理互斥)——paddle predictor
-        #   非线程安全, 并发调用会挂死(这正是"探测通过后再无动作"的原因)。
-        #   且用全局探测锁保证 4 线程只探测一次, 其余线程等待探测结果。
-        _probe_lock = getattr(self, '_probe_lock', None)
-        if _probe_lock is None:
-            import threading as _th
-            _probe_lock = _th.Lock()
-            self._probe_lock = _probe_lock
-        with _probe_lock:
-            if not getattr(self, '_ocr_probed', False):
-                import concurrent.futures as _cf
-                self._ocr_probed = True
+        # --- 首次推理探测(小图, 服务线程内执行, 全局只做一次) ---
+        # 探测失败不再直接降级: 先尝试GPU挂死→CPU重建→重探测;
+        # CPU重建后仍失败才降级仅图像PDF(避免产出单层文件)。
+        with self._probe_lock:
+            if not self._ocr_probed:
+                self._ocr_probed = True  # 先置位: 重建失败时其他线程不重复探测循环
                 self.log_signal.emit("  OCR引擎首次推理探测(最长等待120秒)...")
                 _probe = os.path.join(output_dir, '_ocr_probe.png')
-                _ocr_lock0 = getattr(self, '_ocr_lock', None)
+                _probe_ok = False
                 try:
-                    Image.new('RGB', (400, 120), 'white').save(_probe)
-                    def _do_probe():
-                        if _ocr_lock0 is not None:
-                            with _ocr_lock0:
-                                return self._ocr_page(_probe, None, lambda s: None)
-                        return self._ocr_page(_probe, None, lambda s: None)
-                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                        _fut = _ex.submit(_do_probe)
-                        try:
-                            _fut.result(timeout=120)
-                            self.log_signal.emit("  OCR推理探测通过")
-                        except _cf.TimeoutError:
-                            self.log_signal.emit("  × OCR首次推理超时(120秒), "
-                                                 "本机OCR环境异常(可能尝试联网被内网阻塞)")
-                            self.log_signal.emit("  → 降级为仅图像PDF继续处理")
-                            self._ocr_broken = True
+                    # 探测图必须含真实文字: 纯白图OCR返回空也算'ok', 无法暴露
+                    # GPU上"能跑但识别不出任何内容"的半失效状态(该状态下每页
+                    # frags为空 → 生成单层PDF)。要求识别出文字才算探测通过。
+                    _pb = Image.new('RGB', (600, 200), 'white')
+                    from PIL import ImageDraw as _ID, ImageFont as _IF
+                    _dr = _ID.Draw(_pb)
+                    try:
+                        _fnt = _IF.truetype('C:/Windows/Fonts/simhei.ttf', 40)
+                    except Exception:
+                        _fnt = None
+                    _dr.text((40, 60), 'OCR探测测试文字', fill=(0, 0, 0), font=_fnt)
+                    _pb.save(_probe)
+                    st, _res = self._ocr_svc_call(
+                        lambda: self._ocr_page(_probe, None, lambda s: None),
+                        timeout=120)
+                    if st == 'ok' and _res:
+                        self.log_signal.emit("  OCR推理探测通过(识别到文字)")
+                        _probe_ok = True
+                    elif st == 'ok':
+                        self.log_signal.emit("  × OCR探测异常: 推理完成但未识别出文字"
+                                             "(GPU半失效状态), 转CPU重试")
+                    elif st == 'timeout':
+                        self.log_signal.emit(
+                            "  × OCR首次推理超时(120秒), GPU推理挂死(显存/驱动异常)")
+                    else:
+                        self.log_signal.emit(f"  × OCR探测失败: {str(_res)[:100]}")
                 finally:
                     try:
                         os.remove(_probe)
                     except Exception:
                         pass
+                if not _probe_ok and not self._svc_rebuilt:
+                    # 未重建过 → 切CPU后重探测一次
+                    self._rebuild_ocr_cpu()
+                    self._ocr_probed = True
+                    self.log_signal.emit("  CPU模式重新探测(最长等待120秒)...")
+                    _p2 = os.path.join(output_dir, '_ocr_probe.png')
+                    try:
+                        _pb2 = Image.new('RGB', (600, 200), 'white')
+                        from PIL import ImageDraw as _ID2, ImageFont as _IF2
+                        _dr2 = _ID2.Draw(_pb2)
+                        try:
+                            _fnt2 = _IF2.truetype('C:/Windows/Fonts/simhei.ttf', 40)
+                        except Exception:
+                            _fnt2 = None
+                        _dr2.text((40, 60), 'OCR探测测试文字', fill=(0, 0, 0), font=_fnt2)
+                        _pb2.save(_p2)
+                        st2, _r2 = self._ocr_svc_call(
+                            lambda: self._ocr_page(_p2, None, lambda s: None),
+                            timeout=120)
+                        if st2 == 'ok' and _r2:
+                            self.log_signal.emit("  CPU模式OCR探测通过(识别到文字), 继续生成双层PDF")
+                            _probe_ok = True
+                        else:
+                            self.log_signal.emit("  × CPU模式OCR探测仍失败")
+                    finally:
+                        try:
+                            os.remove(_p2)
+                        except Exception:
+                            pass
+                if not _probe_ok:
+                    self._ocr_broken = True
+                    self.log_signal.emit("  → OCR不可用, 降级为仅图像PDF继续处理")
         if getattr(self, '_ocr_broken', False):
             temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
             return temp_pdf_path, "仅图像PDF（本机OCR推理异常已跳过）"
@@ -4498,13 +4894,13 @@ class JpgToPdfWorker(QThread):
 
         pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
         doc = fitz.open()
-        ocr_lock = getattr(self, '_ocr_lock', None)
-        # GPU渲染模式: 启用 MKL-DNN 指令集加速(paddle的CPU加速路径, 有GPU时配合
-        # GPU OCR形成完整加速链)。生成结果与普通模式完全一致。
-        if getattr(self, 'gpu_render', False):
+        # GPU渲染模式: 启用 MKL-DNN 指令集加速(仅执行一次, 多线程重复设置无益)
+        if getattr(self, 'gpu_render', False) and \
+                not getattr(self, '_mkldnn_set', False):
             try:
                 import paddle
                 paddle.set_flags({'FLAGS_use_mkldnn': True})
+                self._mkldnn_set = True
                 self.log_signal.emit("  渲染加速已启用(MKL-DNN)")
             except Exception:
                 pass
@@ -4531,11 +4927,32 @@ class JpgToPdfWorker(QThread):
                 # OCR文本层(坐标从像素换算到PDF点)——逐页日志, 挂起时可见最后处理到哪
                 self.log_signal.emit(f"    OCR: {os.path.basename(jpg_path)} "
                                      f"({len(jpg_paths)}张中第{jpg_paths.index(jpg_path)+1}张)")
-                if ocr_lock is not None:
-                    with ocr_lock:
-                        frags = self._ocr_page(jpg_path, None, lambda s: None)
-                else:
-                    frags = self._ocr_page(jpg_path, None, lambda s: None)
+                # OCR走服务线程(天然串行=替代ocr锁), 单页180秒超时。
+                # 中途挂死→尝试一次CPU重建并重试本页; 仍失败则该页无文本层,
+                # 继续处理后续页(不再永久阻塞——这是旧版4线程卡死的直接原因)。
+                st, frags = self._ocr_svc_call(
+                    lambda p=jpg_path: self._ocr_page(p, None, lambda s: None),
+                    timeout=180)
+                if st == 'timeout':
+                    self.log_signal.emit(
+                        f"    × OCR单页超时: {os.path.basename(jpg_path)}")
+                    if self._rebuild_ocr_cpu():
+                        st, frags = self._ocr_svc_call(
+                            lambda p=jpg_path: self._ocr_page(p, None, lambda s: None),
+                            timeout=180)
+                if st != 'ok':
+                    if st == 'error':
+                        self.log_signal.emit(
+                            f"    OCR出错(跳过文本层): {str(frags)[:80]}")
+                    else:
+                        self.log_signal.emit(
+                            f"    × OCR持续超时, 该页无文本层: "
+                            f"{os.path.basename(jpg_path)}")
+                    frags = []
+                if st == 'ok' and not frags and len(jpg_paths) > 0:
+                    self.log_signal.emit(
+                        f"    ! 警告: {os.path.basename(jpg_path)} OCR完成但识别0片段"
+                        f"(该页将为单层, 若大面积出现请检查GPU/显卡驱动)")
                 self.log_signal.emit(f"    OCR完成: {os.path.basename(jpg_path)} "
                                      f"识别{len(frags)}片段")
                 sx = w_pt / w_px
@@ -4710,14 +5127,12 @@ class JpgToPdfWorker(QThread):
 
         # 每目录处理完强制回收: paddle推理的C++工作内存与图像缓存不归Python GC管,
         # 长时间多目录累积会耗尽系统内存导致进程被静默终止。逐目录显式释放。
+        # ★ empty_cache 必须走OCR服务线程执行——paddle CUDA操作与推理并发会挂死;
+        #   服务线程挂死时(超时)跳过, 不再在工作线程里直接调用。
         try:
             import gc as _gc
             _gc.collect()
-            try:
-                import paddle
-                paddle.device.cuda.empty_cache() if hasattr(paddle.device, 'cuda') else None
-            except Exception:
-                pass
+            self._svc_empty_cache()
         except Exception:
             pass
 
@@ -5010,6 +5425,9 @@ class JpgToPdfPage(FunctionPage):
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_finished)
+        # QThread终止兜底: 处理线程被操作系统终止或C库崩溃死亡时不会发出完成信号,
+        # 此时界面自动恢复并提示(而非永久卡在“处理中”), 崩溃详情见崩溃日志。
+        self.worker.finished.connect(self._on_worker_exit)
         
         self.worker.start()
         
@@ -5048,6 +5466,22 @@ class JpgToPdfPage(FunctionPage):
             QMessageBox.information(self, "完成", "处理完成！")
         else:
             QMessageBox.warning(self, "提示", message)
+
+    def _on_worker_exit(self):
+        """QThread终止兜底: 处理线程意外死亡(系统内存不足被终止/内部库崩溃等)
+        且未发出完成信号时, 恢复界面并弹窗提示, 不再永久卡在“处理中”。"""
+        if getattr(self.worker, '_done', False):
+            return
+        msg = ("处理线程意外终止(可能是系统内存不足导致进程被终止, 或内部库崩溃)。\n"
+               "详细信息请查看程序目录下的 TMToolMan_崩溃日志_*.txt。\n"
+               "建议: 降低线程数、关闭其他占用内存的程序后重试。")
+        self.log(msg)
+        self.progress.setFormat("异常终止")
+        btn = self.findChild(QPushButton, "ActionBtn")
+        if btn and btn.text() == "开始转换":
+            btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        QMessageBox.critical(self, "处理异常终止", msg)
 
 
 class PdfToOfdWorker(QThread):
@@ -5466,8 +5900,9 @@ class FileBatchReplaceWorker(QThread):
        "-"后得到基础名，与目标目录下的同名子目录匹配；
     2. 仅处理编号 >= 起始编号的文件:
        - 只需复制1个 → 直接覆盖目标同名文件；
-       - 复制多个(N个) → 先将目标目录中编号 > 最小新文件编号的现有文件
-         向后平移 (N-1) 个编号预留空位(从编号最大的文件开始改名避免重复)，
+       - 复制多个(N个) → 源文件从最小编号起连续占位(最小编号处覆盖目标同名文件，
+         源编号不连续时也按升序归位)；目标子目录中编号 > 最小编号的现有文件
+         从 最小编号+N 起按升序重新编号预留空位(从编号最大的文件开始改名避免重复)，
          再将新文件复制到目标目录。
     3. 每个目标子目录替换完成后, 在该子目录下生成/更新 Directory.txt:
        记录替换后的文件名清单(不含扩展名, 每行一个), 供分件功能
@@ -5552,22 +5987,27 @@ class FileBatchReplaceWorker(QThread):
                 existing.append((int(m.group(1)), f))
 
         if n > 1:
-            shift = n - 1
-            # 从编号最大的文件开始改名，避免改名过程中重名覆盖
-            to_rename = sorted([t for t in existing if t[0] > min_new], reverse=True)
-            # 碰撞安全检查: 改名后编号不得与待复制新文件编号冲突(源编号不连续时可能发生)
-            conflict = {num + shift for num, _ in to_rename} & nums_new
-            if conflict:
-                self._wlog(f"  × 源文件编号不连续，改名将与待复制编号 {sorted(conflict)} 冲突，跳过本组")
-                return 0, n
-            for num, fname in to_rename:
+            # 源文件从 min_new 起连续占位(占 min_new..min_new+N-1)；目标现有编号 > min_new 的
+            # 文件从 min_new+N 起按升序重新编号。例: 源 0002/0003 替换时，目标 0002 被覆盖，
+            # 目标原 0003 改名 0004、后续依次类推，替换后编号连续无空洞。
+            # (旧逻辑统一平移 N-1，源编号不连续时改名与待复制编号冲突会跳过整组，已废弃)
+            fill_start = min_new + n
+            push_asc = sorted([t for t in existing if t[0] > min_new],
+                              key=lambda t: t[0])
+            num_map = {num: fill_start + i for i, (num, _f) in enumerate(push_asc)}
+            # 从编号最大的文件开始改名：目标编号若与未改名文件重名，其原编号必更大、
+            # 已先行改走，不会发生中间覆盖；编号不变的文件跳过。
+            for num, fname in sorted(push_asc, reverse=True):
+                new_num = num_map[num]
+                if new_num == num:
+                    continue
                 _stem, ext = os.path.splitext(fname)
-                new_name = f"{base}-{num + shift:04d}{ext}"
+                new_name = f"{base}-{new_num:04d}{ext}"
                 os.rename(os.path.join(target_sub, fname),
                           os.path.join(target_sub, new_name))
                 self._wlog(f"  改名: {fname} → {new_name}")
 
-        # 改名完成后复制新文件；改名后仍保留在原编号上的文件才会被覆盖
+        # 改名完成后复制新文件；仍保留在原编号上的目标同名文件才会被覆盖
         overwrite_nums = set()
         if n == 1:
             if any(e_num == new_files[0][0] for e_num, _ in existing):
@@ -5576,17 +6016,23 @@ class FileBatchReplaceWorker(QThread):
             overwrite_nums.add(min_new)
 
         ok = 0
-        for num, src_path in new_files:
-            fname = os.path.basename(src_path)
-            shutil.copy2(src_path, os.path.join(target_sub, fname))
-            act = "覆盖" if num in overwrite_nums else "复制"
-            self._wlog(f"  {act}: {fname}")
+        target_stems = []
+        for i, (num, src_path) in enumerate(new_files):
+            # 复制N个时按占位编号落盘(源编号不连续时自动归位)；单个时保持源编号
+            target_num = num if n == 1 else min_new + i
+            ext = os.path.splitext(src_path)[1]
+            target_name = f"{base}-{target_num:04d}{ext}"
+            shutil.copy2(src_path, os.path.join(target_sub, target_name))
+            target_stems.append(f"{base}-{target_num:04d}")
+            if target_num != num:
+                self._wlog(f"  复制改名: {os.path.basename(src_path)} → {target_name}")
+            else:
+                act = "覆盖" if num in overwrite_nums else "复制"
+                self._wlog(f"  {act}: {target_name}")
             ok += 1
         if ok:
-            # 生成 Directory.txt: 记录替换后的文件名清单(不含扩展名), 供分件读取偏移量
-            self._write_directory_txt(target_sub,
-                                      [os.path.splitext(os.path.basename(p))[0]
-                                       for _, p in new_files])
+            # 生成 Directory.txt: 记录替换后在目标目录中的文件名清单(不含扩展名), 供分件读取偏移量
+            self._write_directory_txt(target_sub, target_stems)
         return ok, 0
 
     def _write_directory_txt(self, target_sub, new_stems):
@@ -5737,8 +6183,9 @@ class FileBatchReplacePage(FunctionPage):
             "功能说明：\n"
             "• 扫描JPG源目录(含子目录)，文件名去除最后四位数字编号和最后一个\"-\"得到基础名，与目标目录下同名子目录匹配\n"
             "• 仅处理编号不小于起始编号的文件(缺省扩展名jpg，如输入 0002；留空默认从 0001 开始)\n"
-            "• 只复制1个文件 → 直接覆盖目标同名文件；复制N个文件 → 目标目录中编号大于最小复制编号的\n"
-            "  现有文件先向后平移 N-1 个编号预留空位(从编号最大的文件开始改名)，再复制新文件\n"
+            "• 只复制1个文件 → 直接覆盖目标同名文件；复制N个文件 → 源文件从最小编号起连续占位\n"
+            "  (最小编号处覆盖目标同名文件)，目标中编号大于最小编号的现有文件从 最小编号+N 起\n"
+            "  按升序重新编号预留空位(从编号最大的文件开始改名)，再复制新文件，替换后编号连续\n"
             "• 处理日志生成在目标目录下\n"
             "• 替换后在每个目标子目录生成 Directory.txt(记录替换后的文件名清单, 不含扩展名),\n"
             "  供分件功能读取目录页与文件偏移量\n"
@@ -5871,6 +6318,424 @@ class FileBatchReplacePage(FunctionPage):
             QMessageBox.information(self, "完成", "处理完成！")
         else:
             QMessageBox.warning(self, "提示", message)
+
+
+class ArchiveCatalogWorker(QThread):
+    """
+    档案馆标准目录生成后台线程：
+      解析用户指定目录下符合编码规则的子目录名(全宗号-档案类型·年度-保管期限
+      代码-项目号-案卷号, 如 J380-ZY·2021-Y-FGC-0001)，从各子目录内的
+      xlsx(卷内文件目录)提取最大页码，按模板逐条填入，生成标准目录xlsx。
+      - 编码目录不在指定目录的直接下层时，递归向下层查找(按"上级目录"分组输出)
+      - 保管期限: Y=永久, D30=30年, D10=10年
+      - 总页数: 子目录xlsx中序号最大行的页码列的最大页码(如"102-232"取232)
+      - 输出: 指定目录下「档案馆标准目录」子目录, 文件名=编码目录们的上级目录名
+    """
+    log_signal = Signal(str)
+    progress_signal = Signal(int, int)
+    finished_signal = Signal(bool, str)
+
+    # 编码目录名正则: 全宗号-类型·年度-期限-项目-卷号(卷号4位数字)
+    _CODE_RE = re.compile(
+        r'^([A-Z0-9]+)-([A-Z]+)·(\d{4})-([A-Z0-9]+)-([A-Z0-9]+)-(\d{3,4})$')
+    _RETENTION = {'Y': '永久', 'D30': '30年', 'D10': '10年'}
+
+    def __init__(self, base_dir, template_path, output_dir=None, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.template_path = template_path
+        # 输出目录: 缺省=数据目录下「档案馆标准目录」, 可由界面指定
+        self.output_dir = output_dir or os.path.join(base_dir, "档案馆标准目录")
+        self.is_stopped = False
+
+    def stop(self):
+        self.is_stopped = True
+
+    # ---------- 编码目录发现(递归) ----------
+    def _find_code_groups(self):
+        """
+        递归发现编码目录并按上级目录分组。
+        返回 {上级目录绝对路径: [编码子目录绝对路径, ...]}；
+        指定目录的直接下层就是编码目录 → 上级=指定目录本身。
+        递归规则: 直接下层无编码目录时, 深入每个下层普通目录继续找,
+        找到的那层的"上级目录"作为输出文件名来源。
+        """
+        groups = {}
+
+        def scan(dir_path, top):
+            if self.is_stopped:
+                return
+            try:
+                entries = sorted(os.listdir(dir_path))
+            except Exception:
+                return
+            code_dirs, normal_dirs = [], []
+            for e in entries:
+                p = os.path.join(dir_path, e)
+                if not os.path.isdir(p):
+                    continue
+                if self._CODE_RE.match(e):
+                    code_dirs.append(p)
+                else:
+                    normal_dirs.append(p)
+            if code_dirs:
+                groups.setdefault(top, []).extend(code_dirs)
+                return  # 该层已是编码目录层, 不再深入
+            for nd in normal_dirs:
+                scan(nd, nd)  # 下层的上级=该普通目录
+
+        scan(self.base_dir, self.base_dir)
+        return groups
+
+    # ---------- 从子目录xlsx提取最大页码 ----------
+    def _max_page_from_xlsx(self, dir_path, wlog):
+        """子目录内找xlsx, 取序号最大行的页码列最大页码。无有效数据返回None。"""
+        try:
+            import openpyxl
+        except ImportError:
+            wlog("  × 缺少 openpyxl 库")
+            return None
+        xlsx_files = [f for f in sorted(os.listdir(dir_path))
+                      if f.lower().endswith('.xlsx') and not f.startswith('~$')]
+        if not xlsx_files:
+            return None
+        best = None
+        for xf in xlsx_files:
+            xp = os.path.join(dir_path, xf)
+            try:
+                wb = openpyxl.load_workbook(xp, read_only=True, data_only=True)
+                ws = wb.active
+                # 标题行自适应: 前5行内找含"序号"和"页号"的行
+                header_row_idx, seq_col, page_col = None, None, None
+                for r in range(1, 6):
+                    rows = list(ws.iter_rows(min_row=r, max_row=r, values_only=True))
+                    if not rows:
+                        break
+                    headers = [str(c).strip() if c is not None else '' for c in rows[0]]
+                    if '序号' in headers and '页号' in headers:
+                        header_row_idx = r
+                        seq_col = headers.index('序号')
+                        page_col = headers.index('页号')
+                        break
+                if header_row_idx is None:
+                    wb.close()
+                    continue
+                for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+                    cells = list(row)
+                    if len(cells) <= max(seq_col, page_col):
+                        continue
+                    seq_v, page_v = cells[seq_col], cells[page_col]
+                    if seq_v is None or page_v is None:
+                        continue
+                    try:
+                        seq_i = int(seq_v)
+                    except (ValueError, TypeError):
+                        continue
+                    page_str = str(page_v).strip().replace(' ', '')
+                    if not page_str:
+                        continue
+                    nums = [int(x) for x in re.findall(r'\d{1,4}', page_str)]
+                    if not nums:
+                        continue
+                    row_max = max(nums)
+                    if best is None or seq_i > best[0] or (seq_i == best[0] and row_max > best[1]):
+                        best = (seq_i, row_max)
+                wb.close()
+            except Exception as e:
+                wlog(f"  × 读取xlsx失败 {xf}: {e}")
+        return best[1] if best else None
+
+    # ---------- 填充模板 ----------
+    def _fill_template(self, out_path, rows, wlog):
+        """按模板结构追加数据行。
+        rows=[(档号,全宗,类型,年度,期限代码,期限中文,项目,卷号,页数),...]"""
+        import openpyxl
+        from openpyxl.styles import Alignment
+        wb = openpyxl.load_workbook(self.template_path)
+        ws = wb.active
+        # 找模板首个数据行: 首个"档号/案卷级档号"列有值的下一行, 否则表头后一行
+        start_row = None
+        for r in range(1, min(ws.max_row, 20) + 1):
+            for c in range(1, ws.max_column + 1):
+                v = ws.cell(row=r, column=c).value
+                if v is not None and ('档号' in str(v)):
+                    start_row = r + 1
+                    break
+            if start_row:
+                break
+        if start_row is None:
+            start_row = ws.max_row + 1
+        # 列自适应: 按表头关键字定位各列(缺省按顺序)
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=start_row - 1, column=c).value
+            if v is None:
+                continue
+            v = str(v).strip()
+            headers[v] = c
+        col_map = {}
+        for key, aliases in [('档号', ['档号', '案卷级档号', '案卷号档号']),
+                             ('全宗', ['全宗号', '全宗']),
+                             ('类型', ['档案类型', '门类代码', '类型']),
+                             ('年度', ['年度', '年份']),
+                             ('期限代码', ['保管期限代码', '期限代码']),
+                             ('期限', ['保管期限', '期限']),
+                             ('项目', ['项目号', '项目代码', '项目']),
+                             ('卷号', ['案卷号', '卷号']),
+                             ('页数', ['总页数', '页数'])]:
+            for a in aliases:
+                if a in headers:
+                    col_map[key] = headers[a]
+                    break
+        center = Alignment(horizontal='center', vertical='center')
+        for i, (code, fonds, ftype, year, ret_code, retention, proj, vol, pages) in enumerate(rows):
+            r = start_row + i
+            if '档号' in col_map:
+                ws.cell(row=r, column=col_map['档号'], value=code)
+            if '全宗' in col_map:
+                ws.cell(row=r, column=col_map['全宗'], value=fonds)
+            if '类型' in col_map:
+                ws.cell(row=r, column=col_map['类型'], value=ftype)
+            if '年度' in col_map:
+                ws.cell(row=r, column=col_map['年度'], value=int(year))
+            if '期限代码' in col_map:
+                ws.cell(row=r, column=col_map['期限代码'], value=ret_code)
+            if '期限' in col_map:
+                ws.cell(row=r, column=col_map['期限'], value=retention)
+            if '项目' in col_map:
+                ws.cell(row=r, column=col_map['项目'], value=proj)
+            if '卷号' in col_map:
+                ws.cell(row=r, column=col_map['卷号'], value=int(vol))
+            if '页数' in col_map and pages is not None:
+                ws.cell(row=r, column=col_map['页数'], value=pages)
+            for c in range(1, ws.max_column + 1):
+                ws.cell(row=r, column=c).alignment = center
+        wb.save(out_path)
+
+    def run(self):
+        try:
+            if not os.path.isdir(self.base_dir):
+                self.finished_signal.emit(False, "所选目录不存在")
+                return
+            if not os.path.isfile(self.template_path):
+                self.finished_signal.emit(False, "模板文件不存在")
+                return
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            out_root = self.output_dir
+            os.makedirs(out_root, exist_ok=True)
+            log_path = os.path.join(out_root, f"档案馆目录日志_{ts}.txt")
+            logf = open(log_path, 'w', encoding='utf-8')
+            import threading
+            lock = threading.Lock()
+
+            def wlog(s):
+                with lock:
+                    logf.write(s + "\n")
+                    logf.flush()
+                self.log_signal.emit(s)
+
+            wlog("档案馆标准目录生成 - 处理日志")
+            wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            wlog(f"指定目录: {self.base_dir}")
+            wlog(f"模板: {self.template_path}")
+            wlog("=" * 70)
+
+            groups = self._find_code_groups()
+            if not groups:
+                logf.close()
+                self.finished_signal.emit(False, "该目录(含下层)无可用编码目录数据")
+                return
+
+            total = sum(len(v) for v in groups.values())
+            wlog(f"发现 {len(groups)} 个分组 / 共 {total} 个编码子目录")
+            done = 0
+            ok_files = []
+            for top, code_dirs in sorted(groups.items()):
+                if self.is_stopped:
+                    break
+                top_name = os.path.basename(top)
+                wlog("")
+                wlog(f"── 分组: {top_name} ({len(code_dirs)} 卷) ──")
+                rows = []
+                for cd in sorted(code_dirs):
+                    m = self._CODE_RE.match(os.path.basename(cd))
+                    fonds, ftype, year, code_ret, proj, vol = m.groups()
+                    retention = self._RETENTION.get(code_ret, code_ret)
+                    pages = self._max_page_from_xlsx(cd, wlog)
+                    full_code = os.path.basename(cd)
+                    wlog(f"  {full_code}: 全宗={fonds} 类型={ftype} 年度={year} "
+                         f"期限={retention} 项目={proj} 卷号={vol} 页数={pages}")
+                    rows.append((full_code, fonds, ftype, year, code_ret, retention, proj, vol, pages))
+                    done += 1
+                    self.progress_signal.emit(done, total)
+                if not rows:
+                    continue
+                out_name = f"{top_name}.xlsx"
+                out_path = os.path.join(out_root, out_name)
+                try:
+                    self._fill_template(out_path, rows, wlog)
+                    ok_files.append(out_name)
+                    wlog(f"  ✓ 生成: {out_name} ({len(rows)} 条)")
+                except Exception as e:
+                    wlog(f"  × 生成失败 {out_name}: {e}")
+
+            wlog("")
+            wlog("=" * 70)
+            wlog(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            wlog(f"生成 {len(ok_files)} 个目录文件: {', '.join(ok_files)}")
+            logf.close()
+            if self.is_stopped:
+                self.finished_signal.emit(False, "已停止")
+            else:
+                self.finished_signal.emit(
+                    True, f"完成！生成 {len(ok_files)} 个标准目录文件 → {out_root}")
+        except Exception as e:
+            self.finished_signal.emit(False, f"处理出错: {e}")
+
+
+class ArchiveCatalogPage(FunctionPage):
+    """档案馆标准目录生成页：解析编码子目录名+提取页数，按模板批量生成xlsx"""
+
+    def __init__(self):
+        super().__init__("档案馆标准目录")
+        self.worker = None
+
+        group = QGroupBox("生成档案馆标准目录（科技类案卷级）")
+        form = QFormLayout()
+
+        self.dir_edit = QLineEdit()
+        self.dir_edit.setPlaceholderText("选择包含编码子目录的目录")
+        btn_browse = QPushButton("选择文件夹")
+        btn_browse.setObjectName("BrowseBtn")
+        btn_browse.clicked.connect(self.browse_dir)
+        h1 = QHBoxLayout()
+        h1.addWidget(self.dir_edit)
+        h1.addWidget(btn_browse)
+        form.addRow("数据目录:", h1)
+
+        self.tpl_edit = QLineEdit()
+        self.tpl_edit.setPlaceholderText("选择档案馆标准目录模板xlsx")
+        btn_tpl = QPushButton("选择模板")
+        btn_tpl.setObjectName("BrowseBtn")
+        btn_tpl.clicked.connect(self.browse_template)
+        h2 = QHBoxLayout()
+        h2.addWidget(self.tpl_edit)
+        h2.addWidget(btn_tpl)
+        form.addRow("模板文件:", h2)
+
+        # 输出目录: 缺省=数据目录下「档案馆标准目录」, 用户可改
+        self.out_edit = QLineEdit()
+        self.out_edit.setPlaceholderText("输出目录(缺省: 数据目录\\档案馆标准目录)")
+        btn_out = QPushButton("选择文件夹")
+        btn_out.setObjectName("BrowseBtn")
+        btn_out.clicked.connect(self.browse_out)
+        h3 = QHBoxLayout()
+        h3.addWidget(self.out_edit)
+        h3.addWidget(btn_out)
+        form.addRow("输出目录:", h3)
+
+        group.setLayout(form)
+        self.layout.addWidget(group)
+
+        info = QLabel(
+            "功能说明：\n"
+            "• 解析子目录编码 全宗号-类型·年度-期限代码-项目号-案卷号\n"
+            "  (如 J380-ZY·2021-Y-FGC-0001)\n"
+            "• 案卷级档号=目录名; 期限 Y=永久 D30=30年 D10=10年\n"
+            "• 总页数=子目录xlsx中序号最大行的页码最大值(如102-232取232)\n"
+            "• 编码目录不在直接下层时自动向下层递归查找\n"
+            "• 输出到「档案馆标准目录」子目录, 文件名=编码目录的上级目录名"
+        )
+        info.setStyleSheet("color: #666; font-size: 12px;")
+        self.layout.addWidget(info)
+
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("生成目录")
+        self.start_btn.setObjectName("ActionBtn")
+        self.start_btn.clicked.connect(self.start)
+        btn_layout.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("ActionBtn")
+        self.stop_btn.setStyleSheet("background-color: #DA3633; color: white;")
+        self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.setEnabled(False)
+        btn_layout.addWidget(self.stop_btn)
+        self.layout.addLayout(btn_layout)
+
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        self.layout.addWidget(self.progress)
+
+        self.add_log_widget()
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择数据目录")
+        if d:
+            self.dir_edit.setText(d)
+            # 输出框为空时自动填缺省(数据目录\档案馆标准目录); 用户改过则不覆盖
+            if not self.out_edit.text().strip():
+                self.out_edit.setText(os.path.join(d, "档案馆标准目录"))
+
+    def browse_out(self):
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if d:
+            self.out_edit.setText(d)
+
+    def browse_template(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "选择模板xlsx", "", "Excel文件 (*.xlsx)")
+        if f:
+            self.tpl_edit.setText(f)
+
+    def start(self):
+        d = self.dir_edit.text().strip()
+        t = self.tpl_edit.text().strip()
+        if not d or not os.path.isdir(d):
+            QMessageBox.warning(self, "提示", "请先选择有效的数据目录")
+            return
+        if not t or not os.path.isfile(t):
+            QMessageBox.warning(self, "提示", "请先选择模板xlsx文件")
+            return
+        out = self.out_edit.text().strip()
+        if not out:
+            out = os.path.join(d, "档案馆标准目录")
+            self.out_edit.setText(out)
+        try:
+            os.makedirs(out, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法创建输出目录: {e}")
+            return
+        self.log_box.clear()
+        self.log(f"开始生成: {d}")
+        self.log(f"模板: {t}")
+        self.log(f"输出目录: {out}")
+        self.worker = ArchiveCatalogWorker(d, t, output_dir=out)
+        self.worker.log_signal.connect(self.log)
+        self.worker.progress_signal.connect(self._update_progress)
+        self.worker.finished_signal.connect(self._on_finished)
+        self.worker.start()
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    def stop(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.log("正在停止...")
+
+    def _update_progress(self, cur, total):
+        pct = cur / total * 100 if total else 0
+        self.progress.setValue(int(pct))
+        self.progress.setFormat(f"{cur} / {total} ({pct:.0f}%)")
+
+    def _on_finished(self, success, message):
+        self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止/失败")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        if success:
+            QMessageBox.information(self, "完成", message)
+        else:
+            QMessageBox.warning(self, "结束", message)
 
 
 class FileSplitPage(FunctionPage):
@@ -7012,7 +7877,7 @@ class XlsxToJpgPage(FunctionPage):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("同美档案工具集合")
+        self.setWindowTitle("同美档案工具集合 v" + VERSION)
         self.resize(1000, 650)
         self.setStyleSheet(TechStyle.QSS)
 
@@ -7038,7 +7903,8 @@ class MainWindow(QMainWindow):
 
         # 菜单按钮配置
         menus = ["文件改名", "自动编页码", "文件移动", "加盖归档章",
-                 "修改DPI", "表格输出为JPG", "JPG转双层PDF", "PDF转OFD", "分件", "文件批量替换"]
+                 "修改DPI", "表格输出为JPG", "JPG转双层PDF", "PDF转OFD", "分件", "文件批量替换",
+                 "档案馆标准目录"]
 
         self.menu_buttons = []
         for m in menus:
@@ -7070,7 +7936,8 @@ class MainWindow(QMainWindow):
             "JPG转双层PDF": JpgToPdfPage(),
             "PDF转OFD": PdfToOfdPage(),
             "分件": FileSplitPage(),
-            "文件批量替换": FileBatchReplacePage()
+            "文件批量替换": FileBatchReplacePage(),
+            "档案馆标准目录": ArchiveCatalogPage()
         }
 
         for name in menus:
@@ -7100,6 +7967,7 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    _setup_crash_log()  # 崩溃日志: 任何崩溃都留下记录(见函数注释)
     app = QApplication(sys.argv)
     # 强制使用深色科技感字体渲染
     f = QFont("Microsoft YaHei", 9)
