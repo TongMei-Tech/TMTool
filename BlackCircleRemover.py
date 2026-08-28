@@ -8,10 +8,17 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "2.8"
+VERSION = "2.9"
 
 CHANGELOG = [
     # 新版本记录追加在此列表头部(最新在前)
+    {
+        "version": "2.9",
+        "date": "2026-08-28",
+        "changes": [
+            "处理失败文件兜底拷贝源文件: 终结输出核对发现输出缺失(图损坏/解码异常/写盘失败等)时, 自动将对应源文件拷贝到输出路径补齐, 保证输出目录永远不缺文件; 拷贝也失败(源被外部删除等)才计为真缺失并显式报错; 兜底成功计为成功并在日志标注原因",
+        ],
+    },
     {
         "version": "2.8",
         "date": "2026-08-27",
@@ -912,8 +919,11 @@ class CircleDetectionWorker(QThread):
             # 终结输出核对：每个已提交的输入都必须有非空输出落盘。任何环节(线程异常、
             # 写盘失败、杀软拦截、外部删除)导致的缺失都在此显式暴露，
             # 杜绝“处理完成但输出缺文件且无任何报错”的静默缺失。
+            # 处理失败的文件兜底拷贝源文件到输出路径——保证输出目录永远不缺文件：
+            # 处理不了(损坏图/解码异常等)也比丢文件好，用户至少拿到原始副本。
             # (仅在正常结束时核对：用户中途停止时未提交的文件属预期跳过，已有停止提示覆盖)
             missing_outputs = []
+            fallback_copies = []
             if not self.is_stopped:
                 res_by_path = {r.get('path'): r for r in results}
                 for jpg_path in jpg_files:
@@ -925,15 +935,33 @@ class CircleDetectionWorker(QThread):
                     if not ok_file:
                         reason = (str(r.get('error_msg', ''))
                                   if (r and not r.get('success')) else '输出文件缺失或为空(原因未知)')
-                        missing_outputs.append((jpg_path, reason))
-                        wlog(f"✗ 输出缺失: {os.path.basename(jpg_path)} -> {op}（{reason}）")
-                        self.log_signal.emit(f"✗ {os.path.basename(jpg_path)} - 输出文件缺失！{reason}")
+                        # 兜底拷贝源文件, 保证不丢文件
+                        try:
+                            shutil.copy2(jpg_path, op)
+                            fallback_copies.append(jpg_path)
+                            wlog(f"⚠ 处理失败已拷贝源文件兜底: {os.path.basename(jpg_path)}"
+                                 f"（{reason}）")
+                            self.log_signal.emit(
+                                f"⚠ {os.path.basename(jpg_path)} - 处理失败, 已拷贝源文件到输出")
+                            # 兜底成功后计为成功(输出存在), 但错误原因仍在日志
+                            if r:
+                                r['success'] = True
+                                r['fallback_copy'] = True
+                            success_count += 1
+                        except Exception as copy_err:
+                            missing_outputs.append((jpg_path, f"{reason}; 兜底拷贝也失败: {copy_err}"))
+                            wlog(f"✗ 输出缺失且兜底拷贝失败: {os.path.basename(jpg_path)}"
+                                 f" -> {op}（{reason}; 拷贝错误: {copy_err}）")
+                            self.log_signal.emit(
+                                f"✗ {os.path.basename(jpg_path)} - 输出缺失且拷贝源文件失败！{reason}")
                     elif r and not r.get('success'):
                         # 罕见：报失败但文件在(如保存后校验前异常)——以实际落盘为准改记成功，避免误报
                         r['success'] = True
                         success_count += 1
                 if missing_outputs:
-                    wlog(f"警告: {len(missing_outputs)} 个输出文件缺失，请检查上方明细后补处理！")
+                    wlog(f"警告: {len(missing_outputs)} 个输出文件仍缺失(兜底拷贝也失败)，请检查上方明细！")
+                if fallback_copies:
+                    wlog(f"兜底拷贝: {len(fallback_copies)} 个处理失败文件已用源文件副本补齐输出")
             if self.is_stopped:
                 wlog("注意：处理被用户中途停止")
             logf.close()
