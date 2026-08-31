@@ -8,10 +8,26 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "2.9"
+VERSION = "2.10"
 
 CHANGELOG = [
     # 新版本记录追加在此列表头部(最新在前)
+    {
+        "version": "3.0",
+        "date": "2026-08-31",
+        "changes": [
+            "新增空白区订书机孔散点清理: 主体文字区外的孤立实心小暗点(订书机冲孔/金属丝压痕, 实心近圆或细长低实心形态)用周边底色填充; 订书钉成排行带(同带5块以上+远离内容区)放宽尺寸限制清理钉帽残迹",
+            "印章保护: 红色印章(红通道优势)/黑色规则印章(d>=60近圆)/残缺印章碎块(20-60低实心, 仅内容区附近)及其60px邻域全部跳过, 手写数字笔画群(100px邻域8块以上)同样保护, 实测0152/0219章旁手写150/145/190完整保留",
+            "带底色扫描图保护: 整页底色非白(中位灰<235)的图只做装订孔检测填充, 跳过去黑边/色蕴/散点等清理环节(实测0006底色213图被误清117k像素, 现仅装订孔处理)",
+        ],
+    },
+    {
+        "version": "2.10",
+        "date": "2026-08-28",
+        "changes": [
+            "撤销2.7的输出命名改动：恢复按输入目录相对路径输出——输出目录下按输入的子目录结构生成对应子目录再写文件，不再生成全路径编码的平铺文件名(用户此前反馈的输出问题实为界面输出框显示内容，非实际文件输出)；预览匹配与完成刷新同步恢复相对路径匹配；大小写冲突改名、终结输出核对、失败兜底拷贝均保留并改为基于相对路径",
+        ],
+    },
     {
         "version": "2.9",
         "date": "2026-08-28",
@@ -126,31 +142,6 @@ def _gray_u8(arr):
         return arr.copy()
     return ((arr[:, :, 0].astype(np.uint16) + arr[:, :, 1] + arr[:, :, 2])
             // 3).astype(np.uint8)
-
-
-def _encode_path_as_filename(path):
-    """把文件绝对路径编码为单层合法文件名(v2.7 输出命名)。
-    输出不再保留输入的目录结构，全部平铺在输出目录；文件名含源文件全路径，
-    既可直接看出来源，又天然避免不同子目录同名文件互覆盖。
-    例: F:\\数据\\档案\\001.jpg -> F__数据_档案_001.jpg"""
-    name = os.path.abspath(path)
-    for ch in '\\/:*?"<>|':
-        name = name.replace(ch, '_')
-    # Windows 路径长度限制：超长时从最长段中部折半缩短(保留段首尾可辨识)，
-    # 防止拼接输出目录后超过 260 字符导致保存失败(常规档案路径不会触发)
-    if len(name) > 200:
-        base, ext = os.path.splitext(name)
-        parts = base.split('_')
-        while parts and len('_'.join(parts)) + len(ext) > 200:
-            idx = max(range(len(parts)), key=lambda i: len(parts[i]))
-            seg = parts[idx]
-            if len(seg) <= 8:
-                parts.pop(idx)
-                continue
-            keep = len(seg) // 2
-            parts[idx] = seg[:keep // 2] + seg[-keep // 2:]
-        name = '_'.join(parts) + ext
-    return name
 
 
 def _projection_skew_cv2(small, max_angle):
@@ -821,23 +812,23 @@ class CircleDetectionWorker(QThread):
             wlog(f"圆圈最大直径: {self.max_diameter_mm}mm；纠偏: {'开启' if self.deskew else '关闭'}；去孔影: {'开启' if self.remove_shadow else '关闭'}；自动加深: {'开启' if self.auto_darken else '关闭'}；线程数: {self.thread_count}")
             wlog("=" * 70)
 
-            # 预分配输出路径：输出文件名 = 源文件全路径编码名(平铺单层，文件名含来源，
-            # 天然避免不同子目录同名文件互覆盖)。仍检测大小写不敏感重名(如
-            # F_..._091.jpg 与 f_..._091.jpg)，Windows 文件系统不区分大小写，
+            # 预分配输出路径：输出保持输入目录结构(相对输入目录)，每个输入子目录在
+            # 输出目录下生成对应子目录。仍检测大小写不敏感重名(两个相对路径仅大小写
+            # 不同，如 A\009.jpg 与 a\009.jpg)，Windows 文件系统不区分大小写，
             # 后者会静默覆盖前者导致输出缺失且无任何报错。冲突时后者改名加 _重复N 后缀。
             out_paths = {}
             _name_seen = {}
             for jpg_path in jpg_files:
-                fname = _encode_path_as_filename(jpg_path)
-                key = fname.lower()
+                rel_path = os.path.relpath(jpg_path, self.input_dir)
+                key = rel_path.lower()
                 n = _name_seen.get(key, 0)
                 _name_seen[key] = n + 1
                 if n > 0:
-                    base, ext = os.path.splitext(fname)
-                    fname = f"{base}_重复{n}{ext}"
-                    wlog(f"警告: {jpg_path} 与此前文件编码后仅大小写不同，Windows下会互相覆盖，"
-                         f"本文件输出改名为 {fname}")
-                out_paths[jpg_path] = os.path.join(self.output_dir, fname)
+                    base, ext = os.path.splitext(rel_path)
+                    rel_path = f"{base}_重复{n}{ext}"
+                    wlog(f"警告: {jpg_path} 与此前文件相对路径仅大小写不同，Windows下会互相覆盖，"
+                         f"本文件输出改名为 {rel_path}")
+                out_paths[jpg_path] = os.path.join(self.output_dir, rel_path)
 
             def process_one(jpg_path, idx):
                 if self.is_stopped:
@@ -935,8 +926,9 @@ class CircleDetectionWorker(QThread):
                     if not ok_file:
                         reason = (str(r.get('error_msg', ''))
                                   if (r and not r.get('success')) else '输出文件缺失或为空(原因未知)')
-                        # 兜底拷贝源文件, 保证不丢文件
+                        # 兜底拷贝源文件, 保证不丢文件(目录结构输出下子目录可能尚未创建)
                         try:
+                            os.makedirs(os.path.dirname(op), exist_ok=True)
                             shutil.copy2(jpg_path, op)
                             fallback_copies.append(jpg_path)
                             wlog(f"⚠ 处理失败已拷贝源文件兜底: {os.path.basename(jpg_path)}"
@@ -1015,7 +1007,7 @@ class CircleDetectionWorker(QThread):
     def process_image(self, image_path, output_path=None):
         """
         处理单个图像：检测打孔洞并用白色填充。返回处理结果字典。
-        output_path 可由批处理预分配(含大小写冲突改名)；缺省按源文件全路径编码名推导。
+        output_path 可由批处理预分配(含大小写冲突改名)；缺省按输入目录相对路径推导(保持目录结构)。
         """
         try:
             # 档案扫描图通常较大：解除 PIL 默认大图限制，容错截断图
@@ -1043,11 +1035,40 @@ class CircleDetectionWorker(QThread):
             gray_full = _gray_u8(arr)
             mask_full = gray_full < 50  # 装订孔检测阈值(灰度<50=足够暗)
             circles_info = self.detect_edge_holes(mask_full, orig_w, orig_h, gray_full)
+            # 带底色扫描图判定：整页底色非白(中位灰<235)的图(彩色底/米黄底档案纸)，
+            # 其"底色与内容对比弱"，去黑边/色蕴/散点/竖带等清理环节的暗块阈值
+            # (bg-60等)会把底色上的正常文字/表格误判清除(实测0006底色213被
+            # 误清117k像素)。此类图只做装订孔检测与填充，跳过其他清理。
+            _arr_med = float(np.median(np.array(img).mean(axis=2))) \
+                if img.mode == 'RGB' else float(np.median(np.array(img)))
+            is_tinted_page = _arr_med < 235
             del arr, gray_full, mask_full
             circles_info = self._dedup_circles(circles_info)
 
             if circles_info:
                 img = self.crop_circles(img, circles_info)
+
+            if is_tinted_page:
+                # 带底色图：仅装订孔处理，其余清理全部跳过(底色图上暗块阈值不可靠)
+                dots_removed = 0
+                shadows_removed = 0
+                darken_applied = False
+                rel_path = os.path.relpath(image_path, self.input_dir)
+                output_path = output_path or os.path.join(self.output_dir, rel_path)
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                img.save(output_path, quality=95, dpi=orig_dpi)
+                return {
+                    'path': image_path,
+                    'filename': os.path.basename(image_path),
+                    'success': True,
+                    'circles_found': len(circles_info),
+                    'deskew_angle': deskew_applied,
+                    'darken_applied': darken_applied,
+                    'dots_removed': dots_removed,
+                    'shadows_removed': shadows_removed,
+                    'tinted_page': True,
+                    'output_path': output_path,
+                }
 
             # --- 已知孔位残影定点清理：孔周浅灰环影(含与扫描灰带相连的情况) ---
             if self.remove_shadow and circles_info:
@@ -1069,6 +1090,9 @@ class CircleDetectionWorker(QThread):
             # --- 去边缘浅蓝色蕴(装订孔后): 扫描仪边缘偏色, 替换为本体色 ---
             img = self.remove_color_halo(img)
 
+            # --- 去空白区订书机孔散点: 主体文字区外的孤立实心小暗点 ---
+            img, dots_removed = self.remove_isolated_specks(img)
+
             # --- 边缘底色覆盖：将四周边缘区域用底色覆盖 ---
             if self.edge_cover and self.edge_margin_pixels > 0:
                 img = self.cover_edge_with_bg(img, self.edge_margin_pixels)
@@ -1085,9 +1109,10 @@ class CircleDetectionWorker(QThread):
                     img = self.darken_text(img, gamma=1.3)
                     darken_applied = True
 
-            # 输出路径：文件名 = 源文件全路径编码名，平铺单层，文件名即可追溯来源
+            # 输出路径：保持输入目录结构(相对输入目录)，每个子目录对应生成输出子目录
             if output_path is None:
-                output_path = os.path.join(self.output_dir, _encode_path_as_filename(image_path))
+                rel_path = os.path.relpath(image_path, self.input_dir)
+                output_path = os.path.join(self.output_dir, rel_path)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
             if circles_info:
@@ -2003,6 +2028,239 @@ class CircleDetectionWorker(QThread):
         out_arr = arr.copy()
         out_arr[fill] = bg
         return Image.fromarray(out_arr), int(fill.sum())
+
+    # ==================== 空白区订书机孔散点清理 + 印章保护 ====================
+
+    @staticmethod
+    def _content_bbox(mask, pad_ratio=0.02):
+        """主体内容bbox：暗像素的5~95分位外扩pad。无内容返回None。
+        用5%分位(而非1%): 散点/订书钉等离群暗点会把1%分位拉到自身位置,
+        使其落入内容bbox内而漏清(实测单点在x=70把x_lo拉到61)。
+        5%分位下离群点占比<5%时不影响边界。"""
+        ys, xs = np.where(mask)
+        if len(ys) < 100:
+            return None
+        y_lo, y_hi = np.percentile(ys, [5, 95])
+        x_lo, x_hi = np.percentile(xs, [5, 95])
+        py = (y_hi - y_lo) * pad_ratio
+        px = (x_hi - x_lo) * pad_ratio
+        return (int(x_lo - px), int(y_lo - py), int(x_hi + px), int(y_hi + py))
+
+    @staticmethod
+    def _detect_seal_protect_zones(arr, gray):
+        """
+        检测印章保护区域(圆bbox列表)。印章是合法内容, 散点清理绝不触碰:
+          1. 红色印章: R>G+40 且 R>B+40 且 R>90 的红色块(任何尺寸);
+          2. 黑色规则印章: d>=60px + 近圆(长宽比<=1.6) + 圆度>=0.35;
+          3. 残缺印章碎块: d 20~60px 且实心度<0.5(笔画/环状) — 整块保护;
+          4. 粘连保护: 印章区域外扩60px内的散点也跳过(章边印泥点)。
+        返回 [(cx, cy, protect_radius), ...]。
+        """
+        try:
+            import cv2
+        except ImportError:
+            return []
+        zones = []
+        H, W = gray.shape
+        rgb = arr.ndim == 3
+
+        def add_zone(cx, cy, reach):
+            zones.append((cx, cy, reach))
+
+        # 1) 红色印章(最强特征, 优先)
+        if rgb:
+            R = arr[:, :, 0].astype(np.int16)
+            G = arr[:, :, 1].astype(np.int16)
+            B = arr[:, :, 2].astype(np.int16)
+            red = ((R - G > 40) & (R - B > 40) & (R > 90)).astype(np.uint8)
+            if red.sum() > 200:
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+                cl = cv2.morphologyEx(red, cv2.MORPH_CLOSE, k)
+                n, _, st, _ = cv2.connectedComponentsWithStats(cl, 8)
+                for i in range(1, n):
+                    a = st[i, 4]
+                    if a < 500:
+                        continue
+                    l, t, w2, h2 = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
+                    cx, cy = l + w2 // 2, t + h2 // 2
+                    add_zone(cx, cy, max(w2, h2) // 2 + 60)
+
+        # 2)+3) 黑色印章块: 单阈值全图暗块分析(含残章)
+        # 残章碎块保护限定在"内容区附近"(距内容bbox边<=200px):
+        # 远离内容区的边缘碎块是订书钉/装订残物而非印章(印章盖在文字区上),
+        # 不保护(否则顶部空白带的订书钉被整带保护导致散点清理失效)。
+        # 内容bbox由调用方散点清理的主区bbox近似传入 → 此处自行重算。
+        dark = (gray < 80).astype(np.uint8)
+        n2, _, st2, _ = cv2.connectedComponentsWithStats(dark, 8)
+        near_content = None
+        if dark.sum() > 5000:
+            ys2, xs2 = np.where(dark)
+            y2lo, y2hi = np.percentile(ys2, [2, 98])
+            x2lo, x2hi = np.percentile(xs2, [2, 98])
+            near_content = (x2lo - 120, y2lo - 120, x2hi + 120, y2hi + 120)
+        for i in range(1, n2):
+            a = st2[i, 4]
+            if a < 300:
+                continue
+            l, t, w2, h2 = st2[i, 0], st2[i, 1], st2[i, 2], st2[i, 3]
+            d = max(w2, h2)
+            asp = d / max(min(w2, h2), 1)
+            sol = a / (w2 * h2) if w2 * h2 else 0
+            cx, cy = l + w2 // 2, t + h2 // 2
+            if d >= 60 and asp <= 1.6:
+                # 圆度: 面积/外接圆面积(印章环+文字典型>=0.35)
+                circ = a / (np.pi * (d / 2.0) ** 2) if d > 0 else 0
+                if circ >= 0.35:
+                    add_zone(cx, cy, d // 2 + 60)
+            elif 20 <= d <= 60 and sol < 0.5:
+                # 残缺印章碎块(笔画/环状低实心): 仅在内容区附近保护;
+                # 边缘远处的不保护(订书钉/装订残物)
+                if near_content:
+                    nx_lo, ny_lo, nx_hi, ny_hi = near_content
+                    if nx_lo <= cx <= nx_hi and ny_lo <= cy <= ny_hi:
+                        add_zone(cx, cy, d // 2 + 50)
+        return zones
+
+    def remove_isolated_specks(self, img,
+                              max_diam_px=35, min_solidity=0.55, max_aspect=2.0):
+        """
+        清理主体文字区外的孤立订书机孔散点(实心小暗点), 用周边底色填充。
+        只动"高实心+近圆+真暗"的小点(订书机孔物理特征):
+          d<=35px + 实心度>=0.55 + 长宽比<=2.0 + 均值灰<80;
+        印章保护: 红章/黑章整章/残章碎块及其60px邻域全部跳过。
+        返回 (结果Image, 清理点数)。需要 cv2; 无 cv2 原样返回。
+        """
+        try:
+            import cv2
+        except ImportError:
+            return img, 0
+        arr = np.array(img)
+        H, W = arr.shape[:2]
+        rgb = arr.ndim == 3
+        gray = (arr.mean(axis=2).astype(np.uint8) if rgb else arr.copy())
+
+        mask = (gray < 80).astype(np.uint8)
+        # 无pad的内容bbox: pad会把贴近主区的散点也当内容保护起来
+        # (实测S161主区y_lo=477, pad后427, 顶部订书钉y≈460被包进内容区漏清)
+        bbox = self._content_bbox(mask, pad_ratio=0.0)
+        if bbox is None:
+            return img, 0
+        x_lo, y_lo, x_hi, y_hi = bbox
+
+        # 印章保护区域
+        zones = self._detect_seal_protect_zones(arr, gray)
+
+        # 候选散点: 内容bbox外 + 严格暗(<80均值)小块
+        strict = (gray < 50).astype(np.uint8)
+        n, labels, st, _ = cv2.connectedComponentsWithStats(strict, 8)
+
+        # 钉排残迹行带预判: bbox外的候选块按y聚成行带(±40px), 同带>=5块且带整体
+        # 距内容区>=60px(远离正文, 排除页眉行) → 该带是订书钉成排残迹, 带内块
+        # 放宽尺寸(d<=60)与形状限制(钉帽/翻折丝印低实心)。印章保护zone仍优先拦截。
+        _pre = []
+        for i in range(1, n):
+            a = st[i, 4]
+            if a < 3 or a > 1500:
+                continue
+            l, t, w2, h2 = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
+            cx, cy = l + w2 // 2, t + h2 // 2
+            if x_lo <= cx <= x_hi and y_lo <= cy <= y_hi:
+                continue
+            _pre.append((i, cx, cy, max(w2, h2), a))
+        staple_rows = set()   # 行带内块的组件索引
+        if _pre:
+            _pre.sort(key=lambda c: c[2])
+            row = [_pre[0]]
+            rows = []
+            for c in _pre[1:]:
+                if c[2] - row[-1][2] <= 40:
+                    row.append(c)
+                else:
+                    rows.append(row)
+                    row = [c]
+            rows.append(row)
+            for r in rows:
+                if len(r) < 5:
+                    continue
+                ys_r = [c[2] for c in r]
+                # 带整体在内容区上方/下方且间隔>=60px
+                if max(ys_r) < y_lo - 60 or min(ys_r) > y_hi + 60:
+                    for c in r:
+                        if c[3] <= 60:
+                            staple_rows.add(c[0])
+        out = arr.copy()
+        removed = 0
+        for i in range(1, n):
+            a = st[i, 4]
+            if a < 3 or a > 1200:
+                continue
+            l, t, w2, h2 = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
+            cx, cy = l + w2 // 2, t + h2 // 2
+            # 必须在内容bbox外(空白区)
+            if x_lo <= cx <= x_hi and y_lo <= cy <= y_hi:
+                continue
+            d = max(w2, h2)
+            in_staple_row = (i in staple_rows)
+            if d > (60 if in_staple_row else max_diam_px):
+                continue
+            asp = d / max(min(w2, h2), 1)
+            # 实心度: 严格暗像素占bbox比(订书机孔穿透点实心度高)
+            sol = a / (w2 * h2) if w2 * h2 else 0
+            # 可清理形态:
+            # ① 实心近圆点(sol>=0.55, asp<=2): 订书机冲孔点/大头针孔;
+            # ② 细长低实心痕(sol>=0.15, asp<=6): 订书钉金属丝压痕;
+            # ③ 钉排行带成员(d<=60): 成串伴同于散点的钉帽/翻折残迹(低实心近方),
+            #    行带判据(同带>=5块+远离内容区)已排除页眉/印章, zone仍兜底保护。
+            is_dot = (asp <= max_aspect and sol >= min_solidity)
+            is_staple = (asp <= 6.0 and sol >= 0.15)
+            if not (is_dot or is_staple or in_staple_row):
+                continue
+            # 块均值灰度(真暗)
+            comp = (labels == i)
+            if float(gray[comp].mean()) >= 80:
+                continue
+            # 印章保护: 落在任何保护zone内则跳过
+            protected = False
+            for zx, zy, zr in zones:
+                if (cx - zx) ** 2 + (cy - zy) ** 2 <= zr ** 2:
+                    protected = True
+                    break
+            if protected:
+                continue
+            # 手写笔画群保护: 候选点100x100邻域内若存在>=8个其他暗块(笔画碎片群),
+            # 说明该处是手写数字/文字/印章笔画区(笔画由大量碎块构成), 不是孤立
+            # 订书机孔点 — 跳过。实测章旁手写"150/145"区碎块密度高(章+笔画群),
+            # 而订书机孔散点彼此孤立(100px窗内仅1-3块)。仅对非钉排行带成员检查
+            # (钉排本身是成排散点, 密度高是正常的)。
+            if not in_staple_row:
+                nb = sum(1 for pj, px, py, pd, pa in _pre
+                         if pj != i and abs(px - cx) <= 50 and abs(py - cy) <= 50)
+                if nb >= 8:
+                    continue
+            # 用周边(外扩至bbox外1.5倍)的亮像素中位数填底色
+            s = max(d, 8)
+            sx1, sy1 = max(0, cx - s), max(0, cy - s)
+            sx2, sy2 = min(W, cx + s + 1), min(H, cy + s + 1)
+            region = out[sy1:sy2, sx1:sx2]
+            region_gray = (region.mean(axis=2) if region.ndim == 3 else region)
+            bright = region[region_gray > 100]
+            if len(bright):
+                fill_color = tuple(int(v) for v in np.median(
+                    bright.reshape(-1, bright.shape[-1]) if region.ndim == 3 else bright,
+                    axis=0))
+            else:
+                fill_color = (255, 255, 255) if rgb else 255
+            # 填充整个块(用连通域精确形状)
+            sub = comp[sy1:sy2, sx1:sx2]
+            if rgb:
+                tgt = out[sy1:sy2, sx1:sx2]
+                tgt[sub] = fill_color
+            else:
+                out[sy1:sy2, sx1:sx2][sub] = fill_color
+            removed += 1
+        if removed == 0:
+            return img, 0
+        return Image.fromarray(out), removed
 
     def remove_color_halo(self, img, edge_ratio=0.18):
         """
@@ -3181,8 +3439,7 @@ class BlackCircleRemoverPage(QWidget):
 
     def preview_file_by_path(self, filepath):
         """按文件路径预览：原图+处理后对比。
-        处理后结果按"源文件全路径编码文件名"匹配(v2.7平铺命名)，
-        未命中时回退旧版本相对目录结构，兼容历史处理结果。"""
+        处理后结果按输入目录相对路径匹配(输出保持输入目录结构)。"""
         if not filepath or not os.path.isfile(filepath):
             return
         # 原图（如果勾选了边缘覆盖，传入margin参数以显示红框）
@@ -3196,17 +3453,14 @@ class BlackCircleRemoverPage(QWidget):
             self.before_panel.path_label.setText(filepath)
         except Exception:
             pass
-        # 处理后结果：优先按全路径编码文件名匹配(v2.7输出命名)，
-        # 未命中回退旧版相对路径结构，兼容历史处理结果不会错位
+        # 处理后结果：按相对输入目录的路径匹配(输出保持输入目录结构)
         self.after_panel.clear()
         self.after_panel.path_label.setText("")
         output_dir = self.output_dir.text().strip()
         root_dir = getattr(self, '_tree_root_dir', '') or self.input_dir.text().strip()
-        if output_dir and os.path.isdir(output_dir):
-            after_path = os.path.join(output_dir, _encode_path_as_filename(filepath))
-            if not os.path.isfile(after_path) and root_dir:
-                rel = os.path.relpath(filepath, root_dir)
-                after_path = os.path.join(output_dir, rel)
+        if output_dir and os.path.isdir(output_dir) and root_dir:
+            rel = os.path.relpath(filepath, root_dir)
+            after_path = os.path.join(output_dir, rel)
             if os.path.isfile(after_path):
                 try:
                     img2 = Image.open(after_path)
@@ -3382,11 +3636,13 @@ class BlackCircleRemoverPage(QWidget):
         cur = self.before_panel._filepath if hasattr(self.before_panel, '_filepath') else None
         if not cur or not os.path.exists(output_path):
             return
-        # 仅当刚完成的输出正是当前预览原件的对应结果时刷新(v2.7全路径编码命名)
+        # 仅当刚完成的输出正是当前预览原件的对应结果时刷新(相对目录结构匹配)
         output_dir = self.output_dir.text().strip()
-        if output_dir:
+        input_root = self.input_dir.text().strip()
+        if output_dir and input_root:
             try:
-                if os.path.join(output_dir, _encode_path_as_filename(cur)) == output_path:
+                rel = os.path.relpath(cur, input_root)
+                if os.path.normcase(os.path.join(output_dir, rel)) == os.path.normcase(output_path):
                     self.preview_file_by_path(cur)
             except Exception:
                 pass
