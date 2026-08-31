@@ -12,10 +12,17 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.8"
+VERSION = "3.9"
 
 CHANGELOG = [
     # 新版本记录追加在此列表头部(最新在前)
+    {
+        "version": "3.9",
+        "date": "2026-08-28",
+        "changes": [
+            "修复JPG转双层PDF的GPU模式运行一段时间后报「Memory allocation failed... Try increasing size of Virtual Memory」的问题：① paddle显存分配策略环境变量(按增长分配/卷积工作区上限/关闭cuDNN穷举搜索)原在工作线程run()里才设置, 但点击开始时的GPU预检已在主线程先行导入paddle导致设置全部失效, 现提前到模块导入时设置(先于任何功能路径); ② 新增OCR引擎例行重建: 每处理200页自动丢弃引擎并重建, 阻断paddle推理引擎长时间运行内存累积; ③ 超长目录每50页分段写盘后追加释放GPU缓存(原仅每目录结束释放一次); ④ 单页推理出现内存分配失败时自动丢弃引擎重建并重试该页一次, 不再直接跳过该页文本层",
+        ],
+    },
     {
         "version": "3.8",
         "date": "2026-08-27",
@@ -139,6 +146,40 @@ def _setup_crash_log():
     threading.excepthook = _threadhook
 
     return crash_path
+# ========================================================================
+
+
+# ============================ GPU显存安全配置(v3.9) ============================
+# FLAGS_allocator_strategy 等环境变量必须在 paddle 【首次导入之前】设置才生效。
+# 旧版在 JPG转PDF 工作线程 run() 里才设置, 但界面点击“开始转换”时的GPU预检会先在
+# 主线程导入 paddle → 环境变量失效 → paddle 缺省分配器长时间运行后内存碎片持续累积,
+# 最终报「Memory allocation failed ... Try increasing size of Virtual Memory」。
+# 此处提前到模块导入时设置(先于任何功能路径)。
+def _setup_paddle_gpu_env():
+    """模块导入时执行一次: 屏蔽无卡机的CUDA设备 + 设置显存安全分配策略。"""
+    # 装了GPU版paddle但机器无NVIDIA卡时, paddle导入即锁定找GPU设备,
+    # 之后任何配置都报「Device id must be less than GPU count」→ 屏蔽CUDA设备走纯CPU。
+    try:
+        if 'CUDA_VISIBLE_DEVICES' not in os.environ:
+            import ctypes as _ct
+            try:
+                _ct.CDLL('nvcuda.dll')
+                _has_nvidia = True
+            except OSError:
+                _has_nvidia = False
+            if not _has_nvidia:
+                os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    except Exception:
+        pass
+    # auto_growth=显存按需增长(缺省策略预占/囤积大块显存, 与显示输出及其他应用争抢,
+    #   长时间多线程运行后碎片累积是「Memory allocation failed」的根因之一);
+    # workspace上限64MB=限制cuDNN卷积工作区, 防单次推理吃满显存;
+    # 关闭cuDNN穷举搜索=避免首推理长耗时选算法(表现为探测超时)。
+    os.environ.setdefault('FLAGS_allocator_strategy', 'auto_growth')
+    os.environ.setdefault('FLAGS_conv_workspace_size_limit', '64')
+    os.environ.setdefault('FLAGS_cudnn_exhaustive_search', '0')
+
+_setup_paddle_gpu_env()
 # ========================================================================
 
 
@@ -328,8 +369,8 @@ class FileSplitWorker(QThread):
       3. 按序号建子目录(目录名+“-”+四位序号)，按页号+偏移量移动 jpg 文件
          (偏移量=Directory.txt最大文件序号, 无Directory.txt时缺省为2；
          如偏移量2时页号“1-17”→移动 0003.jpg..0019.jpg)；
-      4. 建“目录名+备考表卷底”“目录名+卷皮目录”两个子目录；
-         卷皮页与目录页移入卷皮目录，最大与次大文件名移入备考表卷底；
+      4. 卷皮页/目录页 + 最大次大文件(原备考表卷底)统一移入“目录名-0000”子目录；
+         不再单独生成「备考表卷底」「卷皮目录」两个目录；
          分件完成后删除该目录下 Directory.txt；
       5. 全程详细日志(OCR识别行、序号/页号解析、文件移动范围)写入所选目录。
     """
@@ -345,12 +386,17 @@ class FileSplitWorker(QThread):
         self.xlsx_dir = xlsx_dir          # 目录文件(xlsx)所在根目录(None=OCR模式)
         self.is_stopped = False
         self._ocr = None  # PaddleOCR 延迟初始化(只初始化一次, 避免重复加载模型)
+        self._ocr_pages_since_init = 0  # 自上次引擎初始化以来处理的页数(例行重建计数, v3.9)
         import threading as _th
         self._ocr_init_lock = _th.Lock()   # 初始化锁: 多线程(JPG转PDF默认4线程)并发
-                                           # 首次调用时防止同时构造多个PaddleOCR实例
                                            # (并发构造会内存暴涨/死锁——低配机卡死根因)
 
     # ---------- OCR ----------
+    # OCR引擎例行重建阈值: 每处理N页丢弃实例重建。paddle推理引擎长时间连续运行会累积内存,
+    # GPU模式曾运行一段时间后报「Memory allocation failed」→ 定期重建阻断累积。
+    # 重建代价仅数秒模型重载, 相对数百页处理时长可忽略。
+    _OCR_RECYCLE_PAGES = 200
+
     # ---------- OCR服务线程: 串行化+超时看门狗+挂死后CPU重建 ----------
     def _ocr_svc_loop(self, q):
         """OCR服务线程主循环: 串行执行提交的任务。
@@ -440,6 +486,7 @@ class FileSplitWorker(QThread):
             self._ensure_ocr_service()
             self._svc_rebuilt = True
             self._ocr_probed = False
+            self._ocr_pages_since_init = 0  # CPU重建后重新计数(新实例从零开始)
             return True
 
     def _svc_empty_cache(self):
@@ -597,10 +644,28 @@ class FileSplitWorker(QThread):
         x1 为片段右边界，用于列定位。
         兼容 paddleocr 2.x (ocr(img, cls=True)) 与 3.x (predict(img), 结果对象)。
         """
+        # --- 例行重建(v3.9): 每 _OCR_RECYCLE_PAGES 页丢弃引擎, 本次调用重新初始化 ---
+        # 阻断paddle推理引擎长时间运行内存累积(曾在GPU模式运行一段时间后报
+        # "Memory allocation failed")。本方法只在OCR服务线程内串行执行, 重建安全。
+        _cnt = getattr(self, '_ocr_pages_since_init', 0)
+        if _cnt > 0 and _cnt % self._OCR_RECYCLE_PAGES == 0 and self._ocr is not None:
+            self.log_signal.emit(f"  OCR引擎例行重建(已处理{_cnt}页, 防长时间运行内存累积)")
+            self._ocr = None
+            try:
+                import gc as _gc
+                _gc.collect()
+                if getattr(self, 'use_gpu_ocr', False):
+                    import paddle as _pd
+                    if hasattr(_pd.device, 'cuda'):
+                        _pd.device.cuda.empty_cache()
+            except Exception:
+                pass
+        self._ocr_pages_since_init = _cnt + 1
         ocr = self._get_ocr()
         if ocr is None:
             return []
         result = None
+        _mem_fail = False
         try:
             result = ocr.ocr(image_path, cls=True)
         except Exception as e:
@@ -610,11 +675,41 @@ class FileSplitWorker(QThread):
             except Exception:
                 try:
                     result = ocr.predict(image_path)
-                except Exception:
-                    import traceback
-                    wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
-                    wlog("    详细: " + traceback.format_exc().replace('\n', ' | ')[:500])
-                    return []
+                except Exception as e2:
+                    # v3.9: 内存分配失败(长时间运行内存累积) → 丢弃引擎重建后重试本页一次,
+                    # 不再直接跳过文本层。匹配paddle/CUDA的内存类错误文案(不区分大小写)。
+                    _msg = f"{e} | {e2}".lower()
+                    if any(k in _msg for k in ('memory allocation', 'bad_alloc',
+                                               'out of memory', 'cannot allocate',
+                                               'allocation failed')):
+                        _mem_fail = True
+                        self.log_signal.emit(
+                            f"    × OCR内存分配失败, 丢弃引擎重建后重试: "
+                            f"{os.path.basename(image_path)}")
+                        self._ocr = None
+                        try:
+                            import gc as _gc2
+                            _gc2.collect()
+                        except Exception:
+                            pass
+                        _ocr2 = self._get_ocr()
+                        if _ocr2 is not None and _ocr2 is not ocr:
+                            try:
+                                result = _ocr2.ocr(image_path, cls=True)
+                            except Exception:
+                                try:
+                                    result = _ocr2.ocr(image_path)
+                                except Exception:
+                                    result = None
+                    if result is None and not _mem_fail:
+                        import traceback
+                        wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
+                        wlog("    详细: " + traceback.format_exc().replace('\n', ' | ')[:500])
+                        return []
+                    if result is None:
+                        wlog(f"    OCR 内存分配失败且重建重试仍失败, 该页跳过文本层: "
+                             f"{os.path.basename(image_path)}")
+                        return []
 
         frags = []
         items = []
@@ -1434,12 +1529,15 @@ class FileSplitWorker(QThread):
             wlog("  Directory.txt 存在但未解析出对应目录页jpg, 回退默认规则")
 
         # ---- 默认规则(无 Directory.txt) ----
-        jp_dir = os.path.join(subdir, f"{dir_name}卷皮目录")
+        # 已分件目录: 卷皮/目录页归入编号0000目录(旧版为「卷皮目录」, 兼容两处)
+        jp_dir = os.path.join(subdir, f"{dir_name}-0000")
+        if not os.path.isdir(jp_dir):
+            jp_dir = os.path.join(subdir, f"{dir_name}卷皮目录")  # 旧版结果兼容
         jp_jpgs = self._jpg_files_sorted(jp_dir) if os.path.isdir(jp_dir) else []
         if len(jp_jpgs) >= 2:
             f1, f2 = jp_jpgs[0], jp_jpgs[1]
             page2_path = os.path.join(jp_dir, f2)
-            wlog(f"  目录页取自卷皮目录: {f2}")
+            wlog(f"  目录页取自{os.path.basename(jp_dir)}: {f2}")
         elif len(jpgs) >= 2:
             f1, f2 = jpgs[0], jpgs[1]
             page2_path = os.path.join(subdir, f2)
@@ -1559,19 +1657,17 @@ class FileSplitWorker(QThread):
                                        target_base=target_base, copy_mode=copy_mode,
                                        offset=offset)
 
-        # 建备考表卷底 / 卷皮目录
-        path_beikao = os.path.join(out_root, f"{dir_name}备考表卷底")
-        path_juanpi = os.path.join(out_root, f"{dir_name}卷皮目录")
-        os.makedirs(path_beikao, exist_ok=True)
-        os.makedirs(path_juanpi, exist_ok=True)
+        # 备考表卷底 + 卷皮目录 统一合并到编号 0000 的目录(不再生成两个独立目录)
+        path_zero = os.path.join(out_root, f"{dir_name}-0000")
+        os.makedirs(path_zero, exist_ok=True)
 
-        # 卷皮页 + 目录页 → 卷皮目录
+        # 卷皮页 + 目录页 → 0000目录
         for fname in front_files:
             src = os.path.join(subdir, fname)
             if os.path.exists(src):
-                _op(src, os.path.join(path_juanpi, fname))
+                _op(src, os.path.join(path_zero, fname))
                 moved += 1
-        wlog(f"  卷皮: {','.join(front_files)} → {dir_name}卷皮目录/ [{verb}]")
+        wlog(f"  卷皮: {','.join(front_files)} → {dir_name}-0000/ [{verb}]")
 
         # 当前剩余文件里 最大与次大 → 备考表卷底
         if copy_mode:
@@ -1591,9 +1687,9 @@ class FileSplitWorker(QThread):
         if len(remain) >= 2:
             for fname in (remain[-1], remain[-2]):
                 src = os.path.join(subdir, fname)
-                _op(src, os.path.join(path_beikao, fname))
+                _op(src, os.path.join(path_zero, fname))
                 moved += 1
-            wlog(f"  备考: {remain[-2]},{remain[-1]} → {dir_name}备考表卷底/ [{verb}]")
+            wlog(f"  备考: {remain[-2]},{remain[-1]} → {dir_name}-0000/ [{verb}]")
         else:
             wlog(f"  备考: 剩余文件不足2张({len(remain)}), 未处理")
 
@@ -4544,6 +4640,7 @@ class JpgToPdfWorker(QThread):
         self._svc_lock = threading.Lock()   # 服务线程生命周期管理锁(惰性初始化并发)
         self._svc_q = None                  # 当前服务线程任务队列(挂死后换新)
         self._svc_rebuilt = False           # 是否已做过GPU挂死→CPU重建(每轮只做一次)
+        self._ocr_pages_since_init = 0      # 引擎例行重建计数(与分件共享同款机制, v3.9)
         self._probe_lock = threading.Lock()  # 首推理探测全局只做一次(其余线程等结果)
         self._ocr_probed = False            # 探测是否完成(含重建后的重探测)
         self._ocr_broken = False            # OCR彻底不可用(探测+CPU重建均失败)→仅图像PDF
@@ -4563,31 +4660,9 @@ class JpgToPdfWorker(QThread):
     
     def run(self):
         try:
-            # GPU环境预处理(必须在 paddle 首次导入之前执行):
-            # 装了GPU版paddle但机器无NVIDIA卡时, paddle导入即锁定找GPU设备,
-            # 之后任何配置都报「Device id must be less than GPU count」。
-            # 用 ctypes 检测 nvcuda.dll(不导入paddle): 无卡则屏蔽CUDA设备,
-            # 让paddle全程走纯CPU(用户勾选GPU时同样只能回退, 日志已提示)。
-            try:
-                if 'CUDA_VISIBLE_DEVICES' not in os.environ:
-                    import ctypes as _ct
-                    try:
-                        _ct.CDLL('nvcuda.dll')
-                        _has_nvidia = True
-                    except OSError:
-                        _has_nvidia = False
-                    if not _has_nvidia:
-                        os.environ['CUDA_VISIBLE_DEVICES'] = ''
-            except Exception:
-                pass
-            # GPU显存安全限制(必须在 paddle 首次导入之前设置):
-            # auto_growth=显存按需增长(默认会预占绝大部分显存, 与显示输出/
-            #   其他应用争抢 → 长时间多线程运行后整机死机的根因之一);
-            # workspace上限64MB=限制cuDNN卷积工作区, 防单次推理吃满显存;
-            # 关闭cuDNN穷举搜索=避免首推理长耗时选算法(表现为探测超时)。
-            os.environ.setdefault('FLAGS_allocator_strategy', 'auto_growth')
-            os.environ.setdefault('FLAGS_conv_workspace_size_limit', '64')
-            os.environ.setdefault('FLAGS_cudnn_exhaustive_search', '0')
+            # GPU环境预处理(屏蔽无卡机CUDA设备+显存安全分配策略)已在模块导入时完成,
+            # 见文件头部 _setup_paddle_gpu_env()——必须在paddle首次导入之前设置,
+            # 而GPU预检(_check_gpu_capability)会在工作线程启动前先行导入paddle。
 
             # 输出目录不存在则创建(缺省为 源目录/PDF, 可能尚不存在)
             if self.output_dir:
@@ -4778,6 +4853,8 @@ class JpgToPdfWorker(QThread):
     _ocr_svc_call = FileSplitWorker._ocr_svc_call
     _rebuild_ocr_cpu = FileSplitWorker._rebuild_ocr_cpu
     _svc_empty_cache = FileSplitWorker._svc_empty_cache
+    # 类属性别名: 例行重建阈值(方法别名不携带类属性, 须显式同步)
+    _OCR_RECYCLE_PAGES = FileSplitWorker._OCR_RECYCLE_PAGES
 
     def _ocr_local_available(self):
         """本地OCR是否可用(初始化一次)。"""
@@ -4911,7 +4988,7 @@ class JpgToPdfWorker(QThread):
             CHUNK = 50
             seg_paths = []
             page_no = 0
-            for jpg_path in jpg_paths:
+            for page_idx, jpg_path in enumerate(jpg_paths):
                 if self.is_stopped:
                     break
                 # 仅取尺寸(头信息), 不全量解码 → 每页省~26MB解码内存
@@ -4926,7 +5003,7 @@ class JpgToPdfWorker(QThread):
 
                 # OCR文本层(坐标从像素换算到PDF点)——逐页日志, 挂起时可见最后处理到哪
                 self.log_signal.emit(f"    OCR: {os.path.basename(jpg_path)} "
-                                     f"({len(jpg_paths)}张中第{jpg_paths.index(jpg_path)+1}张)")
+                                     f"({len(jpg_paths)}张中第{page_idx+1}张)")
                 # OCR走服务线程(天然串行=替代ocr锁), 单页180秒超时。
                 # 中途挂死→尝试一次CPU重建并重试本页; 仍失败则该页无文本层,
                 # 继续处理后续页(不再永久阻塞——这是旧版4线程卡死的直接原因)。
@@ -5018,6 +5095,9 @@ class JpgToPdfWorker(QThread):
                     doc.close()
                     seg_paths.append(_seg)
                     doc = fitz.open()  # 重置doc, C++侧旧内存随close释放
+                    # v3.9: 分段重置同时释放GPU缓存——原仅每目录结束释放一次,
+                    # 数百页超长目录在单目录处理期间显存/内存会持续增长。
+                    self._svc_empty_cache()
 
             # 收尾: 存最后一段
             if seg_paths:
