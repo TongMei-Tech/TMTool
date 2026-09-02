@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 黑色圆圈检测与裁剪工具 - 检测并裁剪JPG文件左侧或右侧的黑色不规则圆圈
 运行环境：Windows 7
@@ -8,10 +9,31 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.0"
+VERSION = "3.3"
 
 CHANGELOG = [
     # 新版本记录追加在此列表头部(最新在前)
+    {
+        "version": "3.3",
+        "date": "2026-09-01",
+        "changes": [
+            "性能优化(输出像素逐位不变，8张样张实测16.65s→12.55s)：①消除重复计算——灰度图管线入口只算一次并传引用，各环节写像素后用与_gray_u8逐位一致的整除公式增量同步灰度，消除原先每页5+次重复灰度转换与逐环节PIL↔numpy往返；去黑边15×15模糊合并为双通道单次模糊(均值/平方均值)，竖带环节未改图时其局部标准差直接复用；②纠偏检测共享降采样——convert('L')只转一次贯穿各纠偏环节，1500px降采样图投影法/Hough/分区纠偏共用；③印章保护区域前置缓存——去黑边后算一次印章保护区，孔影/散点两环节共用(后续环节只删不加红/暗像素，缓存区只会更保守偏保护方向)，散点环节暗块掩码同源复用。另：中间档粗搜曾试改0.2°减半，实测0021-1样张角度漂移1.26→1.30不逐位一致，已改回0.1°并在代码内留注",
+        ],
+    },
+    {
+        "version": "3.2",
+        "date": "2026-08-31",
+        "changes": [
+            "性能优化：散点清理环节逐候选的块掩码由全图布尔运算(7446组件页单张约3.1s)改为组件外接框/填充窗局部比较，块均值与填充语义逐位不变。实测 0152 页散点环节 10.3s→0.7s、整页 15.0s→4.4s；6张样张平均 5.9s→3.3s，输出像素零差异",
+        ],
+    },
+    {
+        "version": "3.1",
+        "date": "2026-08-31",
+        "changes": [
+            "修复去孔影环节误擦章旁手写数字(实测0152右上角章旁手写150及带横线145被当孔影填掉, 而0219同类幸免)：手写笔画外围浅灰晕圈(灰度90~底色-15)会被软阴影掩码连成大块, 尺寸/均值/色散/成组校验全过关后被大半径填充圆覆盖。新增双重拦截：① 暗核拦截——连通块外接框外扩8px检查窗内暗像素(灰度<90)总量>=25即手写/污渍而非孔影(真孔已填白, 孔影纯渐变无暗核)；② 印章邻域保护——候选落入红章/黑章/残章保护区域(含邻域外延)整体跳过；带底色扫描图仅处理装订孔的保护(3.0)经实测有效保留",
+        ],
+    },
     {
         "version": "3.0",
         "date": "2026-08-31",
@@ -176,8 +198,9 @@ def _projection_skew_cv2(small, max_angle):
         return int(rot.sum(axis=1).var())
 
     v0 = var_at(0.0)
-    # 两级粗搜：先 0.4° 大步长定位峰值区(投影方差-角度曲线为宽单峰，0.4° 不会漏峰)，
-    # 再在峰值区±0.4°内 0.1° 精搜——迭代次数从约170降到约60，结果与单级粗搜一致。
+    # 三级搜索：先 0.4° 大步长定位峰值区(投影方差-角度曲线为宽单峰，0.4° 不会漏峰)，
+    # 再在峰值区±0.4°内 0.1° 细化(真峰距粗搜格点不超过0.05°)，最后±0.1°内 0.02° 精搜。
+    # (中间档曾试改0.2°减半搜索，但实测0021-1角度漂移1.26→1.30不逐位一致，已改回0.1°保零差异)
     s1_idx = int(np.argmax([var_at(a) for a in np.arange(-max_angle, max_angle + 1e-6, 0.4)]))
     s1 = -max_angle + s1_idx * 0.4
     coarse_idx = int(np.argmax([var_at(a) for a in np.arange(s1 - 0.4, s1 + 0.4 + 1e-6, 0.1)]))
@@ -188,14 +211,15 @@ def _projection_skew_cv2(small, max_angle):
     return round(float(fine), 2), round(ratio, 2)
 
 
-def _projection_skew_pure(pil_img, max_angle=8.0):
+def _projection_skew_pure(pil_img, max_angle=8.0, gray_l=None):
     """
     投影方差法估计偏斜角——无 cv2 回退版(纯 PIL + numpy)。
     与 cv2 版语义一致：PIL rotate 代替 warpAffine，直方图法代替 cv2.threshold(OTSU)，
     移位或运算代替闭运算，行/列投影占比代替连通域分析去除大块干扰。
     精度/速度略降(搜索步长 0.2°/0.05°)，打包环境缺 cv2 时保证纠偏功能不失效。
+    gray_l：pil_img 的灰度 PIL 图(调用方共享，省去重复 convert('L'))。
     """
-    gray = pil_img.convert('L')
+    gray = gray_l if gray_l is not None else pil_img.convert('L')
     W, H = gray.size
     sc = 1500.0 / max(W, H)  # 降采样加速(比 cv2 版更激进，纯 Python 旋转较慢)
     sw, sh = max(1, int(W * sc)), max(1, int(H * sc))
@@ -253,31 +277,42 @@ def _projection_skew_pure(pil_img, max_angle=8.0):
     return round(float(fine), 2), round(ratio, 2)
 
 
-def _projection_skew(pil_img, max_angle=8.0):
+def _small_gray(gray_img, cap=1500.0):
+    """把 PIL 灰度图降采样为长边 cap 的 numpy 数组(纠偏各环节共享的降采样图)。
+    与各环节原有公式一致：sc=cap/max(W,H)(小于 cap 的图同样按比例放大，保持既有语义)。"""
+    W, H = gray_img.size
+    sc = cap / max(W, H)
+    sw, sh = max(1, int(W * sc)), max(1, int(H * sc))
+    return np.array(gray_img.resize((sw, sh)))
+
+
+def _projection_skew(pil_img, max_angle=8.0, gray_l=None, small=None):
     """
     投影方差法估计偏斜角(度)。返回 (最佳旋转角, 置信比)。
     旋转角 = 让内容水平所需的旋转角(PIL 语义：正值=逆时针)。精度约 0.02°。
     置信比 = 最佳角处水平投影方差 / 0°处方差；>1 真实偏斜，≈1 无偏斜/信号弱。
     有 cv2 用主路径；无 cv2 回退纯 Python 实现(不再静默放弃纠偏)。
+    gray_l/small：调用方共享输入——gray_l 为 pil_img 的灰度 PIL 图(省重复
+    convert('L'))；small 为已降采样的 1500px 灰度 numpy 数组(与 _hough_skew
+    同源共享，省重复降采样)。
     """
     try:
         import cv2
     except ImportError:
-        return _projection_skew_pure(pil_img, max_angle)
+        return _projection_skew_pure(pil_img, max_angle, gray_l=gray_l)
 
-    gray = pil_img.convert('L')
-    W, H = gray.size
-    sc = 1500.0 / max(W, H)  # 降采样加速
-    sw, sh = max(1, int(W * sc)), max(1, int(H * sc))
-    small = np.array(gray.resize((sw, sh)))
+    if small is None:
+        small = _small_gray(gray_l if gray_l is not None else pil_img.convert('L'))
     return _projection_skew_cv2(small, max_angle)
 
 
-def _hough_skew(pil_img, min_count=30):
+def _hough_skew(pil_img, min_count=30, gray_l=None, small=None):
     """
     Hough直线法估计偏斜角(度)。返回 (角度, 近水平线根数=置信度)。
     对投影法不敏感的小角度(约1°)文字/表单图更灵敏。
     角度已与 PIL rotate 对齐(正值=逆时针，直接用于纠偏)。需要 cv2；无 cv2 返回 (0, 0)。
+    gray_l/small：调用方共享输入(与 _projection_skew 同源)——small 为已降采样
+    1500px 灰度数组，缺省时自行转换/降采样。
 
     仅用于文字行方向检测(降采样全量近水平线中位数)，不作表格基准：
     表格横线基准由 _ruled_table_angle(剪切投影法)专责——Canny+Hough 长线的 maxLineGap
@@ -289,13 +324,10 @@ def _hough_skew(pil_img, min_count=30):
     except ImportError:
         return 0.0, 0
 
-    gray = pil_img.convert('L')
-    W, H = gray.size
-
     # 降采样全量近水平线中位数(文字行密集图的主路径)
-    sc = 1500.0 / max(W, H)
-    sw, sh = max(1, int(W * sc)), max(1, int(H * sc))
-    small = np.array(gray.resize((sw, sh)))
+    if small is None:
+        small = _small_gray(gray_l if gray_l is not None else pil_img.convert('L'))
+    sh, sw = small.shape[:2]
     edges = cv2.Canny(small, 50, 150)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
                             minLineLength=max(20, sw // 8), maxLineGap=20)
@@ -314,7 +346,7 @@ def _hough_skew(pil_img, min_count=30):
     return 0.0, len(angs)
 
 
-def _vertical_frame_angle(pil_img):
+def _vertical_frame_angle(pil_img, gray_l=None):
     """
     页面左右两条竖向框线(手写/印刷方框的左右边)的基准倾角(度，PIL 语义)；
     无清晰竖框时返回 None。
@@ -325,13 +357,15 @@ def _vertical_frame_angle(pil_img):
     每带按行暗像素质心线性拟合测倾斜；两带角度一致(差≤1°)才返回中位角。
     排除(返回None)：暗底页(早退)、单侧孤线/边缘阴影带(间距不足)、整片暗区(带太宽)。
     """
-    gray = np.array(pil_img.convert('L'))
-    H, W = gray.shape
+    W, H = pil_img.size
     if max(W, H) > 1800:  # 降采样到长边1500提速(竖线几何不受影响)
         sc = 1500.0 / max(W, H)
         # resize 参数是(宽,高)，与 numpy shape(H,W)顺序相反，勿写反。
+        # 保持既有“先缩放彩色图再转灰度”顺序(与转灰再缩放数值不同)；全尺寸灰度转换不再做。
         gray = np.array(pil_img.resize((max(1, int(W * sc)), max(1, int(H * sc)))).convert('L'))
         H, W = gray.shape
+    else:
+        gray = np.array(gray_l) if gray_l is not None else np.array(pil_img.convert('L'))
     if float(np.percentile(gray, 75)) < 150:
         return None  # 暗底/彩底扫描件不适用框线概念(与清理系列函数惯例一致)
     dark = gray < 160  # 竖线笔墨阈值(印刷/手写墨线均远暗于此，纸面噪点远高于此)
@@ -381,7 +415,7 @@ def _vertical_frame_angle(pil_img):
     return float(np.median(angs))
 
 
-def _ruled_table_angle(pil_img):
+def _ruled_table_angle(pil_img, gray_l=None):
     """
     页面印刷横线(表格框线/表单行线)基准倾角(度，PIL 语义)；无表格基准时返回 None。
     印刷框线是页面真实方向基准：表格内的手写/打印文字行本身可能写得歪斜(实测手写行与
@@ -400,14 +434,17 @@ def _ruled_table_angle(pil_img):
     故小角度候选(|角|≤0.4°)须过“零度档对比闸门”：若零度档薄带数与最优档相差≤1，
     判为量化伪峰返回0°(宁可漏掉肉眼不可见的0.2°微倾，不可把水平表格旋歪——用户投诉的根源)；
     大角度候选不受此限(真倾斜页在零度档薄带数为0，无歧义)。
+    gray_l：调用方共享的灰度 PIL 图(仅 W≤1400 分支使用；大页走彩色缩放路径以保数值不变)。
     """
-    gray = np.array(pil_img.convert('L'))
-    H, W = gray.shape
+    W, H = pil_img.size
     if W > 1400:  # 降采样2倍提速(0.2°角度分辨率不受影响)
         # resize 参数是(宽,高)，与 numpy shape(H,W)顺序相反，勿写反。
-        pil_img = pil_img.resize((W // 2, H // 2))
-        gray = np.array(pil_img.convert('L'))
+        # 保持既有“先缩放彩色图再转灰度”顺序(与转灰再缩放数值不同)；
+        # 原实现在此分支前的全尺寸灰度转换被丢弃，现已省去。
+        gray = np.array(pil_img.resize((W // 2, H // 2)).convert('L'))
         H, W = gray.shape
+    else:
+        gray = np.array(gray_l) if gray_l is not None else np.array(pil_img.convert('L'))
     if W < 200:
         return None
     # 暗底/彩底扫描件(封面、底纹页)早退：前景≈整页，横线检测退化成页边界/底纹噪声，
@@ -480,9 +517,11 @@ def _ruled_table_angle(pil_img):
 _RULED_UNSET = object()  # 哨兵：表示横线基准尚未预计算(_deskew_image 内只算一次供两处复用)
 
 
-def _estimate_skew(pil_img, max_angle=8.0, ruled=_RULED_UNSET):
+def _estimate_skew(pil_img, max_angle=8.0, ruled=_RULED_UNSET, gray_l=None):
     """
     估计图像内容偏斜角(度)。返回 (旋转角, 置信比)，角度已与 PIL rotate 对齐。
+    gray_l：调用方(_deskew_image)共享的全页灰度 PIL 图，其 1500px 降采样图在
+    本函数内只算一次，供投影法与 Hough 复用(省去各环节重复 convert('L')+降采样)。
 
     检测优先级：
     0. 印刷横线基准(最高优先，先于投影法计算)：页面有表格框线时，框线角度是唯一可信的
@@ -494,9 +533,12 @@ def _estimate_skew(pil_img, max_angle=8.0, ruled=_RULED_UNSET):
        把原本正常的红头/红线旋出可见倾斜。
     2. 投影法大角度低置信伪峰值(>=3°且ratio<1.4，宽表格图)改用 Hough 裁决。
     """
+    # 全页灰度 + 1500px 降采样图只算一次，投影法与 Hough 共享(避免各环节重复转换)
+    _gl = gray_l if gray_l is not None else pil_img.convert('L')
+    _small = _small_gray(_gl)
     # 印刷横线基准(表格页)：优先级最高，检出则直接返回(不再跑投影法)
     if ruled is _RULED_UNSET:
-        ruled = _ruled_table_angle(pil_img)
+        ruled = _ruled_table_angle(pil_img, gray_l=_gl)
     ang_r = ruled
     if ang_r is not None:
         if abs(ang_r) >= 1.0:
@@ -504,18 +546,18 @@ def _estimate_skew(pil_img, max_angle=8.0, ruled=_RULED_UNSET):
             # 伪造大角度基准(实测照片页 ruled=-3.6°/-3.4° 而 Hough 有大量近水平线=0°——
             # 真倾斜≥1°的表格页其文字行同样倾斜，实测018页 Hough=-2.17 与 ruled=-2.0 一致)，
             # 不一致则基准作废，退回投影法常规判定(照片页投影判平整→不纠偏)。
-            ang_h, conf = _hough_skew(pil_img)
+            ang_h, conf = _hough_skew(pil_img, small=_small)
             if conf >= 30 and abs(ang_h - ang_r) > 0.8:
                 ang_r = None
     if ang_r is not None:
         if abs(ang_r) >= 0.1:
             return ang_r, 2.0  # 框线有倾角：整体按框线纠偏(无论投影法判平整与否)
         return 0.0, 1.0  # 框线水平：页面方向已正，文字行歪斜是书写问题，不旋转(保护红头/框线)
-    ang, ratio = _projection_skew(pil_img, max_angle)
+    ang, ratio = _projection_skew(pil_img, max_angle, small=_small)
     if ratio >= 1.2 and abs(ang) >= 0.1:
         # 投影法“大角度+低置信比”可能是宽表格图伪峰值，改用 Hough 裁决。
         if abs(ang) >= 3.0 and ratio < 1.4:
-            ang_h, conf = _hough_skew(pil_img)
+            ang_h, conf = _hough_skew(pil_img, small=_small)
             if conf >= 50:
                 # Hough 高置信：以其角度为准(表格图 Hough 可靠)
                 return (ang_h, 2.0) if abs(ang_h) >= 0.1 else (0.0, 1.0)
@@ -526,7 +568,7 @@ def _estimate_skew(pil_img, max_angle=8.0, ruled=_RULED_UNSET):
     # Hough 全量近水平线高置信(conf>=150)且角度与投影一致(差<0.8°)时采信——
     # 两独立方法同向印证可信；conf不足或分歧大仍判平整(保持红头保护语义)。
     if 1.1 <= ratio < 1.2:
-        ang_h, conf = _hough_skew(pil_img)
+        ang_h, conf = _hough_skew(pil_img, small=_small)
         # conf>=150 直接可信；表格图线少(conf>=40)但与投影同向(差<0.8°)亦可信
         # (实测D22表格页45根线中位1.75、四分位[0.95,2.14]紧凑同向，投影1.34印证)。
         ok_conf = conf >= 150 or (conf >= 40 and abs(ang_h - ang) <= 0.8)
@@ -537,7 +579,7 @@ def _estimate_skew(pil_img, max_angle=8.0, ruled=_RULED_UNSET):
     return 0.0, 1.0
 
 
-def _deskew_split(pil_img, fillcolor=(255, 255, 255), ruled=_RULED_UNSET):
+def _deskew_split(pil_img, fillcolor=(255, 255, 255), ruled=_RULED_UNSET, gray_l=None):
     """
     分区纠偏：页面整体无全局倾斜(投影法判平整)，但正文区存在明显倾斜时，
     保留顶部(红头标题/红线等本就水平的内容)原样，仅旋转切分线以下的正文区。
@@ -557,16 +599,16 @@ def _deskew_split(pil_img, fillcolor=(255, 255, 255), ruled=_RULED_UNSET):
     # 局部旋转会把表格内部上下错位/角度不一(实测表格第2-4行被单独旋转被用户投诉)，
     # 表格页只能由 _estimate_skew 按框线基准整体纠偏。
     if ruled is _RULED_UNSET:
-        ruled = _ruled_table_angle(pil_img)
+        ruled = _ruled_table_angle(pil_img, gray_l=gray_l)
     if ruled is not None:
         return pil_img, 0.0
-    out, ang = _deskew_split_bottom(pil_img, fillcolor)
+    out, ang = _deskew_split_bottom(pil_img, fillcolor, gray_l=gray_l)
     if ang != 0.0:
         return out, ang
-    return _deskew_split_lines(pil_img, fillcolor)
+    return _deskew_split_lines(pil_img, fillcolor, gray_l=gray_l)
 
 
-def _deskew_split_bottom(pil_img, fillcolor=(255, 255, 255)):
+def _deskew_split_bottom(pil_img, fillcolor=(255, 255, 255), gray_l=None):
     """
     分区纠偏路径一(常规布局)。
     触发条件(缺一不可)：
@@ -576,12 +618,14 @@ def _deskew_split_bottom(pil_img, fillcolor=(255, 255, 255)):
     切分线取页面上部的整行白底带(页眉与正文间的空隙)，接缝处是白底，旋转位移不可见。
     """
     W, H = pil_img.size
-    # 1. 底部区倾斜测量(投影法 + Hough 交叉印证)
+    # 1. 底部区倾斜测量(投影法 + Hough 交叉印证；底部区降采样图两法共享)
     bottom = pil_img.crop((0, int(H * 0.4), W, H))
-    ang_b, r_b = _projection_skew(bottom, 8.0)
+    bottom_small = (_small_gray(gray_l.crop((0, int(H * 0.4), W, H)))
+                    if gray_l is not None else None)
+    ang_b, r_b = _projection_skew(bottom, 8.0, small=bottom_small)
     if abs(ang_b) < 0.5 or r_b < 1.15:
         return pil_img, 0.0
-    ang_h, conf = _hough_skew(bottom)
+    ang_h, conf = _hough_skew(bottom, small=bottom_small)
     if abs(ang_b) >= 2.0:
         # 大角度必须有 Hough 文字线印证：投影法在图形化内容(如 S 形手绘画笔、
         # 大矩形框内的斜向笔画)上会产生强伪峰(实测 0017 页底部区伪峰 +5.84°/1.34，
@@ -598,7 +642,7 @@ def _deskew_split_bottom(pil_img, fillcolor=(255, 255, 255)):
         if (abs(ang_h) <= 0.3 and abs(ang_b) >= 0.5) or (conf >= 20 and abs(ang_b - ang_h) > 0.5):
             return pil_img, 0.0
     # 2. 切分线：页面上部最靠近正文的整行白底带(顶部内容保留最多)
-    gray = np.array(pil_img.convert('L'))
+    gray = np.array(gray_l) if gray_l is not None else np.array(pil_img.convert('L'))
     rows_white = (gray >= 210).mean(axis=1) >= 0.985
     y_lo, y_hi = int(H * 0.15), int(H * 0.50)
     best = None
@@ -625,7 +669,7 @@ def _deskew_split_bottom(pil_img, fillcolor=(255, 255, 255)):
     return out, round(float(ang_b), 2)
 
 
-def _deskew_split_lines(pil_img, fillcolor=(255, 255, 255)):
+def _deskew_split_lines(pil_img, fillcolor=(255, 255, 255), gray_l=None):
     """
     分区纠偏路径二(稀疏布局逐行共识)。
     场景：内容集中在页面上部(红头+文号+少量正文行)，下方是印章/日期/页码加大片空白。
@@ -638,7 +682,7 @@ def _deskew_split_lines(pil_img, fillcolor=(255, 255, 255)):
     且置信比>=1.02、Hough 交叉印证(同路径一)。
     """
     W, H = pil_img.size
-    gray = np.array(pil_img.convert('L'))
+    gray = np.array(gray_l) if gray_l is not None else np.array(pil_img.convert('L'))
     rows_white = (gray >= 210).mean(axis=1) >= 0.985
     ink = gray < 210
     min_ink = int(0.0002 * W * H)  # 文字行墨量下限(随分辨率缩放)：印章圆弧碎片/手写批注达不到
@@ -666,7 +710,9 @@ def _deskew_split_lines(pil_img, fillcolor=(255, 255, 255)):
     for (s, e) in runs:
         if e - s > 200 or int(ink[s:e].sum()) < min_ink:
             continue
-        a, r = _projection_skew(pil_img.crop((0, max(0, s - 4), W, min(H, e + 4))), 5.0)
+        a, r = _projection_skew(pil_img.crop((0, max(0, s - 4), W, min(H, e + 4))), 5.0,
+                                gray_l=(gray_l.crop((0, max(0, s - 4), W, min(H, e + 4)))
+                                        if gray_l is not None else None))
         if r >= 1.05 and abs(a) >= 0.8:
             tilted.append((s, e, a))
     if len(tilted) < 2:
@@ -689,12 +735,14 @@ def _deskew_split_lines(pil_img, fillcolor=(255, 255, 255)):
     y_cut_top = (up[-1][0] + up[-1][1]) // 2
     y_cut_bot = ((dn[0][0] + dn[0][1]) // 2) if dn else H
 
-    # 4. 条带级角度裁决(多条平行文字行互相增强，比单行可信)
+    # 4. 条带级角度裁决(多条平行文字行互相增强，比单行可信；降采样图投影与 Hough 共享)
     strip = pil_img.crop((0, y_cut_top, W, y_cut_bot))
-    ang_s, r_s = _projection_skew(strip, 5.0)
+    strip_small = (_small_gray(gray_l.crop((0, y_cut_top, W, y_cut_bot)))
+                   if gray_l is not None else None)
+    ang_s, r_s = _projection_skew(strip, 5.0, small=strip_small)
     if abs(ang_s) < 0.5 or abs(ang_s) > 4.0 or r_s < 1.02:
         return pil_img, 0.0
-    ang_h, conf = _hough_skew(strip)
+    ang_h, conf = _hough_skew(strip, small=strip_small)
     if conf >= 30 and abs(ang_s - ang_h) > 0.8:
         return pil_img, 0.0  # 与 Hough 矛盾：不动
 
@@ -715,20 +763,23 @@ def _deskew_image(pil_img, fillcolor=(255, 255, 255), min_angle=0.1, min_ratio=1
     全局判平整但正文区明显倾斜时(红头页)，改走分区纠偏(_deskew_split)。
     横线基准(_ruled_table_angle，约1秒)只计算一次，供 _estimate_skew 与
     _deskew_split 复用，避免每页重复两次的昂贵剪切扫描。
+    全页灰度只转一次，供横线基准/投影法/Hough/竖框线/分区各环节共享，
+    消除各环节重复的全图 convert('L')。
     """
-    ruled = _ruled_table_angle(pil_img)
-    ang, ratio = _estimate_skew(pil_img, ruled=ruled)
+    gray_l = pil_img.convert('L')
+    ruled = _ruled_table_angle(pil_img, gray_l=gray_l)
+    ang, ratio = _estimate_skew(pil_img, ruled=ruled, gray_l=gray_l)
     if abs(ang) >= min_angle and ratio >= min_ratio:
         if abs(ang) >= 2.0:
             # 垂直框线裁决：页面有左右两条清晰竖框线(三/四面包围手写的方框)时，竖线是页面方向基准。
             # 框内手写行写歪会让投影法产生大角度伪峰(实测0040页框竖直、框内手写-2.58°把整页旋歪)，
             # 竖框接近竖直则页面已正，宁不纠偏。小角度(<2°)不查：真微倾页竖框同样微倾，投影法可信。
-            v_ang = _vertical_frame_angle(pil_img)
+            v_ang = _vertical_frame_angle(pil_img, gray_l=gray_l)
             if v_ang is not None and abs(v_ang) <= 0.6:
                 return pil_img, 0.0
         out = pil_img.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=fillcolor)
         return out, ang
-    return _deskew_split(pil_img, fillcolor, ruled=ruled)
+    return _deskew_split(pil_img, fillcolor, ruled=ruled, gray_l=gray_l)
 
 
 class CircleDetectionWorker(QThread):
@@ -983,7 +1034,7 @@ class CircleDetectionWorker(QThread):
     def stop(self):
         self.is_stopped = True
 
-    def darken_text(self, img, gamma=1.3):
+    def darken_text(self, arr, gray, gamma=1.3):
         """
         自动加深文字：对较暗的文字像素(灰度<200)做幂律加深，背景(>200)不变。
         gamma>1 使中间调(浅灰文字)变暗，让文字更黑更清晰，接近高对比扫描件的效果。
@@ -991,18 +1042,25 @@ class CircleDetectionWorker(QThread):
         LUT 实现：映射 v→clip(200*(v/200)^gamma) 只依赖像素自身通道值(注意
         v>=200 时原幂律会把亮通道轻微提亮如240→253，LUT 完全保留此行为)，
         与原 float64 幂律逐位一致；免去全图 float64 中间数组(约 200MB)与逐像素幂运算。
+        输入/输出为管线传引用的 numpy 数组：gray 在变像素上用同一整除公式重算，
+        与全图 _gray_u8 结果逐位一致。返回 (加深后数组, 同步灰度数组)。
         """
         lut = 200.0 * (np.arange(256, dtype=np.float64) / 200.0) ** gamma
         table = np.clip(lut, 0, 255).astype(np.uint8)
-        arr = np.array(img)
         # 掩码 gray<200 用整除灰度与浮点均值判定逐位等价(sum//3<200 ⇔ sum/3<200)
-        gray = _gray_u8(arr)
         mask = gray < 200  # 文字/图形区域(非背景)
         if not mask.any():
-            return img
+            return arr, gray
         out = arr.copy()
         out[mask] = table[arr[mask]]
-        return Image.fromarray(out)
+        g_out = gray.copy()
+        if arr.ndim == 3:
+            px = out[mask]
+            g_out[mask] = ((px[:, 0].astype(np.uint16) + px[:, 1] + px[:, 2])
+                           // 3).astype(np.uint8)
+        else:
+            g_out[mask] = out[mask]
+        return out, g_out
 
     def process_image(self, image_path, output_path=None):
         """
@@ -1031,6 +1089,9 @@ class CircleDetectionWorker(QThread):
             # --- 先检测+填充装订孔（在去黑边之前！）---
             # 去黑边用更宽的灰度阈值(page_bg-60)，会把孔和附近的暗块连成大块一并填掉，
             # 导致后续检测不到孔。先在 <50 严格阈值上检测孔，填充后再去黑边。
+            # 性能：管线入口一次性 numpy 化并只算一次灰度，之后各环节传引用复用；
+            # 各环节写像素后用同一整除公式同步更新对应像素的灰度(与全图重算逐位一致)，
+            # 消除原先每页 5+ 次重复灰度转换与逐环节 PIL↔numpy 往返转换。
             arr = np.array(img)
             gray_full = _gray_u8(arr)
             mask_full = gray_full < 50  # 装订孔检测阈值(灰度<50=足够暗)
@@ -1039,14 +1100,13 @@ class CircleDetectionWorker(QThread):
             # 其"底色与内容对比弱"，去黑边/色蕴/散点/竖带等清理环节的暗块阈值
             # (bg-60等)会把底色上的正常文字/表格误判清除(实测0006底色213被
             # 误清117k像素)。此类图只做装订孔检测与填充，跳过其他清理。
-            _arr_med = float(np.median(np.array(img).mean(axis=2))) \
-                if img.mode == 'RGB' else float(np.median(np.array(img)))
+            _arr_med = float(np.median(gray_full))
             is_tinted_page = _arr_med < 235
-            del arr, gray_full, mask_full
+            del mask_full
             circles_info = self._dedup_circles(circles_info)
 
             if circles_info:
-                img = self.crop_circles(img, circles_info)
+                img = self.crop_circles(img, circles_info, arr)
 
             if is_tinted_page:
                 # 带底色图：仅装订孔处理，其余清理全部跳过(底色图上暗块阈值不可靠)
@@ -1070,44 +1130,60 @@ class CircleDetectionWorker(QThread):
                     'output_path': output_path,
                 }
 
+            # 非底色页继续清理：孔已填充，先刷新管线基准数组(后续环节看填充后的图)
+            if circles_info:
+                arr = np.array(img)
+                gray_full = _gray_u8(arr)
+
             # --- 已知孔位残影定点清理：孔周浅灰环影(含与扫描灰带相连的情况) ---
             if self.remove_shadow and circles_info:
-                img, _ = self.cleanup_known_hole_residue(img, circles_info)
+                arr, gray_full, _ = self.cleanup_known_hole_residue(
+                    arr, gray_full, circles_info)
 
             # --- 去贴边竖向扫描暗带(装订侧盖板阴影)：孔已填充，按列剖面整带清理 ---
+            _vb, _lstd15 = 0, None
             if self.remove_border:
-                img, _vb = self.remove_edge_vertical_band(img)
+                arr, gray_full, _vb, _lstd15 = self.remove_edge_vertical_band(arr, gray_full)
 
             # --- 再去黑边/阴影（孔已填充为底色，不会被误连）---
+            # 竖带环节未改图(_vb==0)时，其 15×15 局部标准差直接复用(同一灰度，结果逐位一致)
             if self.remove_border:
-                img, _br = self.remove_black_border(img)
+                arr, gray_full, _br = self.remove_black_border(
+                    arr, gray_full, local_std15=_lstd15 if _vb == 0 else None)
 
-            # --- 去装订孔阴影残留：孔周浅灰环/弧影(冲头压痕/扫描泛光) ---
+            # --- 印章保护区域前置缓存：孔影/散点两环节共用，避免重复全图连通域 ---
+            seal_zones = None
             shadows_removed = 0
             if self.remove_shadow:
-                img, shadows_removed = self.remove_hole_shadow_residue(img)
+                seal_zones = self._detect_seal_protect_zones(arr, gray_full)
+                # --- 去装订孔阴影残留：孔周浅灰环/弧影(冲头压痕/扫描泛光) ---
+                arr, gray_full, shadows_removed = self.remove_hole_shadow_residue(
+                    arr, gray_full, seal_zones)
 
             # --- 去边缘浅蓝色蕴(装订孔后): 扫描仪边缘偏色, 替换为本体色 ---
-            img = self.remove_color_halo(img)
+            arr, gray_full = self.remove_color_halo(arr, gray_full)
 
             # --- 去空白区订书机孔散点: 主体文字区外的孤立实心小暗点 ---
-            img, dots_removed = self.remove_isolated_specks(img)
+            arr, gray_full, dots_removed = self.remove_isolated_specks(
+                arr, gray_full, seal_zones)
 
             # --- 边缘底色覆盖：将四周边缘区域用底色覆盖 ---
             if self.edge_cover and self.edge_margin_pixels > 0:
-                img = self.cover_edge_with_bg(img, self.edge_margin_pixels)
+                arr, gray_full = self.cover_edge_with_bg(
+                    arr, gray_full, self.edge_margin_pixels)
 
             # --- 自动加深文字 ---
             darken_applied = False
             if self.auto_darken:
-                # 判断文字是否偏浅：统计文字像素(灰度<150)的平均灰度，
+                # 判断文字是否偏浅：统计文字像素(灰度 30~150)的平均灰度，
                 # 偏浅(>110)才加深；已经很深的文字不处理，避免过度加深。
-                arr_chk = np.array(img)
-                gray_chk = _gray_u8(arr_chk)
-                text_px = gray_chk[(gray_chk > 30) & (gray_chk < 150)]
+                # (直接用管线灰度，不再重复转换)
+                text_px = gray_full[(gray_full > 30) & (gray_full < 150)]
                 if text_px.size > 500 and float(text_px.mean()) > 110:
-                    img = self.darken_text(img, gamma=1.3)
+                    arr, gray_full = self.darken_text(arr, gray_full, gamma=1.3)
                     darken_applied = True
+
+            img = Image.fromarray(arr)
 
             # 输出路径：保持输入目录结构(相对输入目录)，每个子目录对应生成输出子目录
             if output_path is None:
@@ -1797,14 +1873,16 @@ class CircleDetectionWorker(QThread):
             area = int(stats[i, 4])
             yield top, left, top + h - 1, left + w - 1, area
 
-    def crop_circles(self, img, circles_info):
+    def crop_circles(self, img, circles_info, arr=None):
         """
         用与底色一致的颜色填充圆洞区域：在每个圆洞外围采样局部背景色再填充。
         白底图填白、彩底图填对应底色，避免彩色底图上出现刺眼白斑。
+        arr：原图 numpy 数组(管线传引用，省一次重复的 np.array(img))，缺省内部转换。
         """
         img_copy = img.copy()
         draw = ImageDraw.Draw(img_copy)
-        arr = np.array(img)  # 原始未绘制状态，用于采样背景色
+        if arr is None:
+            arr = np.array(img)  # 原始未绘制状态，用于采样背景色
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
 
@@ -1833,7 +1911,7 @@ class CircleDetectionWorker(QThread):
 
         return img_copy
 
-    def cleanup_known_hole_residue(self, img, circles_info):
+    def cleanup_known_hole_residue(self, arr, gray, circles_info):
         """
         已知装订孔位的阴影定点清理：孔填充后，孔周常残留浅灰环影(冲头压痕/扫描泛光)；
         当孔紧贴灰色扫描竖带时，残影与竖带连成巨型连通域，通用孔影检测(按连通域直径)
@@ -1841,17 +1919,18 @@ class CircleDetectionWorker(QThread):
         安全：只动浅灰像素(>=90)，深色墨迹像素不覆盖；填充圆内有墨迹连通域时整孔放弃。
         填充色取孔外环带浅灰中位数(灰带内取灰带色、白底取白)，使孔位融入周边背景。
         纯 numpy 实现，无 cv2 亦可用。
+        输入/输出为管线传引用的 numpy 数组，写像素处用同一整除公式同步灰度。
+        返回 (结果数组, 同步灰度数组, 填充孔数)。
         """
         if not circles_info:
-            return img, 0
-        arr = np.array(img)
+            return arr, gray, 0
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
-        gray = _gray_u8(arr)
         page_bg = float(np.percentile(gray, 75))
         if page_bg < 150:
-            return img, 0  # 暗底扫描件不适用残影概念(与 remove_hole_shadow_residue 一致)
+            return arr, gray, 0  # 暗底扫描件不适用残影概念(与 remove_hole_shadow_residue 一致)
         out = arr.copy()
+        g_out = None  # 惰性拷贝：多数页无残影，可省一次全图灰度拷贝
         filled = 0
         for cx, cy, r in circles_info:
             r = int(r)
@@ -1903,12 +1982,19 @@ class CircleDetectionWorker(QThread):
             sub = out[y0:y1, x0:x1]
             sub[residue] = color
             out[y0:y1, x0:x1] = sub
+            # 同步更新灰度(与 _gray_u8 同一整除公式，逐位一致)
+            if g_out is None:
+                g_out = gray.copy()
+            if rgb:
+                g_out[y0:y1, x0:x1][residue] = (color[0] + color[1] + color[2]) // 3
+            else:
+                g_out[y0:y1, x0:x1][residue] = color
             filled += 1
         if filled == 0:
-            return img, 0
-        return Image.fromarray(out), filled
+            return arr, gray, 0
+        return out, g_out, filled
 
-    def remove_edge_vertical_band(self, img):
+    def remove_edge_vertical_band(self, arr, gray):
         """
         去除紧贴左/右纸边的竖向扫描暗带(装订侧盖板阴影/纸张翘起泛光)。
         此类暗带纵贯全页、从纸边向内平滑渐变，孔填充后仍残留一条灰/黑竖带。
@@ -1922,15 +2008,19 @@ class CircleDetectionWorker(QThread):
              但彩墨像素(色散>30，如红章/彩笔)永不覆盖；
           3. 过渡区(带外侧渐变尾)收窄到更暗阈值(底色-60)之外才填且受墨迹保护，
              保护贴边但越界的手写/印章笔画。
-        纯 numpy 实现，无 cv2 亦可用。返回 (结果Image, 被填充像素数)。
+        纯 numpy 实现，无 cv2 亦可用。输入/输出为管线传引用的 numpy 数组。
+        返回 (结果数组, 同步灰度数组, 被填充像素数, 15×15局部标准差)——
+        未改图时局部标准差可供后续去黑边环节复用(同一灰度，逐位一致)，已改图时为 None。
         """
-        arr = np.array(img)
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
-        gray = _gray_u8(arr)
         page_bg = float(np.percentile(gray, 75))
         if page_bg < 150:
-            return img, 0  # 暗底扫描件不处理(与其他边缘清理一致)
+            return arr, gray, 0, None  # 暗底扫描件不处理(与其他边缘清理一致)
+        body = slice(100, H - 100) if H > 400 else slice(0, H)
+        body_h = body.stop - body.start
+        if body_h < 200:
+            return arr, gray, 0, None
 
         # 填充底色：取接近纸面白的像素中位(75 分位会被暗带亮部拉低，改取 90 分位)
         bgmask = gray >= float(np.percentile(gray, 90))
@@ -1942,14 +2032,9 @@ class CircleDetectionWorker(QThread):
             bg = int(np.median(arr[bgmask])) if bgmask.any() else 255
 
         gf = gray.astype(np.float32)
-        gmean = self._box_blur(gf, 15)
-        gsq = self._box_blur(gf * gf, 15)
+        gmean, gsq = self._blur_pair(gf, 15)
         local_std = np.sqrt(np.maximum(gsq - gmean * gmean, 0))
 
-        body = slice(100, H - 100) if H > 400 else slice(0, H)
-        body_h = body.stop - body.start
-        if body_h < 200:
-            return img, 0
         max_scan = min(W // 3, max(self.margin_pixels, 200))
         soft_thr = page_bg - 8    # 软阴影像素(含浅灰渐变尾)
         hard_thr = page_bg - 60  # 过渡区收窄阈值(墨迹保护线)
@@ -2015,7 +2100,7 @@ class CircleDetectionWorker(QThread):
             fill_tail |= b_tail
 
         if not fill_in.any():
-            return img, 0
+            return arr, gray, 0, local_std  # 未改图：局部标准差可供去黑边环节复用
         ink_mask = gray < (page_bg - 80)  # 过渡区深墨迹不覆盖(内部区已过纹理校验不受限)
         fill_tail = fill_tail & ~ink_mask
         fill = fill_in | fill_tail
@@ -2025,9 +2110,14 @@ class CircleDetectionWorker(QThread):
         if rgb:
             chroma = (arr.max(axis=2).astype(np.int16) - arr.min(axis=2).astype(np.int16))
             fill = fill & (chroma <= 30)
+        if not fill.any():
+            return arr, gray, 0, local_std  # 墨迹/彩墨过滤后无填充：图未变，标准差仍可复用
         out_arr = arr.copy()
         out_arr[fill] = bg
-        return Image.fromarray(out_arr), int(fill.sum())
+        # 同步更新灰度(与 _gray_u8 同一整除公式，逐位一致)
+        g_out = gray.copy()
+        g_out[fill] = (bg[0] + bg[1] + bg[2]) // 3 if rgb else bg
+        return out_arr, g_out, int(fill.sum()), None
 
     # ==================== 空白区订书机孔散点清理 + 印章保护 ====================
 
@@ -2047,13 +2137,14 @@ class CircleDetectionWorker(QThread):
         return (int(x_lo - px), int(y_lo - py), int(x_hi + px), int(y_hi + py))
 
     @staticmethod
-    def _detect_seal_protect_zones(arr, gray):
+    def _detect_seal_protect_zones(arr, gray, dark_mask=None):
         """
         检测印章保护区域(圆bbox列表)。印章是合法内容, 散点清理绝不触碰:
           1. 红色印章: R>G+40 且 R>B+40 且 R>90 的红色块(任何尺寸);
           2. 黑色规则印章: d>=60px + 近圆(长宽比<=1.6) + 圆度>=0.35;
           3. 残缺印章碎块: d 20~60px 且实心度<0.5(笔画/环状) — 整块保护;
           4. 粘连保护: 印章区域外扩60px内的散点也跳过(章边印泥点)。
+        dark_mask：调用方已有的 (gray<80) uint8 掩码(散点环节同源复用，避免重复全图比较)。
         返回 [(cx, cy, protect_radius), ...]。
         """
         try:
@@ -2090,7 +2181,7 @@ class CircleDetectionWorker(QThread):
         # 远离内容区的边缘碎块是订书钉/装订残物而非印章(印章盖在文字区上),
         # 不保护(否则顶部空白带的订书钉被整带保护导致散点清理失效)。
         # 内容bbox由调用方散点清理的主区bbox近似传入 → 此处自行重算。
-        dark = (gray < 80).astype(np.uint8)
+        dark = dark_mask if dark_mask is not None else (gray < 80).astype(np.uint8)
         n2, _, st2, _ = cv2.connectedComponentsWithStats(dark, 8)
         near_content = None
         if dark.sum() > 5000:
@@ -2121,34 +2212,112 @@ class CircleDetectionWorker(QThread):
                         add_zone(cx, cy, d // 2 + 50)
         return zones
 
-    def remove_isolated_specks(self, img,
+    @staticmethod
+    def _text_line_bands(mask, min_x_extent=120, max_grow=45):
+        """检出「文字行保护带」，返回 (row_band, (bx_lo, bx_hi))。
+
+        row_band：长度 H 的 int32 数组，第 y 行属于第 k 条保护带则为 k，否则 -1；
+        bx_lo/bx_hi：各保护带内墨迹的 x 起止(列表，下标与 k 对应)。
+        判定「点(cx,cy)是否落在文字行上」即 row_band[cy]>=0 且
+        bx_lo[k]<=cx<=bx_hi[k]，O(1) 查表，不随候选数退化。
+
+        为什么需要：散点清理把内容bbox(暗像素5~95分位)之外当空白区，但页首标题行/
+        页脚行/表头行这类「暗像素总量占比不足5%」的合法文字行会整体落在分位bbox之外，
+        其笔画暗核(gray<50)随后被逐个当订书钉散点填白，只剩 50~80 灰度的抗锯齿
+        轮廓 → 成品出现「中空只有黑边缘线的文字」(实测 007/019/056 首行、0160 页首
+        标题行、0270 表头行均被掏空)；整行成员还会被行带逻辑误判为「订书钉排」而
+        放宽尺寸(d<=60)与形状校验，加剧破坏。
+
+        判据(6张样张实测的可分特征)：文字行整行笔画横贯，单行暗像素峰值>=146；
+        订书钉/散点带每行只有几个小点，单行峰值<=82。故：
+          ① 种子行 row_ink >= max(100, 4%W) —— 阈值落在 82 与 146 的间隙中；
+          ② 向上下按 row_ink >= max(30, 1.2%W) 生长(至多 max_grow 行)补全字符高度，
+             行间空白(ink≈0)自然截断生长，故各文字行不会被并成一条；
+          ③ 带内墨迹 x 跨度 >= min_x_extent 才算文字行(排除印章/污渍等紧凑暗块
+             自成的带，避免其把邻域散点一并庇护)。
+        """
+        H, W = mask.shape
+        row_ink = mask.sum(axis=1)
+        seed_thr = max(100, int(0.04 * W))
+        grow_thr = max(30, int(0.012 * W))
+        seeds = np.where(row_ink >= seed_thr)[0]
+        row_band = np.full(H, -1, dtype=np.int32)
+        if seeds.size == 0:
+            return row_band, ([], [])
+        band = np.zeros(H, dtype=bool)
+        band[seeds] = True
+        grow = row_ink >= grow_thr
+        for _ in range(max_grow):
+            nb = band.copy()
+            nb[1:] |= band[:-1] & grow[1:]    # 向下生长
+            nb[:-1] |= band[1:] & grow[:-1]   # 向上生长
+            if np.array_equal(nb, band):
+                break
+            band = nb
+        ys = np.where(band)[0]
+        # 切分连续段(段内允许<=6行的抗锯齿/字间空隙)
+        runs = []
+        start = prev = int(ys[0])
+        for y in ys[1:]:
+            y = int(y)
+            if y - prev > 6:
+                runs.append((start, prev))
+                start = y
+            prev = y
+        runs.append((start, prev))
+        bx_lo, bx_hi = [], []
+        for y0, y1 in runs:
+            xs = np.where(mask[y0:y1 + 1].any(axis=0))[0]
+            if xs.size == 0:
+                continue
+            if int(xs.max()) - int(xs.min()) + 1 < min_x_extent:
+                continue
+            bid = len(bx_lo)
+            bx_lo.append(int(xs.min()))
+            bx_hi.append(int(xs.max()))
+            row_band[y0:y1 + 1] = bid
+        return row_band, (bx_lo, bx_hi)
+
+    def remove_isolated_specks(self, arr, gray, seal_zones=None,
                               max_diam_px=35, min_solidity=0.55, max_aspect=2.0):
         """
         清理主体文字区外的孤立订书机孔散点(实心小暗点), 用周边底色填充。
         只动"高实心+近圆+真暗"的小点(订书机孔物理特征):
           d<=35px + 实心度>=0.55 + 长宽比<=2.0 + 均值灰<80;
         印章保护: 红章/黑章整章/残章碎块及其60px邻域全部跳过。
-        返回 (结果Image, 清理点数)。需要 cv2; 无 cv2 原样返回。
+        文字行保护: 页首标题行/页脚行/表头行等整行落在分位内容bbox外的合法文字,
+        其笔画暗核不是散点, 一律跳过(_text_line_bands), 否则会被填白成中空黑边字。
+        numpy数组+同步灰度进出(写像素后增量更新灰度)；
+        seal_zones：上游前置缓存的印章保护区(缺省自行计算)。
+        返回 (结果数组, 更新后灰度, 清理点数)。需要 cv2; 无 cv2 原样返回。
         """
         try:
             import cv2
         except ImportError:
-            return img, 0
-        arr = np.array(img)
+            return arr, gray, 0
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
-        gray = (arr.mean(axis=2).astype(np.uint8) if rgb else arr.copy())
 
         mask = (gray < 80).astype(np.uint8)
         # 无pad的内容bbox: pad会把贴近主区的散点也当内容保护起来
         # (实测S161主区y_lo=477, pad后427, 顶部订书钉y≈460被包进内容区漏清)
         bbox = self._content_bbox(mask, pad_ratio=0.0)
         if bbox is None:
-            return img, 0
+            return arr, gray, 0
         x_lo, y_lo, x_hi, y_hi = bbox
 
-        # 印章保护区域
-        zones = self._detect_seal_protect_zones(arr, gray)
+        # 印章保护区域(优先用上游前置缓存；自算时复用本环节已有的(gray<80)掩码)
+        zones = (seal_zones if seal_zones is not None
+                 else self._detect_seal_protect_zones(arr, gray, dark_mask=mask))
+
+        # 文字行保护带: 整行落在分位bbox外的页首标题行/页脚行/表头行(合法文字),
+        # 其笔画暗核绝不能当散点填白(详见 _text_line_bands 注释)。
+        row_band, _bx = self._text_line_bands(mask)
+        bx_lo, bx_hi = _bx
+
+        def in_text_line(cx, cy):
+            bid = row_band[cy]
+            return bid >= 0 and bx_lo[bid] <= cx <= bx_hi[bid]
 
         # 候选散点: 内容bbox外 + 严格暗(<80均值)小块
         strict = (gray < 50).astype(np.uint8)
@@ -2165,6 +2334,10 @@ class CircleDetectionWorker(QThread):
             l, t, w2, h2 = st[i, 0], st[i, 1], st[i, 2], st[i, 3]
             cx, cy = l + w2 // 2, t + h2 // 2
             if x_lo <= cx <= x_hi and y_lo <= cy <= y_hi:
+                continue
+            # 文字行成员不参与行带聚类: 否则整行文字会被当成"订书钉排"(同带>=5块
+            # +距内容区>=60px)而放宽尺寸/形状校验, 把字符笔画核成排填白。
+            if in_text_line(cx, cy):
                 continue
             _pre.append((i, cx, cy, max(w2, h2), a))
         staple_rows = set()   # 行带内块的组件索引
@@ -2188,7 +2361,8 @@ class CircleDetectionWorker(QThread):
                     for c in r:
                         if c[3] <= 60:
                             staple_rows.add(c[0])
-        out = arr.copy()
+        out = None      # 惰性拷贝：真正写入像素时才复制 arr/gray
+        g_out = None
         removed = 0
         for i in range(1, n):
             a = st[i, 4]
@@ -2198,6 +2372,11 @@ class CircleDetectionWorker(QThread):
             cx, cy = l + w2 // 2, t + h2 // 2
             # 必须在内容bbox外(空白区)
             if x_lo <= cx <= x_hi and y_lo <= cy <= y_hi:
+                continue
+            # 文字行保护: 页首标题行/页脚行/表头行的笔画暗核不是订书钉散点,
+            # 填白后只剩抗锯齿边缘 → 成品出现中空只有黑边缘线的文字(实测
+            # 007/019/056 首行、0160 页首标题行、0270 表头行均被掏空)。
+            if in_text_line(cx, cy):
                 continue
             d = max(w2, h2)
             in_staple_row = (i in staple_rows)
@@ -2215,9 +2394,11 @@ class CircleDetectionWorker(QThread):
             is_staple = (asp <= 6.0 and sol >= 0.15)
             if not (is_dot or is_staple or in_staple_row):
                 continue
-            # 块均值灰度(真暗)
-            comp = (labels == i)
-            if float(gray[comp].mean()) >= 80:
+            # 块均值灰度(真暗)：只在外接框局部窗内做布尔比较(块像素都在框内，
+            # 与全图 labels==i 逐位一致)，免去逐候选全图布尔运算——实测 0152 页 7446 个
+            # 组件下全图版耗时约 3.1s(整个散点环节的一半)，是单张最大热点。
+            comp = (labels[t:t + h2, l:l + w2] == i)
+            if float(gray[t:t + h2, l:l + w2][comp].mean()) >= 80:
                 continue
             # 印章保护: 落在任何保护zone内则跳过
             protected = False
@@ -2241,7 +2422,8 @@ class CircleDetectionWorker(QThread):
             s = max(d, 8)
             sx1, sy1 = max(0, cx - s), max(0, cy - s)
             sx2, sy2 = min(W, cx + s + 1), min(H, cy + s + 1)
-            region = out[sy1:sy2, sx1:sx2]
+            region_src = out if out is not None else arr
+            region = region_src[sy1:sy2, sx1:sx2]
             region_gray = (region.mean(axis=2) if region.ndim == 3 else region)
             bright = region[region_gray > 100]
             if len(bright):
@@ -2250,19 +2432,26 @@ class CircleDetectionWorker(QThread):
                     axis=0))
             else:
                 fill_color = (255, 255, 255) if rgb else 255
-            # 填充整个块(用连通域精确形状)
-            sub = comp[sy1:sy2, sx1:sx2]
+            # 填充整个块(用连通域精确形状)——注意填充窗与组件外接框坐标不同，
+            # 须在填充窗坐标下重新取局部布尔(与原全图 comp 切片逐位一致)
+            sub = (labels[sy1:sy2, sx1:sx2] == i)
+            if out is None:
+                out = arr.copy()
+                g_out = gray.copy()
             if rgb:
                 tgt = out[sy1:sy2, sx1:sx2]
                 tgt[sub] = fill_color
             else:
                 out[sy1:sy2, sx1:sx2][sub] = fill_color
+            # 灰度增量同步: 与 _gray_u8 同一整除公式(逐位一致)
+            g_out[sy1:sy2, sx1:sx2][sub] = (
+                (fill_color[0] + fill_color[1] + fill_color[2]) // 3 if rgb else fill_color)
             removed += 1
         if removed == 0:
-            return img, 0
-        return Image.fromarray(out), removed
+            return arr, gray, 0
+        return out, g_out, removed
 
-    def remove_color_halo(self, img, edge_ratio=0.18):
+    def remove_color_halo(self, arr, gray, edge_ratio=0.18):
         """
         去除页面边缘的浅蓝色蕴(扫描仪彩色边缘偏色)，替换为页面本体色。
         判定条件(全部满足)：
@@ -2273,18 +2462,17 @@ class CircleDetectionWorker(QThread):
           4. 靠边：位于页面四周 edge_ratio(18%) 带内（色蕴是边缘现象，
              中部同色是内容底色不动）。
         本体色取页面中部非蓝像素中位数。需要 cv2；无 cv2 原样返回。
+        numpy数组+同步灰度进出，返回 (结果数组, 更新后灰度)。
         """
         try:
             import cv2
         except ImportError:
-            return img
+            return arr, gray
 
-        arr = np.array(img)
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
-        gray = _gray_u8(arr)
         if not rgb:
-            return img  # 灰度图无彩色色蕴
+            return arr, gray  # 灰度图无彩色色蕴
 
         r_c = arr[:, :, 0].astype(np.int16)
         b_c = arr[:, :, 2].astype(np.int16)
@@ -2294,7 +2482,7 @@ class CircleDetectionWorker(QThread):
         # 直接原样返回，不做色蕴处理。
         _blue_all = ((b_c - r_c) > 10) & (b_c > 180) & (gray > 190)
         if float(_blue_all.mean()) > 0.50:
-            return img
+            return arr, gray
 
         # 页面本体色(中部非蓝像素中位 RGB)
         cx0, cx1 = max(0, W // 2 - 300), min(W, W // 2 + 300)
@@ -2303,7 +2491,7 @@ class CircleDetectionWorker(QThread):
         cblue = (creg[:, :, 2].astype(np.int16) - creg[:, :, 0].astype(np.int16)) > 12
         body_px = creg[~cblue]
         if len(body_px) < 100:
-            return img
+            return arr, gray
         body = tuple(int(v) for v in np.median(body_px.reshape(-1, 3), axis=0))
 
         # 色蕴候选：蓝+亮+靠边；先做廉价判定，无候选直接返回(省去 51px 邻域模糊与连通域分析)
@@ -2316,14 +2504,14 @@ class CircleDetectionWorker(QThread):
         edge_band[:, W - ex:] = True
         halo = halo & edge_band
         if not halo.any():
-            return img
+            return arr, gray
         # 无文字：邻域暗像素密度(色蕴区可能含浅表格线, 阈值放宽到0.06;
         # 表格行底纹的文字密度通常>>0.10, 仍被排除)
         dark = (gray < 120).astype(np.float32)
         kd = cv2.blur(dark, (51, 51))
         halo = halo & (kd < 0.06)
         if not halo.any():
-            return img
+            return arr, gray
 
         # 连通域过滤：只处理与纸边相连的大块色蕴(排除边缘孤立蓝色小图形)
         halo_u8 = halo.astype(np.uint8)
@@ -2338,11 +2526,14 @@ class CircleDetectionWorker(QThread):
             if l <= 2 or t <= 2 or (l + w2) >= W - 2 or (t + h2) >= H - 2:
                 final |= (labels == i)
         if not final.any():
-            return img
+            return arr, gray
 
         out = arr.copy()
         out[final] = body
-        return Image.fromarray(out)
+        g_out = gray.copy()
+        # 灰度增量同步: 与 _gray_u8 同一整除公式(逐位一致；本环节仅处理RGB图)
+        g_out[final] = (body[0] + body[1] + body[2]) // 3
+        return out, g_out
 
     @staticmethod
     def _box_blur(gray_f, win):
@@ -2366,17 +2557,31 @@ class CircleDetectionWorker(QThread):
         out[1:, 1:] += c[:-d, :-d]
         return (out / float(d * d))[:h, :w].astype(np.float32)
 
-    def remove_black_border(self, img):
+    @staticmethod
+    def _blur_pair(g, win):
+        """一次模糊同时取局部标准差所需的 (均值, 平方均值)：把两个数组堆成双通道
+        单次 cv2.blur(逐通道独立，与分别调用两次逐位一致，已探针验证)，省一次全图滤波。
+        无 cv2 回退两次 _box_blur(前缀和实现仅支持二维，不可堆叠)。"""
+        try:
+            import cv2
+            bl = cv2.blur(np.stack((g, g * g), axis=2), (win, win))
+            return bl[:, :, 0], bl[:, :, 1]
+        except Exception:
+            return (CircleDetectionWorker._box_blur(g, win),
+                    CircleDetectionWorker._box_blur(g * g, win))
+
+    def remove_black_border(self, arr, gray, local_std15=None):
         """
         去除扫描黑边/阴影：检测靠近纸边、明显比页面底色暗的大块连通域
         (深色长条、灰色阴影三角等)，用页面底色填充。
-        只处理“靠近边缘且足够大”的暗块，不动正文与远处内容。返回 (结果Image, 被填充像素数)。
+        只处理“靠近边缘且足够大”的暗块，不动正文与远处内容。
+        local_std15：前一环节(竖带清理)未改图时传入的 15×15 局部标准差(同一灰度，
+        逐位一致)，直接复用省去全图滤波；缺省自行计算(双通道单次模糊)。
         连通域/纹理均有无 cv2 回退路径，打包环境缺 cv2 时不失效。
+        输入/输出为管线传引用的 numpy 数组。返回 (结果数组, 同步灰度数组, 被填充像素数)。
         """
-        arr = np.array(img)
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
-        gray = _gray_u8(arr)
 
         # 页面底色亮度(取偏亮的 75 分位，避免被暗块/文字拉低)
         page_bg = float(np.percentile(gray, 75))
@@ -2394,15 +2599,12 @@ class CircleDetectionWorker(QThread):
         n_fg, labels, stats = self._connected_components_full(darkish)
 
         # 局部纹理(15x15 窗标准差)：二维码/条码等高频内容纹理高，真实黑边/阴影平滑(低)
-        gf = gray.astype(np.float32)
-        try:
-            import cv2
-            gmean = cv2.blur(gf, (15, 15))
-            gsq = cv2.blur(gf * gf, (15, 15))
-        except Exception:
-            gmean = self._box_blur(gf, 15)
-            gsq = self._box_blur(gf * gf, 15)
-        local_std = np.sqrt(np.maximum(gsq - gmean * gmean, 0))
+        if local_std15 is not None:
+            local_std = local_std15  # 前环节未改图，直接复用(逐位一致)
+        else:
+            gf = gray.astype(np.float32)
+            gmean, gsq = self._blur_pair(gf, 15)
+            local_std = np.sqrt(np.maximum(gsq - gmean * gmean, 0))
 
         min_area = int(0.0015 * W * H)  # 只处理大块，避免误删靠边文字(文字纹理高会被上面跳过)
         fill = np.zeros((H, W), dtype=bool)
@@ -2483,24 +2685,28 @@ class CircleDetectionWorker(QThread):
             fill |= (labels == i)
 
         if not fill.any():
-            return img, 0
+            return arr, gray, 0
         out_arr = arr.copy()
         # 墨迹保护：不覆盖非常暗的像素(灰度<底色-80)，这些是手写/印章/文字笔画
         bg_gray_val = float(np.mean(bg)) if rgb else float(bg)
         ink_mask = gray < (bg_gray_val - 80)
         fill = fill & ~ink_mask
         if not fill.any():
-            return img, 0
+            return arr, gray, 0
         out_arr[fill] = bg
-        return Image.fromarray(out_arr), int(fill.sum())
+        # 同步更新灰度(与 _gray_u8 同一整除公式，逐位一致；注意与墨迹保护用的
+        # 浮点均值 bg_gray_val 不同，此处必须与实际写入像素的灰度一致)
+        g_out = gray.copy()
+        g_out[fill] = (bg[0] + bg[1] + bg[2]) // 3 if rgb else bg
+        return out_arr, g_out, int(fill.sum())
 
-    def cover_edge_with_bg(self, img, margin_px):
+    def cover_edge_with_bg(self, arr, gray, margin_px):
         """
         将图像四周边缘 margin_px 像素宽度的区域用底色覆盖。
         底色通过采样四角区域的中位数获得。
         边缘区域内含手写/文字(高纹理)的段落跳过，只覆盖纯色边框区域。
+        输入/输出为管线传引用的 numpy 数组。返回 (结果数组, 同步灰度数组)。
         """
-        arr = np.array(img)
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
 
@@ -2520,24 +2726,22 @@ class CircleDetectionWorker(QThread):
             bright = samples[samples > 80]
             bg_color = int(np.median(bright)) if bright.size else 255
 
-        out = arr.copy()
+        out = None
+        g_out = None
+        # 写入像素的实际灰度(与 _gray_u8 同一整除公式；区别于 is_ink 用的浮点均值)
+        bg_gray_fill = ((bg_color[0] + bg_color[1] + bg_color[2]) // 3) if rgb else bg_color
 
-        # 局部纹理：边缘区域内有手写/文字的段落(高纹理)不覆盖
-        gray = arr.mean(axis=2).astype(np.float32) if rgb else arr.astype(np.float32)
+        # 局部纹理：边缘区域内有手写/文字的段落(高纹理)不覆盖(双通道单次模糊)
         win = max(5, margin_px // 3)
-        try:
-            import cv2
-            gmean = cv2.blur(gray, (win, win))
-            gsq = cv2.blur(gray * gray, (win, win))
-        except Exception:
-            gmean = self._box_blur(gray, win)
-            gsq = self._box_blur(gray * gray, win)
+        gmean, gsq = self._blur_pair(gray, win)
         local_std = np.sqrt(np.maximum(gsq - gmean * gmean, 0))
         has_texture = local_std > 30  # 高纹理=有内容
 
         # 只覆盖低纹理(纯色边框)区域，跳过高纹理(手写/文字)和深色墨迹(手写笔画)
         bg_gray_val = float(np.mean(bg_color)) if rgb else float(bg_color)
+
         def safe_cover(y0, y1, x0, x1):
+            nonlocal out, g_out
             if y0 >= y1 or x0 >= x1:
                 return
             region_texture = has_texture[y0:y1, x0:x1]
@@ -2546,12 +2750,16 @@ class CircleDetectionWorker(QThread):
             # 深色墨迹(gray < bg-60)是手写/印章，不覆盖
             is_ink = region_gray < (bg_gray_val - 60)
             cover_mask = ~region_texture & ~is_ink
-            if rgb:
-                sub = out[y0:y1, x0:x1]
-                sub[cover_mask] = bg_color
-                out[y0:y1, x0:x1] = sub
-            else:
-                out[y0:y1, x0:x1][cover_mask] = bg_color
+            if not cover_mask.any():
+                return
+            if out is None:
+                out = arr.copy()
+            sub = out[y0:y1, x0:x1]
+            sub[cover_mask] = bg_color
+            out[y0:y1, x0:x1] = sub
+            if g_out is None:
+                g_out = gray.copy()
+            g_out[y0:y1, x0:x1][cover_mask] = bg_gray_fill
 
         # 上边
         safe_cover(0, margin_px, 0, W)
@@ -2562,9 +2770,10 @@ class CircleDetectionWorker(QThread):
         # 右边
         safe_cover(margin_px, H - margin_px, W - margin_px, W)
 
-        return Image.fromarray(out)
+        return (out if out is not None else arr,
+                g_out if g_out is not None else gray)
 
-    def remove_hole_shadow_residue(self, img):
+    def remove_hole_shadow_residue(self, arr, gray, seal_zones=None):
         """
         去除装订孔阴影残留：孔洞填充后，孔位周围常残留浅灰色环状/弧状阴影
         (冲头压痕/扫描泛光)，灰度仅比页面底色暗 20~100(典型 130~220)，远达
@@ -2582,19 +2791,22 @@ class CircleDetectionWorker(QThread):
           5. 成组：同边带内 2-8 个孔样成员(直径>=24)同列/同排对齐，且列向松散度/
              纵向跨度符合装订孔几何(拦截横排手写数字与聚团斑点)；且去除任一成员后
              跨度仍须达标(拦截靠单个远端碎块撑跨度的假组，如顶部手写+底部页脚碎块)；
-          6. 填充前复查填充圆内无墨迹样连通域(面积>=80或延伸出填充框)。
+          6. 填充前复查填充圆内无墨迹样连通域(面积>=80或延伸出填充框)；
+          7. 暗核拦截：连通块外接框外扩8px窗内暗像素(灰度<90)总量>=25即放弃——手写笔画的
+             外围浅灰晕圈围住/贴着暗色笔画核, 真孔影为纯渐变灰无暗核(实测拦截0152章旁手写)；
+          8. 印章邻域保护：落在印章保护区域(红章/黑章/残章, 含邻域外延)内的候选整体跳过。
+        numpy数组+同步灰度进出；seal_zones 由上游前置缓存传入(缺省自行计算)。
+        返回 (结果数组, 更新后灰度, 清除数)。
         """
         try:
             import cv2
         except ImportError:
-            return img, 0
-        arr = np.array(img)
+            return arr, gray, 0
         H, W = arr.shape[:2]
         rgb = arr.ndim == 3
-        gray = _gray_u8(arr)
         page_bg = float(np.percentile(gray, 75))
         if page_bg < 150:
-            return img, 0  # 整页暗底扫描件不适用阴影残留概念，不处理
+            return arr, gray, 0  # 整页暗底扫描件不适用阴影残留概念，不处理
 
         thr = page_bg - 15
         # 浅灰阴影掩码(排除<90的深色墨迹)；硬掩码含墨迹，用于孤立性检查
@@ -2612,6 +2824,10 @@ class CircleDetectionWorker(QThread):
 
         max_diam = self.max_diameter_pixels * 0.5
         tol = max(self.max_diameter_pixels // 4, 1)
+        # 印章保护区域：手写数字/批注常伴随印章出现(实测0152/0219误清案例均在章旁)，
+        # 落在红章/黑章/残章保护区域内的候选整体跳过，与散点清理同策略。
+        if seal_zones is None:
+            seal_zones = self._detect_seal_protect_zones(arr, gray)
 
         def edge_dist(cx, cy, edge):
             if edge == 'L':
@@ -2687,6 +2903,26 @@ class CircleDetectionWorker(QThread):
                 cy = t + h // 2 + off_y
                 if not ink_isolated(cx, cy, diam // 2):
                     continue
+                # 暗核拦截：手写笔画晕圈(灰度90~page_bg-15的浅灰外围)围住/贴着暗色笔画核，
+                # 检查窗(连通块外接框外扩8px)内暗像素(<90)总量>=25即手写/污渍而非孔影。
+                # 实测0152章旁手写150/带横线145的晕圈块尺寸/均值灰度/色散/成组全过关；
+                # 笔画核有时不与晕圈连通(在框外相邻)故窗需外扩；用总量而非单块面积，
+                # 拦截相邻的细笔画核。真孔已填白、孔影纯渐变无暗核；边带零散压缩噪声总量低不拦。
+                bx0 = max(0, l + off_x - 8)
+                by0 = max(0, t + off_y - 8)
+                bx1 = min(W, l + off_x + w + 8)
+                by1 = min(H, t + off_y + h + 8)
+                if int((gray[by0:by1, bx0:bx1] < 90).sum()) >= 25:
+                    continue
+                # 印章邻域保护：候选中心落入印章保护区域则跳过(章旁手写/批注兜底)。
+                # 半径额外外延120：章旁手写数字常距章心超出60px(实测0152/0219距章可达~150)。
+                _prot = False
+                for zx, zy, zr in seal_zones:
+                    if (cx - zx) ** 2 + (cy - zy) ** 2 <= (zr + 120) ** 2:
+                        _prot = True
+                        break
+                if _prot:
+                    continue
                 band_cands.append((cx, cy, w, h))
             # 贴边筛选：装订孔物理上贴着纸边打(实测孔心距边 76-107px)，只保留距纸边
             # <=160px 的候选——边距带深处的文字列表/表格/页眉痕迹(距边>=290px)全部排除。
@@ -2746,7 +2982,7 @@ class CircleDetectionWorker(QThread):
                 candidates.extend((c[0], c[1], rf) for c in col)
 
         if not candidates:
-            return img, 0
+            return arr, gray, 0
 
         # 去重(角落区域可能同时落在横竖两条边带内)
         targets = []
@@ -2759,7 +2995,8 @@ class CircleDetectionWorker(QThread):
             if not dup:
                 targets.append((cx, cy, rf))
 
-        out = arr.copy()
+        out = None      # 惰性拷贝：真正写入像素时才复制 arr/gray
+        g_out = None
         filled = 0
         for cx, cy, rf in targets:
             # 圆形填充区：以组内中位直径为基准外扩一圈，把渐变尾巴一并抹净
@@ -2800,13 +3037,19 @@ class CircleDetectionWorker(QThread):
                          if bright.any() else (255, 255, 255))
             else:
                 color = int(np.median(s_gray[bright])) if bright.any() else 255
+            if out is None:
+                out = arr.copy()
+                g_out = gray.copy()
             sub = out[y0:y1, x0:x1]
             sub[ell] = color
             out[y0:y1, x0:x1] = sub
+            # 灰度增量同步: 与 _gray_u8 同一整除公式(逐位一致)
+            g_out[y0:y1, x0:x1][ell] = (
+                (color[0] + color[1] + color[2]) // 3 if rgb else color)
             filled += 1
         if filled == 0:
-            return img, 0
-        return Image.fromarray(out), filled
+            return arr, gray, 0
+        return out, g_out, filled
 
 
 class ZoomableImageView(QGraphicsView):
