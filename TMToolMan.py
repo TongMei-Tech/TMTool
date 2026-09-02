@@ -12,9 +12,31 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.10"
+VERSION = "3.13"
 
 CHANGELOG = [
+    {
+        "version": "3.13",
+        "date": "2026-09-02",
+        "changes": [
+            "程序启动时强制校验解释器位数：必须64位(32位进程用户态地址空间上限约2GB, 是崩溃日志20260901中OCR长时间运行内存耗尽的根因)。检测到32位时弹窗提示「请使用64位Python重新打包」并拒绝启动, 同时写入崩溃日志留痕；此前曾误用32位Python打包出问题版本, 此处硬性拦截防止再次发生",
+        ],
+    },
+    {
+        "version": "3.12",
+        "date": "2026-09-01",
+        "changes": [
+            "修复JPG转双层PDF的OCR模式运行中崩溃(日志: could not create a primitive → cv2 Insufficient memory → SystemExit → access violation)的问题：① paddleocr在cv2缩放内存不足时内部调用sys.exit(0)抛出的SystemExit继承BaseException, 原服务循环/单页逻辑仅捕获Exception导致OcrSvc服务线程被直接打死、后续所有页OCR任务空等超时, 现各层均捕获SystemExit(服务线程不再死亡, 单页按内存失败处理: 丢弃引擎重建+重试); ② 内存类错误关键词补充 could not create a primitive(MKL-DNN分配失败)与 insufficient memory; ③ OCR初始化显式关闭MKL-DNN(paddleocr 2.x缺省use_mkldnn=True, 其oneDNN缓存在变尺寸输入下持续泄漏宿主内存, 是宿主内存耗尽的根因); ④ 服务线程意外死亡时自动检测并重建(原死亡后任务永远超时); ⑤ 内存看门狗阈值适配32位进程(地址空间上限约2GB, 原2.6/3.2GB阈值永不可达, 改为1.2/1.5GB)",
+        ],
+    },
+    {
+        "version": "3.11",
+        "date": "2026-08-31",
+        "changes": [
+            "修复JPG转双层PDF的GPU模式处理内容多、单文件大的目录时长时间运行崩溃(崩溃日志0字节=进程被系统终止)的问题：① 分段写盘页数CHUNK由固定50改为按单文件实际大小自适应(按单段≤约400MB折算, 8~50页)——大文件仍固定50页时, GPU模式因OCR快四线程同时处于写doc阶段, 叠加paddle驻留内存会达数GB触发系统终止; ② 新增进程内存看门狗: 每10页检测进程工作集, 超过预警线记日志留痕、超过回收线(3.2GB)在OCR服务线程内强制丢弃重建引擎+GC阻断继续增长; ③ 移除全局MKL-DNN开关(对本功能无加速作用, 且中途降级CPU后其oneDNN缓存在变尺寸输入下持续泄漏宿主内存); ④ 分段合并时中间doc立即关闭(原未关闭, 大分段驻留叠加内存峰值)",
+        ],
+    },
+    # 新版本记录追加在此列表头部(最新在前)
     {
         "version": "3.10",
         "date": "2026-08-31",
@@ -22,7 +44,6 @@ CHANGELOG = [
             "分件目录结构调整: 备考表卷底与卷皮目录两个子目录合并为编号0000的单一目录(如J380-ZY-SJ-2021-Y-0001-0000), 卷皮页/目录页与备考表卷底文件统一移入, 不再生成两个独立目录; 已分件目录的目录页查找同步适配(优先-0000, 兼容旧版卷皮目录)",
         ],
     },
-    # 新版本记录追加在此列表头部(最新在前)
     {
         "version": "3.9",
         "date": "2026-08-28",
@@ -187,6 +208,43 @@ def _setup_paddle_gpu_env():
     os.environ.setdefault('FLAGS_cudnn_exhaustive_search', '0')
 
 _setup_paddle_gpu_env()
+# ========================================================================
+
+
+# ============================ 进程内存监测工具(v3.11) ============================
+def _proc_mem_mb():
+    """当前进程工作集内存(MB); 获取失败返回0。用于长时间运行的内存看门狗。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong),
+                        ("PageFaultCount", ctypes.c_ulong),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        _k32 = ctypes.windll.kernel32
+        _k32.GetCurrentProcess.restype = wintypes.HANDLE
+        _h = _k32.GetCurrentProcess()
+        _psapi = ctypes.windll.psapi
+        _psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE,
+                                                ctypes.POINTER(_PMC),
+                                                wintypes.DWORD]
+        _psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        _pmc = _PMC()
+        _pmc.cb = ctypes.sizeof(_PMC)
+        if _psapi.GetProcessMemoryInfo(_h, ctypes.byref(_pmc), _pmc.cb):
+            return _pmc.WorkingSetSize / 1048576.0
+    except Exception:
+        pass
+    return 0.0
 # ========================================================================
 
 
@@ -420,7 +478,10 @@ class FileSplitWorker(QThread):
             try:
                 val = fn()
                 box[0], box[1] = True, val
-            except Exception as e:
+            except BaseException as e:
+                # v3.12: 必须捕获 SystemExit——paddleocr 在 cv2 缩放内存不足时内部调用
+                # sys.exit(0)。SystemExit 继承 BaseException 而非 Exception, 漏捕获会把本服务
+                # 线程直接打死(崩溃日志 20260901 根因), 之后所有 OCR 任务将永远等不到响应。
                 box[0], box[1] = False, e
             finally:
                 try:
@@ -433,12 +494,22 @@ class FileSplitWorker(QThread):
         with self._svc_lock:
             import queue as _queue
             import threading as _th
-            if self._svc_q is not None:
-                return self._svc_q
+            q = getattr(self, '_svc_q', None)
+            t = getattr(self, '_svc_thread', None)
+            if q is not None and (t is None or t.is_alive()):
+                return q
+            # v3.12: 服务线程已死亡(如旧版 SystemExit 未被捕获)→ 换新队列重建,
+            # 否则投递的任务永远无人处理, 调用方全部空等超时。
+            if q is not None:
+                try:
+                    q.put_nowait(None)
+                except Exception:
+                    pass
             q = _queue.Queue()
             self._svc_q = q
             t = _th.Thread(target=self._ocr_svc_loop, args=(q,),
                            name='OcrSvc', daemon=True)
+            self._svc_thread = t
             t.start()
             return q
 
@@ -590,13 +661,18 @@ class FileSplitWorker(QThread):
             if has_models:
                 configs += [
                     # 2.x 标准配置
+                    # use_mkldnn=False(v3.12): paddleocr 2.x 缺省 use_mkldnn=True,
+                    # CPU predictor 的 oneDNN 缓存在变尺寸输入下持续泄漏宿主内存,
+                    # 长时间运行后宿主内存耗尽(报 could not create a primitive /
+                    # cv2 Insufficient memory 崩溃)。OCR推理不依赖其加速, 显式关闭。
                     dict(use_angle_cls=True, lang='ch', show_log=False,
                          det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls,
-                         **_gpu_kw),
-                    # 3.x legacy: use_angle_cls 被兼容, 但 show_log 已移除
+                         use_mkldnn=False, **_gpu_kw),
+                    # 3.x legacy: use_angle_cls 被兼容, 但 show_log 已移除(3.x可能不认
+                    # use_mkldnn参数, 不携带——该配置失败时自动尝试下一配置)
                     dict(use_angle_cls=True, lang='ch',
                          det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls,
-                         **_gpu_kw),
+                         use_mkldnn=False, **_gpu_kw),
                     # 3.x 新参数 + 旧模型路径(部分版本参数改名但模型格式仍兼容)
                     dict(use_textline_orientation=True, lang='ch',
                          det_model_dir=m_det, rec_model_dir=m_rec, cls_model_dir=m_cls),
@@ -651,9 +727,10 @@ class FileSplitWorker(QThread):
         x1 为片段右边界，用于列定位。
         兼容 paddleocr 2.x (ocr(img, cls=True)) 与 3.x (predict(img), 结果对象)。
         """
-        # --- 例行重建(v3.9): 每 _OCR_RECYCLE_PAGES 页丢弃引擎, 本次调用重新初始化 ---
+        # --- 例行重建: 每 _OCR_RECYCLE_PAGES 页丢弃引擎, 本次调用重新初始化 ---
         # 阻断paddle推理引擎长时间运行内存累积(曾在GPU模式运行一段时间后报
         # "Memory allocation failed")。本方法只在OCR服务线程内串行执行, 重建安全。
+        # v3.11: 另有内存看门狗在双层PDF主循环中按进程工作集阈值强制重建(见下方主循环)。
         _cnt = getattr(self, '_ocr_pages_since_init', 0)
         if _cnt > 0 and _cnt % self._OCR_RECYCLE_PAGES == 0 and self._ocr is not None:
             self.log_signal.emit(f"  OCR引擎例行重建(已处理{_cnt}页, 防长时间运行内存累积)")
@@ -675,20 +752,29 @@ class FileSplitWorker(QThread):
         _mem_fail = False
         try:
             result = ocr.ocr(image_path, cls=True)
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # v3.12: 必须同时捕获 SystemExit——paddleocr 在 cv2 缩放内存不足时内部调用
+            # sys.exit(0)(崩溃日志20260901)。SystemExit 继承 BaseException, 仅捕获
+            # Exception 会透传打死服务线程。此处拦下按内存失败处理。
             # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
             try:
                 result = ocr.ocr(image_path)
-            except Exception:
+            except (Exception, SystemExit):
                 try:
                     result = ocr.predict(image_path)
-                except Exception as e2:
+                except (Exception, SystemExit) as e2:
                     # v3.9: 内存分配失败(长时间运行内存累积) → 丢弃引擎重建后重试本页一次,
                     # 不再直接跳过文本层。匹配paddle/CUDA的内存类错误文案(不区分大小写)。
+                    # v3.12: 补充 could not create a primitive(MKL-DNN分配失败)与
+                    # insufficient memory(cv2.resize OOM); SystemExit(paddleocr内部
+                    # sys.exit(0), 仅在resize内存不足时发生)同样判定为内存失败。
                     _msg = f"{e} | {e2}".lower()
-                    if any(k in _msg for k in ('memory allocation', 'bad_alloc',
-                                               'out of memory', 'cannot allocate',
-                                               'allocation failed')):
+                    if (isinstance(e, SystemExit) or isinstance(e2, SystemExit)
+                            or any(k in _msg for k in ('memory allocation', 'bad_alloc',
+                                                       'out of memory', 'cannot allocate',
+                                                       'allocation failed',
+                                                       'could not create a primitive',
+                                                       'insufficient memory'))):
                         _mem_fail = True
                         self.log_signal.emit(
                             f"    × OCR内存分配失败, 丢弃引擎重建后重试: "
@@ -703,10 +789,10 @@ class FileSplitWorker(QThread):
                         if _ocr2 is not None and _ocr2 is not ocr:
                             try:
                                 result = _ocr2.ocr(image_path, cls=True)
-                            except Exception:
+                            except (Exception, SystemExit):
                                 try:
                                     result = _ocr2.ocr(image_path)
-                                except Exception:
+                                except (Exception, SystemExit):
                                     result = None
                     if result is None and not _mem_fail:
                         import traceback
@@ -4646,6 +4732,7 @@ class JpgToPdfWorker(QThread):
         # CPU配置重启新服务线程(孤儿线程后台泄漏但不再阻塞任何处理)。
         self._svc_lock = threading.Lock()   # 服务线程生命周期管理锁(惰性初始化并发)
         self._svc_q = None                  # 当前服务线程任务队列(挂死后换新)
+        self._svc_thread = None             # 当前服务线程对象(v3.12: 存活检测用)
         self._svc_rebuilt = False           # 是否已做过GPU挂死→CPU重建(每轮只做一次)
         self._ocr_pages_since_init = 0      # 引擎例行重建计数(与分件共享同款机制, v3.9)
         self._probe_lock = threading.Lock()  # 首推理探测全局只做一次(其余线程等结果)
@@ -4796,8 +4883,14 @@ class JpgToPdfWorker(QThread):
             fitz = None
         if fitz is not None:
             doc = fitz.open()
-            # 分段写盘: 与双层路径同款策略, 超大目录分段保存后合并, doc峰值恒定
-            CHUNK = 50
+            # 分段写盘: 与双层路径同款策略, 超大目录分段保存后合并, doc峰值恒定。
+            # v3.11: CHUNK同样按单文件大小自适应(大文件时缩小分段, 限制doc驻留峰值)。
+            try:
+                _sizes = [os.path.getsize(p) for p in jpg_paths[:20]]
+                _avg_mb = (sum(_sizes) / len(_sizes) / 1048576.0) if _sizes else 1.0
+                CHUNK = int(max(8, min(50, 400.0 / max(_avg_mb, 0.5))))
+            except Exception:
+                CHUNK = 50
             seg_paths = []
             page_no = 0
             for jpg_path in jpg_paths:
@@ -4823,7 +4916,9 @@ class JpgToPdfWorker(QThread):
                 seg_paths.append(_last)
                 merged = fitz.open()
                 for sp in seg_paths:
-                    merged.insert_pdf(fitz.open(sp))
+                    _sd = fitz.open(sp)
+                    merged.insert_pdf(_sd)
+                    _sd.close()  # v3.11: insert_pdf已拷入页面, 立即关闭分段防驻留累积
                     os.remove(sp)
                 merged.save(pdf_path, garbage=3, deflate=True)
                 merged.close()
@@ -4978,21 +5073,37 @@ class JpgToPdfWorker(QThread):
 
         pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
         doc = fitz.open()
-        # GPU渲染模式: 启用 MKL-DNN 指令集加速(仅执行一次, 多线程重复设置无益)
-        if getattr(self, 'gpu_render', False) and \
-                not getattr(self, '_mkldnn_set', False):
-            try:
-                import paddle
-                paddle.set_flags({'FLAGS_use_mkldnn': True})
-                self._mkldnn_set = True
-                self.log_signal.emit("  渲染加速已启用(MKL-DNN)")
-            except Exception:
-                pass
+        # v3.11: 移除全局 MKL-DNN 标志(FLAGS_use_mkldnn)——本路径图像经 fitz 直嵌,
+        # 该标志对本功能无加速作用; 且它是全局开关, 若中途OCR降级CPU, CPU predictor
+        # 带 oneDNN 缓存在变尺寸输入下会持续泄漏宿主内存。
+        # v3.12: 进一步在 PaddleOCR 初始化配置中显式 use_mkldnn=False(见
+        # _init_ocr_locked)——paddleocr 2.x 缺省 use_mkldnn=True, 仅移除全局标志时
+        # CPU predictor 仍带 oneDNN 缓存, 宿主内存持续泄漏直至耗尽(崩溃日志20260901)。
         try:
             # 分段写盘: 超大目录(几百页)的 doc 若整体驻留, C++内存随页数线性增长,
             # 4线程并行4个doc会累积到GB级导致进程被系统终止(无提示退出)。
             # 每 CHUNK 页保存为分段PDF并释放doc, 最后合并 —— doc峰值恒定。
-            CHUNK = 50
+            # v3.11: CHUNK 按单文件实际大小自适应——大文件(高分辨率扫描件)仍固定50页时,
+            # 4线程同时持有50页大doc会达数GB, GPU模式因OCR快而4线程同时处于写doc阶段,
+            # 叠加paddle驻留内存后触发系统终止(崩溃日志0字节)。按单段≤~400MB折算页数。
+            try:
+                _sizes = [os.path.getsize(p) for p in jpg_paths[:20]]
+                _avg_mb = (sum(_sizes) / len(_sizes) / 1048576.0) if _sizes else 1.0
+                CHUNK = int(max(8, min(50, 400.0 / max(_avg_mb, 0.5))))
+            except Exception:
+                CHUNK = 50
+            _MEM_WARN_MB = 2600   # 工作集超过此值 → 记日志提醒(留痕供崩溃排查)
+            _MEM_REBUILD_MB = 3200  # 工作集超过此值 → 强制重建引擎+GC(阻断继续增长)
+            # v3.12: 32位进程地址空间上限约2GB, 上述阈值永不可达——进程会先因地址空间
+            # 耗尽崩溃(崩溃日志20260901: cv2连1.9MB都分配失败)。32位时大幅下调阈值,
+            # 让看门狗在真正耗尽前提前介入回收。
+            try:
+                import struct as _st32
+                if _st32.calcsize('P') * 8 == 32:
+                    _MEM_WARN_MB = 1200
+                    _MEM_REBUILD_MB = 1500
+            except Exception:
+                pass
             seg_paths = []
             page_no = 0
             for page_idx, jpg_path in enumerate(jpg_paths):
@@ -5039,6 +5150,41 @@ class JpgToPdfWorker(QThread):
                         f"(该页将为单层, 若大面积出现请检查GPU/显卡驱动)")
                 self.log_signal.emit(f"    OCR完成: {os.path.basename(jpg_path)} "
                                      f"识别{len(frags)}片段")
+                # v3.11 内存看门狗: 每10页检测一次进程工作集。GPU模式大目录+大文件长时间运行,
+                # paddle/fitz宿主内存累积可致进程被系统终止(崩溃日志0字节)。
+                # 超阈值 → 服务线程内强制重建OCR引擎+GC(与其他推理串行, 安全)。
+                if page_idx % 10 == 0:
+                    _wm = _proc_mem_mb()
+                    if _wm > _MEM_REBUILD_MB:
+                        self.log_signal.emit(
+                            f"    ! 进程内存{_wm:.0f}MB超过阈值{_MEM_REBUILD_MB}MB, "
+                            f"强制回收(第{page_idx+1}页)")
+
+                        def _force_recycle():
+                            """仅丢弃引擎+重建(不推理本页), 阻断宿主内存继续增长。"""
+                            self._ocr = None
+                            self._ocr_pages_since_init = 0
+                            import gc as _gcr
+                            _gcr.collect()
+                            if getattr(self, 'use_gpu_ocr', False):
+                                try:
+                                    import paddle as _pdr
+                                    if hasattr(_pdr.device, 'cuda'):
+                                        _pdr.device.cuda.empty_cache()
+                                except Exception:
+                                    pass
+                            self._get_ocr()  # 重建新实例(按当前GPU/CPU配置)
+                            return True
+
+                        self._ocr_svc_call(_force_recycle, timeout=300)
+                        try:
+                            import gc as _gcw
+                            _gcw.collect()
+                        except Exception:
+                            pass
+                    elif _wm > _MEM_WARN_MB:
+                        self.log_signal.emit(
+                            f"    ! 进程内存{_wm:.0f}MB偏高(第{page_idx+1}页), 持续监控")
                 sx = w_pt / w_px
                 sy = h_pt / h_px
                 for txt, x0, y0, x1, y1 in frags:
@@ -5115,7 +5261,9 @@ class JpgToPdfWorker(QThread):
                 # 合并分段 → 最终PDF
                 merged = fitz.open()
                 for sp in seg_paths:
-                    merged.insert_pdf(fitz.open(sp))
+                    _sd = fitz.open(sp)
+                    merged.insert_pdf(_sd)
+                    _sd.close()  # v3.11: 立即关闭分段doc, 防大分段驻留累积内存峰值
                     os.remove(sp)
                 merged.save(pdf_path, garbage=3, deflate=True)
                 merged.close()
@@ -8055,6 +8203,35 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     _setup_crash_log()  # 崩溃日志: 任何崩溃都留下记录(见函数注释)
+
+    # v3.13: 启动时强制校验解释器位数——必须64位。
+    # 32位进程用户态地址空间上限约2GB, paddle/cv2 长时间运行必然先于真实内存
+    # 耗尽而崩溃(崩溃日志20260901: cv2连1.9MB都分配失败)。此前曾误用32位Python
+    # 打包出问题版本, 此处硬性拦截, 并写入崩溃日志留痕便于事后排查。
+    import struct as _st_bitness
+    _bitness = _st_bitness.calcsize('P') * 8
+    if _bitness != 64:
+        _msg = (f"程序必须运行在64位Python环境下(当前为{_bitness}位)。\n"
+                f"32位进程内存地址空间上限约2GB, OCR长时间运行会因内存耗尽崩溃。\n"
+                f"请使用64位Python重新打包后再运行。")
+        try:
+            with open(os.path.join(
+                    os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+                    else os.path.dirname(os.path.abspath(__file__)),
+                    f"TMToolMan_崩溃日志_{datetime.now().strftime('%Y%m%d')}.txt"),
+                    'a', encoding='utf-8') as _f:
+                _f.write(f"\n{'=' * 80}\n[位数拦截] 检测到{_bitness}位解释器, 程序拒绝启动 "
+                         f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except Exception:
+            pass
+        try:
+            from PyQt5.QtWidgets import QApplication as _QA, QMessageBox as _QMB
+            _app = _QA(sys.argv)
+            _QMB.critical(None, "运行环境错误", _msg)
+        except Exception:
+            pass
+        sys.exit(1)
+
     app = QApplication(sys.argv)
     # 强制使用深色科技感字体渲染
     f = QFont("Microsoft YaHei", 9)
