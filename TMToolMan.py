@@ -12,9 +12,17 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.13"
+VERSION = "3.14"
 
 CHANGELOG = [
+    {
+        "version": "3.14",
+        "date": "2026-09-03",
+        "changes": [
+            "修复v3.13后GPU模式转PDF仍崩溃(同20260901崩溃日志形态: could not create a primitive→access violation)的问题：① 根因——_ocr_page捕获首次异常后立即用【同一个可能已损坏的实例】重试ocr()/predict()两次, GPU predictor报primitive/CUDA类错误后内部状态已坏, 在损坏的CUDA上下文上继续调用触发进程级access violation(段错误, Python层捕获无效); ② 首次异常即按文案判定引擎损坏类错误(primitive/显存/cudnn/cuda error/illegal memory access/SystemExit), 损坏类不再用原实例重试, 直接丢弃重建; 仅参数不兼容类(3.x不接受cls)才用原实例重试; ③ GPU引擎损坏累计≥2次→全局降级CPU推理(_rebuild_ocr_cpu, 一次性切换不再回GPU)——GPU实例反复报显存类错误说明CUDA上下文已不可靠, 继续重建GPU实例会在坏上下文上创建导致连环崩溃",
+            "新增GPU模式运行监控日志run_monitor_时间戳.txt(输出目录): 每10秒采样进程工作集/GPU显存(paddle已分配+保留, paddle不可用时经NVML读全卡)/活跃线程数/OCR服务队列积压深度/引擎累计页数/GPU损坏计数/当前推理模式, 并在关键事件(引擎异常重建/GPU降级CPU/单页超时/内存看门狗触发/处理结束)时写事件行——崩溃后最后一条采样即崩溃时刻的资源快照, 用于判断显存耗尽/内存累积/线程风暴等崩溃原因; 新增_gpu_mem_info()显存查询(paddle CUDA API优先, NVML兜底)",
+        ],
+    },
     {
         "version": "3.13",
         "date": "2026-09-02",
@@ -245,6 +253,49 @@ def _proc_mem_mb():
     except Exception:
         pass
     return 0.0
+
+
+def _gpu_mem_info():
+    """GPU显存信息(v3.14): 返回 (已用MB, 总MB, paddle已分配MB), 获取失败返回None。
+    优先用 paddle CUDA API(与推理同源, 反映paddle实际占用); 失败再试 NVML(nvml.dll)。
+    本函数只在OCR服务线程/监控线程调用, 避免与其他CUDA操作并发。"""
+    # ① paddle CUDA(与推理同源)
+    try:
+        import paddle
+        if hasattr(paddle.device, 'cuda') and paddle.device.is_compiled_with_cuda():
+            if int(paddle.device.cuda.device_count()) > 0:
+                alloc = reserved = 0.0
+                try:
+                    alloc = float(paddle.device.cuda.memory_allocated()) / 1048576.0
+                    reserved = float(paddle.device.cuda.memory_reserved()) / 1048576.0
+                except Exception:
+                    pass
+                return (alloc, reserved, 'paddle')
+    except Exception:
+        pass
+    # ② NVML(不依赖paddle, 反映全卡显存——含其他进程占用)
+    try:
+        import ctypes as _ct2
+        nvml = _ct2.CDLL('nvml.dll')
+        if nvml.nvmlInit_v2() == 0:
+            try:
+                h = _ct2.c_void_p()
+                if nvml.nvmlDeviceGetHandleByIndex_v2(0, _ct2.byref(h)) == 0:
+                    free = _ct2.c_ulonglong()
+                    total = _ct2.c_ulonglong()
+                    if nvml.nvmlDeviceGetMemoryInfo(h, _ct2.byref(free),
+                                                    _ct2.byref(total)) == 0:
+                        used = (total.value - free.value) / 1048576.0
+                        tot = total.value / 1048576.0
+                        return (used, tot, 'nvml')
+            finally:
+                try:
+                    nvml.nvmlShutdown()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
 # ========================================================================
 
 
@@ -549,6 +600,7 @@ class FileSplitWorker(QThread):
             if self._svc_rebuilt:
                 return True
             self.log_signal.emit("  → OCR引擎切换为CPU重建(丢弃挂死的GPU实例)")
+            self._run_monitor_line('GPU→CPU重建(推理挂死或引擎连续损坏, 后续全部CPU推理)')
             self.use_gpu_ocr = False
             self._ocr = None
             # 全局paddle place已设为GPU, 强制切回CPU(失败不影响重建——
@@ -583,6 +635,87 @@ class FileSplitWorker(QThread):
                 except Exception:
                     pass
             self._ocr_svc_call(_do, timeout=30)
+        except Exception:
+            pass
+
+    # ---------- v3.14: GPU运行监控日志 ----------
+    # 背景: GPU模式4线程转PDF仍崩溃(access violation), 崩溃点无从定位。
+    # 此处建立周期采样: 每10秒记录 进程工作集/GPU显存/活跃线程数/OCR服务队列
+    # 深度/引擎重建计数, 与业务日志同目录(run_monitor_时间戳.txt)。
+    # 崩溃后最后一条采样即崩溃时刻的资源快照, 可判断是显存耗尽/内存累积/线程风暴。
+    def _run_monitor_line(self, event=''):
+        """写一条监控采样(线程安全)。event非空时为事件行(重建/降级/超时等)。"""
+        if not getattr(self, '_run_mon_path', None):
+            return
+        try:
+            import threading as _thm
+            ts = datetime.now().strftime('%H:%M:%S')
+            with self._run_mon_lock:
+                with open(self._run_mon_path, 'a', encoding='utf-8') as f:
+                    if event:
+                        f.write(f"[{ts}] 事件: {event}\n")
+                        return
+                    mem = _proc_mem_mb()
+                    n_threads = _thm.active_count()
+                    qd = 'n/a'
+                    try:
+                        q = getattr(self, '_svc_q', None)
+                        if q is not None:
+                            qd = str(q.qsize())
+                    except Exception:
+                        pass
+                    gpu_txt = 'n/a'
+                    if getattr(self, 'use_gpu_ocr', False):
+                        gi = _gpu_mem_info()
+                        if gi:
+                            gpu_txt = (f"{gi[0]:.0f}MB alloc/{gi[1]:.0f}MB reserved"
+                                       if gi[2] == 'paddle'
+                                       else f"{gi[0]:.0f}MB used/{gi[1]:.0f}MB total")
+                    f.write(f"[{ts}] mem={mem:.0f}MB gpu={gpu_txt} "
+                            f"threads={n_threads} ocr_q={qd} "
+                            f"pages={getattr(self, '_ocr_pages_since_init', 0)} "
+                            f"gpu_fail={getattr(self, '_gpu_engine_failures', 0)} "
+                            f"gpu_mode={int(bool(getattr(self, 'use_gpu_ocr', False)))}\n")
+        except Exception:
+            pass
+
+    def _run_monitor_loop(self, interval=10):
+        """监控采样线程主循环(daemon), 由 _start_run_monitor 启动。"""
+        while not self._run_mon_stop.wait(interval):
+            self._run_monitor_line()
+
+    def _start_run_monitor(self, output_dir, note=''):
+        """启动运行监控(仅GPU模式)。输出 run_monitor_时间戳.txt 于输出目录。"""
+        try:
+            if not getattr(self, 'use_gpu_ocr', False):
+                return
+            os.makedirs(output_dir, exist_ok=True)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self._run_mon_path = os.path.join(output_dir, f'run_monitor_{ts}.txt')
+            import struct as _st_m
+            bits = _st_m.calcsize('P') * 8
+            with open(self._run_mon_path, 'w', encoding='utf-8') as f:
+                f.write(f"TMToolMan GPU运行监控  启动: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
+                f.write(f"解释器: {bits}位  工作线程数: {getattr(self, 'max_workers', '?')}  "
+                        f"{'| ' + note if note else ''}\n")
+                f.write("采样: 每10秒 | mem=进程工作集 gpu=显存(paddle分配/保留 或 全卡已用/总量) "
+                        "threads=活跃线程 ocr_q=OCR服务队列积压 pages=引擎累计页数 "
+                        "gpu_fail=GPU引擎损坏计数 gpu_mode=当前是否GPU推理\n")
+                f.write("=" * 100 + "\n")
+            import threading as _th_s
+            _t = _th_s.Thread(target=self._run_monitor_loop, daemon=True,
+                              name='RunMonitor')
+            _t.start()
+            self.log_signal.emit(f"  GPU运行监控已启动: run_monitor_{ts}.txt")
+        except Exception as e:
+            self.log_signal.emit(f"  (运行监控启动失败, 不影响处理: {e})")
+
+    def _stop_run_monitor(self, note='正常结束'):
+        """停止监控并写收尾行。"""
+        try:
+            self._run_mon_stop.set()
+            if getattr(self, '_run_mon_path', None):
+                self._run_monitor_line(f'监控结束({note})')
         except Exception:
             pass
 
@@ -756,53 +889,92 @@ class FileSplitWorker(QThread):
             # v3.12: 必须同时捕获 SystemExit——paddleocr 在 cv2 缩放内存不足时内部调用
             # sys.exit(0)(崩溃日志20260901)。SystemExit 继承 BaseException, 仅捕获
             # Exception 会透传打死服务线程。此处拦下按内存失败处理。
-            # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
-            try:
-                result = ocr.ocr(image_path)
-            except (Exception, SystemExit):
+            # v3.14: 首次异常即判定是否引擎损坏类错误(primitive/CUDA/显存类)。
+            # 此类错误下 predictor 内部状态已坏, 继续用同一实例重试会在损坏的
+            # CUDA 上下文上操作 → access violation 进程级崩溃(v3.13后仍崩的根因)。
+            # 损坏类错误: 立即弃用实例; 仅参数不兼容类(3.x不接受cls)才用原实例重试。
+            _e1_txt = f"{type(e).__name__}: {e}".lower()
+            _engine_broken = (isinstance(e, SystemExit)
+                              or any(k in _e1_txt for k in (
+                                  'could not create a primitive',
+                                  'memory allocation', 'bad_alloc', 'out of memory',
+                                  'cannot allocate', 'allocation failed',
+                                  'insufficient memory', 'cudnn', 'cuda error',
+                                  'device side assert', 'illegal memory access')))
+            e2 = e  # 默认占位: 引擎损坏路径不再重试, e2=e 保证下方文案判定包含首错
+            if not _engine_broken:
+                # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
                 try:
-                    result = ocr.predict(image_path)
-                except (Exception, SystemExit) as e2:
-                    # v3.9: 内存分配失败(长时间运行内存累积) → 丢弃引擎重建后重试本页一次,
-                    # 不再直接跳过文本层。匹配paddle/CUDA的内存类错误文案(不区分大小写)。
-                    # v3.12: 补充 could not create a primitive(MKL-DNN分配失败)与
-                    # insufficient memory(cv2.resize OOM); SystemExit(paddleocr内部
-                    # sys.exit(0), 仅在resize内存不足时发生)同样判定为内存失败。
-                    _msg = f"{e} | {e2}".lower()
-                    if (isinstance(e, SystemExit) or isinstance(e2, SystemExit)
-                            or any(k in _msg for k in ('memory allocation', 'bad_alloc',
-                                                       'out of memory', 'cannot allocate',
-                                                       'allocation failed',
-                                                       'could not create a primitive',
-                                                       'insufficient memory'))):
-                        _mem_fail = True
+                    result = ocr.ocr(image_path)
+                except (Exception, SystemExit):
+                    try:
+                        result = ocr.predict(image_path)
+                    except (Exception, SystemExit) as _e3:
+                        e2 = _e3
+                        result = None
+                else:
+                    e2 = None
+            else:
+                result = None
+            if result is None:
+                # v3.9: 内存分配失败(长时间运行内存累积) → 丢弃引擎重建后重试本页一次,
+                # 不再直接跳过文本层。匹配paddle/CUDA的内存类错误文案(不区分大小写)。
+                # v3.12: 补充 could not create a primitive(MKL-DNN分配失败)与
+                # insufficient memory(cv2.resize OOM); SystemExit(paddleocr内部
+                # sys.exit(0), 仅在resize内存不足时发生)同样判定为内存失败。
+                _msg = f"{e} | {e2}".lower()
+                _mem_fail = _mem_fail or _engine_broken or isinstance(e2, SystemExit) \
+                    or any(k in _msg for k in ('memory allocation', 'bad_alloc',
+                                               'out of memory', 'cannot allocate',
+                                               'allocation failed',
+                                               'could not create a primitive',
+                                               'insufficient memory'))
+                if _mem_fail:
+                    self.log_signal.emit(
+                        f"    × OCR引擎异常(疑似内存/推理损坏), 丢弃引擎重建后重试: "
+                        f"{os.path.basename(image_path)}")
+                    self._run_monitor_line(
+                        f'OCR引擎异常并重建: {os.path.basename(image_path)} | '
+                        f'{_e1_txt[:150]}')
+                    self._ocr = None
+                    try:
+                        import gc as _gc2
+                        _gc2.collect()
+                    except Exception:
+                        pass
+                    # v3.14: GPU模式下引擎损坏达到累计阈值 → 全局降级CPU。
+                    # GPU实例反复报 primitive/显存错误说明CUDA上下文已不可靠
+                    # (显存耗尽/驱动异常), 继续重建GPU实例会在坏上下文上创建,
+                    # 连环崩溃(v3.13后仍崩溃的直接原因)。CPU重建一次性切换,
+                    # 之后所有页走CPU(慢但稳), 不再回到GPU。
+                    _gpu_fail = getattr(self, '_gpu_engine_failures', 0) + \
+                        (1 if getattr(self, 'use_gpu_ocr', False) else 0)
+                    self._gpu_engine_failures = _gpu_fail
+                    if getattr(self, 'use_gpu_ocr', False) and _gpu_fail >= 2:
                         self.log_signal.emit(
-                            f"    × OCR内存分配失败, 丢弃引擎重建后重试: "
-                            f"{os.path.basename(image_path)}")
-                        self._ocr = None
+                            f"    × GPU引擎已连续损坏{_gpu_fail}次, 全局切换CPU推理"
+                            f"(后续页全部走CPU, 速度变慢但不再崩溃)")
+                        self._run_monitor_line(
+                            f'GPU引擎累计损坏{_gpu_fail}次≥2, 全局降级CPU推理')
+                        self._rebuild_ocr_cpu()
+                    _ocr2 = self._get_ocr()
+                    if _ocr2 is not None and _ocr2 is not ocr:
+                        # v3.14: 重建实例仅试一次(带cls), 失败不再连环重试——
+                        # 重建实例若仍报同类错误(显存/上下文问题未消除),
+                        # 继续重试同样有access violation风险, 该页直接放弃文本层。
                         try:
-                            import gc as _gc2
-                            _gc2.collect()
-                        except Exception:
-                            pass
-                        _ocr2 = self._get_ocr()
-                        if _ocr2 is not None and _ocr2 is not ocr:
-                            try:
-                                result = _ocr2.ocr(image_path, cls=True)
-                            except (Exception, SystemExit):
-                                try:
-                                    result = _ocr2.ocr(image_path)
-                                except (Exception, SystemExit):
-                                    result = None
-                    if result is None and not _mem_fail:
-                        import traceback
-                        wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
-                        wlog("    详细: " + traceback.format_exc().replace('\n', ' | ')[:500])
-                        return []
-                    if result is None:
-                        wlog(f"    OCR 内存分配失败且重建重试仍失败, 该页跳过文本层: "
-                             f"{os.path.basename(image_path)}")
-                        return []
+                            result = _ocr2.ocr(image_path, cls=True)
+                        except (Exception, SystemExit):
+                            result = None
+                else:
+                    import traceback
+                    wlog(f"    OCR 出错 {os.path.basename(image_path)}: {e}")
+                    wlog("    详细: " + traceback.format_exc().replace('\n', ' | ')[:500])
+                    return []
+                if result is None:
+                    wlog(f"    OCR 内存分配失败且重建重试仍失败, 该页跳过文本层: "
+                         f"{os.path.basename(image_path)}")
+                    return []
 
         frags = []
         items = []
@@ -4738,6 +4910,12 @@ class JpgToPdfWorker(QThread):
         self._probe_lock = threading.Lock()  # 首推理探测全局只做一次(其余线程等结果)
         self._ocr_probed = False            # 探测是否完成(含重建后的重探测)
         self._ocr_broken = False            # OCR彻底不可用(探测+CPU重建均失败)→仅图像PDF
+        self._gpu_engine_failures = 0       # v3.14: GPU引擎损坏累计(≥2次全局降级CPU)
+        # v3.14: GPU运行监控日志——4线程GPU模式下周期采样进程内存/GPU显存/线程数/
+        # OCR队列深度, 写入输出目录 run_monitor_时间戳.txt, 协助定位崩溃点。
+        self._run_mon_path = None           # 监控日志路径(None=不启用)
+        self._run_mon_lock = threading.Lock()
+        self._run_mon_stop = threading.Event()
         
         # 检查 OFD 转换库是否可用（用于生成双层OFD）
         # 使用自建 ofd_writer（基于 PyMuPDF，生成图像层+文本层的双层OFD，
@@ -4769,6 +4947,10 @@ class JpgToPdfWorker(QThread):
             
             total_dirs = len(dir_jpgs_map)
             self.log_signal.emit(f"找到 {total_dirs} 个包含JPG文件的目录，使用 {self.max_workers} 个线程开始处理...")
+
+            # v3.14: GPU模式启动运行监控(每10秒采样内存/显存/线程/队列, 崩溃定位用)
+            self._start_run_monitor(self.output_dir,
+                                    f'{total_dirs}个目录/{self.max_workers}线程')
             
             # 创建日志文件
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -4839,10 +5021,12 @@ class JpgToPdfWorker(QThread):
                 self._emit_finished(True, rate_msg)
             else:
                 self._emit_finished(False, "处理已停止")
-                
+            self._stop_run_monitor('处理完成' if not self.is_stopped else '用户停止')
+
         except BaseException as e:
             # BaseException: SystemExit/KeyboardInterrupt 等也须发出完成信号,
             # 否则界面永久卡死; 具体堆栈由全局崩溃日志机制记录。
+            self._stop_run_monitor(f'run异常: {e}')
             self._emit_finished(False, f"处理出错: {str(e)}")
     
     def stop(self):
@@ -4955,6 +5139,11 @@ class JpgToPdfWorker(QThread):
     _ocr_svc_call = FileSplitWorker._ocr_svc_call
     _rebuild_ocr_cpu = FileSplitWorker._rebuild_ocr_cpu
     _svc_empty_cache = FileSplitWorker._svc_empty_cache
+    # v3.14: GPU运行监控(同定义于 FileSplitWorker, 依赖 __init__ 中 _run_mon_* 属性)
+    _run_monitor_line = FileSplitWorker._run_monitor_line
+    _run_monitor_loop = FileSplitWorker._run_monitor_loop
+    _start_run_monitor = FileSplitWorker._start_run_monitor
+    _stop_run_monitor = FileSplitWorker._stop_run_monitor
     # 类属性别名: 例行重建阈值(方法别名不携带类属性, 须显式同步)
     _OCR_RECYCLE_PAGES = FileSplitWorker._OCR_RECYCLE_PAGES
 
@@ -5131,6 +5320,8 @@ class JpgToPdfWorker(QThread):
                 if st == 'timeout':
                     self.log_signal.emit(
                         f"    × OCR单页超时: {os.path.basename(jpg_path)}")
+                    self._run_monitor_line(
+                        f'OCR单页超时180秒: {os.path.basename(jpg_path)}')
                     if self._rebuild_ocr_cpu():
                         st, frags = self._ocr_svc_call(
                             lambda p=jpg_path: self._ocr_page(p, None, lambda s: None),
@@ -5139,6 +5330,8 @@ class JpgToPdfWorker(QThread):
                     if st == 'error':
                         self.log_signal.emit(
                             f"    OCR出错(跳过文本层): {str(frags)[:80]}")
+                        self._run_monitor_line(
+                            f'OCR服务线程异常: {str(frags)[:120]}')
                     else:
                         self.log_signal.emit(
                             f"    × OCR持续超时, 该页无文本层: "
@@ -5159,6 +5352,9 @@ class JpgToPdfWorker(QThread):
                         self.log_signal.emit(
                             f"    ! 进程内存{_wm:.0f}MB超过阈值{_MEM_REBUILD_MB}MB, "
                             f"强制回收(第{page_idx+1}页)")
+                        self._run_monitor_line(
+                            f'内存看门狗触发: {_wm:.0f}MB>阈值{_MEM_REBUILD_MB}MB, '
+                            f'强制重建引擎(第{page_idx+1}页)')
 
                         def _force_recycle():
                             """仅丢弃引擎+重建(不推理本页), 阻断宿主内存继续增长。"""
