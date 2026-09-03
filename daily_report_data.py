@@ -61,12 +61,68 @@ def _app_dir():
 
 
 def _data_file():
-    """数据文件路径：与程序同目录下的 daily_reports.json"""
+    """旧版json数据文件路径(用于自动迁移)"""
     return os.path.join(_app_dir(), 'daily_reports.json')
 
 
+def _db_file():
+    """sqlite数据库路径：与程序同目录下的 daily_reports.db"""
+    return os.path.join(_app_dir(), 'daily_reports.db')
+
+
+def _db_conn():
+    """打开数据库并确保表结构。失败返回None(降级json)。"""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(_db_file())
+        conn.execute("""CREATE TABLE IF NOT EXISTS daily_reports (
+            date_str TEXT PRIMARY KEY,
+            data_json TEXT NOT NULL,
+            updated_at TEXT)""")
+        conn.commit()
+        return conn
+    except Exception:
+        return None
+
+
+def _migrate_json_if_any(conn):
+    """旧json数据自动迁移进sqlite(仅当库为空且json存在)。迁移后json改名为.bak。"""
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM daily_reports").fetchone()[0]
+        if n > 0:
+            return
+        jp = _data_file()
+        if not os.path.exists(jp):
+            return
+        with open(jp, 'r', encoding='utf-8') as f:
+            old = json.load(f)
+        if not isinstance(old, dict):
+            return
+        conn.executemany(
+            "INSERT OR REPLACE INTO daily_reports VALUES (?,?,?)",
+            [(d, json.dumps(rows, ensure_ascii=False),
+              datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+             for d, rows in old.items()])
+        conn.commit()
+        os.replace(jp, jp + '.bak')   # 保留备份, 防误删
+    except Exception:
+        pass
+
+
 def load_all_data():
-    """加载所有日报数据，返回 {date_str: [[row0 data], [row1 data], ...], ...}"""
+    """加载所有日报数据，返回 {date_str: [[row0 data], [row1 data], ...], ...}
+    存储: sqlite(daily_reports.db); 库不可用时降级读旧json。"""
+    conn = _db_conn()
+    if conn is not None:
+        try:
+            _migrate_json_if_any(conn)
+            rows = conn.execute("SELECT date_str, data_json FROM daily_reports").fetchall()
+            return {d: json.loads(j) for d, j in rows}
+        except Exception:
+            return {}
+        finally:
+            conn.close()
+    # 降级: sqlite不可用 → 读旧json
     path = _data_file()
     if os.path.exists(path):
         try:
@@ -78,7 +134,21 @@ def load_all_data():
 
 
 def save_all_data(data):
-    """保存所有日报数据"""
+    """保存所有日报数据(sqlite整表重写, 接口与旧json版一致)"""
+    conn = _db_conn()
+    if conn is not None:
+        try:
+            conn.execute("DELETE FROM daily_reports")
+            conn.executemany(
+                "INSERT INTO daily_reports VALUES (?,?,?)",
+                [(d, json.dumps(rows, ensure_ascii=False),
+                  datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                 for d, rows in data.items()])
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    # 降级: sqlite不可用 → 写json
     path = _data_file()
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -310,8 +380,22 @@ def save_baselines(baselines):
 
 
 def has_any_data():
-    """检查是否有之前录入的数据"""
-    return os.path.exists(_data_file())
+    """检查是否有之前录入的数据(sqlite有行 或 旧json/bak存在均算有)。
+    修复: 旧实现只查json——sqlite迁移把json改名.bak后永远返回False,
+    导致每次启动都被误判'首次使用'而弹出初始化窗口。"""
+    conn = _db_conn()
+    if conn is not None:
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM daily_reports").fetchone()[0]
+            if n > 0:
+                return True
+        except Exception:
+            pass
+        finally:
+            conn.close()
+    # sqlite无数据时, 兼容尚未迁移的旧json(或其.bak)
+    return (os.path.exists(_data_file())
+            or os.path.exists(_data_file() + '.bak'))
 
 
 # === 归档数据（按组）===

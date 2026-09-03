@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QMessageBox, QSplitter, QLabel,
                              QAbstractItemView, QFrame, QDialog, QComboBox,
                              QTreeWidget, QTreeWidgetItem, QLineEdit, QFormLayout)
-from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtCore import Qt, QDate, QTimer
 from PyQt5.QtGui import QFont, QColor, QBrush, QTextCharFormat
 
 from daily_report_data import (
@@ -42,9 +42,16 @@ class DailyReportWindow(QMainWindow):
         self._updating_totals = False
         self._init_ui()
         self._mark_calendar_dates()
-        # 首次使用检查
-        self._check_first_use()
         self._load_date(self.current_date)
+        # 首次使用检查挪到主窗口显示后(showEvent), 避免初始化子窗口先于主窗口弹出
+        self._first_show_pending = True
+
+    def showEvent(self, event):
+        """主窗口首次显示后再弹初始化窗口(保证主窗口先出现)"""
+        super().showEvent(event)
+        if getattr(self, '_first_show_pending', False):
+            self._first_show_pending = False
+            QTimer.singleShot(0, self._check_first_use)
 
     def _check_first_use(self):
         """首次使用检查：无数据则自动初始化"""

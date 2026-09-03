@@ -12,9 +12,23 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.14"
+VERSION = "3.16"
 
 CHANGELOG = [
+    {
+        "version": "3.16",
+        "date": "2026-09-03",
+        "changes": [
+            "修复_ocr_broken实例级全局标志导致探测失败后整批永久降级单层PDF的问题(高风险)：①原逻辑探测(GPU失败→CPU重建→CPU探测仍失败)置_ocr_broken=True后本轮运行内永不恢复, 后续所有目录静默跳过OCR直接单层(仅第一个失败目录有一行降级提示), 但探测失败可能是临时性故障(探测时GPU显存恰被其他程序占满/系统内存紧张, 之后资源已释放)或探测假阳性, 不应永久封死整批双层输出; ②降级改为非永久: 每_OCR_REPROBE_DIRS(10)个目录在探测锁内自动快速复探(丢弃旧引擎→重建→小图推理60秒), 通过即解除降级恢复双层生成并日志明示(降级期间的目录仍为单层, 可对本批重跑补齐); ③降级期间每个目录日志均明确提示'OCR仍处降级状态'(不再只在首个目录提示), 状态字符串改为'仅图像PDF（OCR探测失败已降级, 周期复探中）'; ④探测图字体改为simhei/msyh/simsun依次回退(原仅试simhei且缺失时静默用PIL默认小字体, 小字识别不出文字→探测假阳性→误全局降级单层)",
+        ],
+    },
+    {
+        "version": "3.15",
+        "date": "2026-09-03",
+        "changes": [
+            "GPU OCR模式下JPG转双层PDF强制单线程(高风险修复——孤儿GPU线程显存泄漏)：OCR本就由内部单一服务线程串行执行, 多线程不提升OCR吞吐, 反而①多个工作线程各持fitz doc分段, GPU模式OCR快会使各线程同时处于写doc阶段, 内存并发峰值叠加paddle驻留(曾致进程被系统终止); ②OCR服务线程GPU推理挂死后无法强制终止成为孤儿线程, 其调用栈持有的GPU引擎(det/rec/cls三模型+CUDA上下文)显存永不释放, 且GPU引擎损坏计数≥2才降级CPU, 最坏可积累多个挂死GPU引擎——多线程高频投递放大180秒超时误判与重建频率, 孤儿线程更易累积; ③多线程同时超时在_ocr_svc_call超时分支存在连环重建服务线程的竞态(v3.14的run_monitor监控日志只能事后诊断, 不能阻止泄漏); 现JpgToPdfWorker.__init__按初始use_gpu_ocr强制max_workers=1(运行中降级CPU后不回改——CPU模式OCR慢, 多线程仍有流水线意义), UI勾选GPU OCR且线程数>1时弹窗确认后自动调为单线程并日志说明",
+        ],
+    },
     {
         "version": "3.14",
         "date": "2026-09-03",
@@ -4892,6 +4906,17 @@ class JpgToPdfWorker(QThread):
         self.generate_ofd = generate_ofd  # 是否同时生成OFD文件
         self.gpu_render = gpu_render      # GPU渲染: 图像加速路径(MKL-DNN+无损直传)
         self.use_gpu_ocr = use_gpu_ocr    # OCR用GPU推理(不可用自动回退CPU)
+        # v3.15: GPU OCR模式强制单线程(按初始use_gpu_ocr决定, 运行中降级CPU后
+        # 不回改——CPU模式OCR慢, 多线程仍可流水线并行)。OCR本就由单一服务线程
+        # 串行执行, 多线程不提升OCR吞吐, 反而:
+        # ① 多个工作线程各持fitz doc分段, GPU模式OCR快会使各线程同时处于写doc
+        #    阶段, 内存并发峰值叠加paddle驻留(曾致进程被系统终止);
+        # ② 服务线程GPU挂死后无法强制终止(孤儿线程), 其调用栈持有的GPU引擎
+        #    显存永不释放; 多线程高频投递放大超时误判→重建频率, 孤儿线程更易累积;
+        # ③ 多线程同时超时在 _ocr_svc_call 超时分支存在连环重建服务线程的竞态。
+        self._gpu_forced_single = bool(use_gpu_ocr) and max_workers > 1
+        if self._gpu_forced_single:
+            self.max_workers = 1
         self.is_stopped = False
         self._done = False  # 是否已发出完成信号(界面层线程意外终止兜底判断用)
         import threading
@@ -4907,9 +4932,18 @@ class JpgToPdfWorker(QThread):
         self._svc_thread = None             # 当前服务线程对象(v3.12: 存活检测用)
         self._svc_rebuilt = False           # 是否已做过GPU挂死→CPU重建(每轮只做一次)
         self._ocr_pages_since_init = 0      # 引擎例行重建计数(与分件共享同款机制, v3.9)
+        # v3.14补: 初始化锁必须在此创建——_get_ocr 的双重检查锁通过
+        # getattr(self,'_ocr_init_lock',None) 取锁, 缺失时取到None直接跳过加锁,
+        # 4个工作线程并发首调 _get_ocr() 会同时进入 _init_ocr_locked() 并发
+        # 构造 PaddleOCR(GPU显存重复分配/CUDA上下文冲突→Memory allocation failed
+        # 或段错误)。FileSplitWorker.__init__ 有同款锁(分件单线程时无害),
+        # 本类此前遗漏是真实缺陷。
+        self._ocr_init_lock = threading.Lock()
         self._probe_lock = threading.Lock()  # 首推理探测全局只做一次(其余线程等结果)
         self._ocr_probed = False            # 探测是否完成(含重建后的重探测)
-        self._ocr_broken = False            # OCR彻底不可用(探测+CPU重建均失败)→仅图像PDF
+        self._ocr_broken = False            # OCR降级标志(探测+CPU重建均失败→仅图像PDF;
+                                           # v3.16起非永久: 每OCR_REPROBE_DIRS个目录复探)
+        self._dirs_since_broken = 0         # v3.16: OCR降级后已处理的目录数(复探计数)
         self._gpu_engine_failures = 0       # v3.14: GPU引擎损坏累计(≥2次全局降级CPU)
         # v3.14: GPU运行监控日志——4线程GPU模式下周期采样进程内存/GPU显存/线程数/
         # OCR队列深度, 写入输出目录 run_monitor_时间戳.txt, 协助定位崩溃点。
@@ -4947,6 +4981,9 @@ class JpgToPdfWorker(QThread):
             
             total_dirs = len(dir_jpgs_map)
             self.log_signal.emit(f"找到 {total_dirs} 个包含JPG文件的目录，使用 {self.max_workers} 个线程开始处理...")
+            if getattr(self, '_gpu_forced_single', False):
+                self.log_signal.emit("  GPU OCR模式已强制单线程(OCR由服务线程串行执行, "
+                                     "多线程无加速且增加GPU挂死显存泄漏风险)")
 
             # v3.14: GPU模式启动运行监控(每10秒采样内存/显存/线程/队列, 崩溃定位用)
             self._start_run_monitor(self.output_dir,
@@ -5151,6 +5188,55 @@ class JpgToPdfWorker(QThread):
         """本地OCR是否可用(初始化一次)。"""
         return self._get_ocr() is not None
 
+    # v3.16: OCR降级后的自动复探间隔(目录数)。降级可能源于临时性故障(探测时
+    # 显存恰被其他程序占满/系统内存紧张)或探测假阳性, 不应永久封死整批双层
+    # 输出; 间隔取10平衡"环境真坏时的重试代价"(每10个目录一次60秒复探)与
+    # "临时故障的恢复时延"。
+    _OCR_REPROBE_DIRS = 10
+
+    @staticmethod
+    def _make_probe_image(path):
+        """生成OCR探测图(600x200白底黑字)。字体依次尝试 simhei/msyh/simsun,
+        全部缺失时回退PIL默认字体(v3.16前仅试simhei且失败时静默用默认小字体,
+        小字识别不出文字 → 探测假阳性 → 误全局降级单层)。"""
+        _pb = Image.new('RGB', (600, 200), 'white')
+        from PIL import ImageDraw as _ID, ImageFont as _IF
+        _dr = _ID.Draw(_pb)
+        _fnt = None
+        for _fn in ('simhei.ttf', 'msyh.ttc', 'simsun.ttc'):
+            try:
+                _fnt = _IF.truetype('C:/Windows/Fonts/' + _fn, 40)
+                break
+            except Exception:
+                continue
+        _dr.text((40, 60), 'OCR探测测试文字', fill=(0, 0, 0), font=_fnt)
+        _pb.save(path)
+
+    def _reprobe_ocr(self, output_dir):
+        """OCR降级后的快速复探(须持 _probe_lock 调用)。
+        丢弃降级时可能损坏的引擎→按当前配置(降级路径已CPU化)重建→小图推理,
+        60秒超时。返回 True=推理恢复正常(调用方解除降级)。"""
+        self.log_signal.emit("  OCR降级后自动复探(最长60秒)...")
+        _probe = os.path.join(output_dir, '_ocr_probe.png')
+        try:
+            self._make_probe_image(_probe)
+            self._ocr = None              # 丢弃旧实例(降级时可能已损坏)
+            self._ocr_pages_since_init = 0
+            st, _res = self._ocr_svc_call(
+                lambda: self._ocr_page(_probe, None, lambda s: None),
+                timeout=60)
+            if st == 'ok' and _res:
+                return True
+            self.log_signal.emit(f"  × OCR复探未通过({st}), 继续降级单层")
+            return False
+        except Exception:
+            return False
+        finally:
+            try:
+                os.remove(_probe)
+            except Exception:
+                pass
+
     def process_jpgs_to_ocr_pdf(self, jpg_paths, output_dir, pdf_filename):
         """
         将多个JPG文件合并转换为双层PDF（图像+OCR文本层）。
@@ -5190,15 +5276,7 @@ class JpgToPdfWorker(QThread):
                     # 探测图必须含真实文字: 纯白图OCR返回空也算'ok', 无法暴露
                     # GPU上"能跑但识别不出任何内容"的半失效状态(该状态下每页
                     # frags为空 → 生成单层PDF)。要求识别出文字才算探测通过。
-                    _pb = Image.new('RGB', (600, 200), 'white')
-                    from PIL import ImageDraw as _ID, ImageFont as _IF
-                    _dr = _ID.Draw(_pb)
-                    try:
-                        _fnt = _IF.truetype('C:/Windows/Fonts/simhei.ttf', 40)
-                    except Exception:
-                        _fnt = None
-                    _dr.text((40, 60), 'OCR探测测试文字', fill=(0, 0, 0), font=_fnt)
-                    _pb.save(_probe)
+                    self._make_probe_image(_probe)
                     st, _res = self._ocr_svc_call(
                         lambda: self._ocr_page(_probe, None, lambda s: None),
                         timeout=120)
@@ -5225,15 +5303,7 @@ class JpgToPdfWorker(QThread):
                     self.log_signal.emit("  CPU模式重新探测(最长等待120秒)...")
                     _p2 = os.path.join(output_dir, '_ocr_probe.png')
                     try:
-                        _pb2 = Image.new('RGB', (600, 200), 'white')
-                        from PIL import ImageDraw as _ID2, ImageFont as _IF2
-                        _dr2 = _ID2.Draw(_pb2)
-                        try:
-                            _fnt2 = _IF2.truetype('C:/Windows/Fonts/simhei.ttf', 40)
-                        except Exception:
-                            _fnt2 = None
-                        _dr2.text((40, 60), 'OCR探测测试文字', fill=(0, 0, 0), font=_fnt2)
-                        _pb2.save(_p2)
+                        self._make_probe_image(_p2)
                         st2, _r2 = self._ocr_svc_call(
                             lambda: self._ocr_page(_p2, None, lambda s: None),
                             timeout=120)
@@ -5248,11 +5318,32 @@ class JpgToPdfWorker(QThread):
                         except Exception:
                             pass
                 if not _probe_ok:
+                    # v3.16: 降级不再永久——探测失败可能是临时性故障(探测时显存
+                    # 恰被其他程序占满/系统内存紧张, 之后资源已释放)或探测假阳性,
+                    # 每 _OCR_REPROBE_DIRS 个目录自动复探, 通过即恢复双层生成。
                     self._ocr_broken = True
-                    self.log_signal.emit("  → OCR不可用, 降级为仅图像PDF继续处理")
+                    self._dirs_since_broken = 0
+                    self.log_signal.emit(
+                        "  → OCR探测+CPU重建均失败, 降级为仅图像PDF继续处理"
+                        f"(每{self._OCR_REPROBE_DIRS}个目录将自动复探恢复)")
+            elif getattr(self, '_ocr_broken', False):
+                # v3.16: 降级状态下的周期复探(在 _probe_lock 内, 与首探测互斥)
+                self._dirs_since_broken = getattr(self, '_dirs_since_broken', 0) + 1
+                if self._dirs_since_broken >= self._OCR_REPROBE_DIRS:
+                    if self._reprobe_ocr(output_dir):
+                        self._ocr_broken = False
+                        self._dirs_since_broken = 0
+                        self.log_signal.emit(
+                            "  ✓ OCR复探通过, 恢复双层PDF生成"
+                            "(降级期间的目录仍为单层, 可对本批重跑补齐)")
+                        self._run_monitor_line('OCR复探通过, 解除全局降级')
+                    else:
+                        self._dirs_since_broken = 0  # 复探未过: 计数清零, 下轮再试
         if getattr(self, '_ocr_broken', False):
+            # v3.16: 每目录明确提示(不再仅首个失败目录可见降级原因)
+            self.log_signal.emit("  ! OCR仍处降级状态, 本目录仅生成图像PDF(无文本层)")
             temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
-            return temp_pdf_path, "仅图像PDF（本机OCR推理异常已跳过）"
+            return temp_pdf_path, "仅图像PDF（OCR探测失败已降级, 周期复探中）"
 
         try:
             import fitz  # PyMuPDF
@@ -5839,8 +5930,29 @@ class JpgToPdfPage(FunctionPage):
 
         self.log("="*50)
         
-        # 创建工作线程
+        # v3.15: GPU OCR模式线程数约束——OCR由内部单一服务线程串行执行, 多线程
+        # 不提升OCR吞吐, 反而放大内存峰值与GPU孤儿线程显存泄漏风险(挂死的服务
+        # 线程无法终止, 其GPU引擎显存永不释放; v3.14的run_monitor仅事后诊断)。
         max_workers = self.thread_spin.value()
+        if self.gpu_ocr_check.isChecked() and max_workers > 1:
+            reply = QMessageBox.question(
+                self, "GPU模式线程数调整",
+                f"当前线程数为 {max_workers}，但「OCR使用GPU处理」模式下\n"
+                "多线程无法加速OCR（OCR在内部单一服务线程串行执行），\n"
+                "反而会增加内存峰值与GPU线程挂死、显存泄漏的风险。\n\n"
+                "将以单线程模式开始处理，是否继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply != QMessageBox.Yes:
+                self.log("已取消: GPU OCR模式建议单线程"
+                         "(可手动调低线程数或改用CPU模式后重试)")
+                self.progress.setFormat("待开始")
+                return
+            self.thread_spin.setValue(1)
+            max_workers = 1
+            self.log("GPU OCR模式: 线程数已调整为1"
+                     "(OCR串行执行, 多线程无加速且增加显存泄漏风险)")
+
+        # 创建工作线程
         resolution = float(self.dpi_spin.value())
         generate_ofd = self.generate_ofd_check.isChecked()
         self.worker = JpgToPdfWorker(
