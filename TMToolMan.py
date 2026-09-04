@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.16"
+VERSION = "3.17"
 
 CHANGELOG = [
+    {
+        "version": "3.17",
+        "date": "2026-09-04",
+        "changes": [
+            "取消v3.15的GPU OCR模式下JPG转双层PDF强制单线程限制, 恢复允许用户自选多线程(应用户要求)：①OCR本身仍由内部单一服务线程串行执行(线程安全不变), 多线程的意义在于图像解码/PDF分段写入等非OCR阶段与OCR形成流水线并行; ②UI不再弹窗后强制调为1线程, 改为多线程+GPU时一次性提示风险(内存峰值/GPU挂死会自动降级CPU), 用户确认后按所选线程数执行; ③运行日志提示同步改为'GPU OCR模式多线程'说明流水线并行与兜底机制; ④v3.15担心的孤儿GPU线程显存泄漏风险仍由v3.14的run_monitor监控+GPU引擎损坏计数≥2全局降级CPU兜底, 不再以牺牲吞吐换取",
+        ],
+    },
     {
         "version": "3.16",
         "date": "2026-09-03",
@@ -4906,17 +4913,12 @@ class JpgToPdfWorker(QThread):
         self.generate_ofd = generate_ofd  # 是否同时生成OFD文件
         self.gpu_render = gpu_render      # GPU渲染: 图像加速路径(MKL-DNN+无损直传)
         self.use_gpu_ocr = use_gpu_ocr    # OCR用GPU推理(不可用自动回退CPU)
-        # v3.15: GPU OCR模式强制单线程(按初始use_gpu_ocr决定, 运行中降级CPU后
-        # 不回改——CPU模式OCR慢, 多线程仍可流水线并行)。OCR本就由单一服务线程
-        # 串行执行, 多线程不提升OCR吞吐, 反而:
-        # ① 多个工作线程各持fitz doc分段, GPU模式OCR快会使各线程同时处于写doc
-        #    阶段, 内存并发峰值叠加paddle驻留(曾致进程被系统终止);
-        # ② 服务线程GPU挂死后无法强制终止(孤儿线程), 其调用栈持有的GPU引擎
-        #    显存永不释放; 多线程高频投递放大超时误判→重建频率, 孤儿线程更易累积;
-        # ③ 多线程同时超时在 _ocr_svc_call 超时分支存在连环重建服务线程的竞态。
-        self._gpu_forced_single = bool(use_gpu_ocr) and max_workers > 1
-        if self._gpu_forced_single:
-            self.max_workers = 1
+        # v3.17: 取消v3.15的GPU OCR模式强制单线程限制, 恢复允许用户自选多线程。
+        # OCR仍由单一服务线程串行执行(线程安全不变), 多线程的意义在于图像解码/
+        # PDF分段写入等非OCR阶段与OCR形成流水线并行。v3.15担心的内存峰值与
+        # 孤儿GPU线程显存泄漏风险由v3.14的run_monitor监控与GPU引擎损坏计数≥2
+        # 全局降级CPU机制兜底, 不再以牺牲吞吐换取。
+        self._gpu_forced_single = False
         self.is_stopped = False
         self._done = False  # 是否已发出完成信号(界面层线程意外终止兜底判断用)
         import threading
@@ -4981,9 +4983,12 @@ class JpgToPdfWorker(QThread):
             
             total_dirs = len(dir_jpgs_map)
             self.log_signal.emit(f"找到 {total_dirs} 个包含JPG文件的目录，使用 {self.max_workers} 个线程开始处理...")
-            if getattr(self, '_gpu_forced_single', False):
-                self.log_signal.emit("  GPU OCR模式已强制单线程(OCR由服务线程串行执行, "
-                                     "多线程无加速且增加GPU挂死显存泄漏风险)")
+            if self.use_gpu_ocr and self.max_workers > 1:
+                # v3.17: GPU模式多线程提示(不再强制单线程): OCR本身由服务线程
+                # 串行执行, 多线程用于解码/写PDF等阶段与OCR流水线并行。
+                self.log_signal.emit("  GPU OCR模式多线程: OCR推理仍串行执行, "
+                                     "多线程用于图像解码/PDF写入流水线(有内存峰值与"
+                                     "GPU挂死风险, 已由运行监控与自动降级CPU兜底)")
 
             # v3.14: GPU模式启动运行监控(每10秒采样内存/显存/线程/队列, 崩溃定位用)
             self._start_run_monitor(self.output_dir,
@@ -5930,27 +5935,30 @@ class JpgToPdfPage(FunctionPage):
 
         self.log("="*50)
         
-        # v3.15: GPU OCR模式线程数约束——OCR由内部单一服务线程串行执行, 多线程
-        # 不提升OCR吞吐, 反而放大内存峰值与GPU孤儿线程显存泄漏风险(挂死的服务
-        # 线程无法终止, 其GPU引擎显存永不释放; v3.14的run_monitor仅事后诊断)。
+        # v3.17: 取消v3.15的GPU OCR模式强制单线程——允许用户自选多线程。
+        # OCR本身由内部单一服务线程串行执行(线程安全不变), 多线程用于图像
+        # 解码/PDF分段写入等阶段与OCR流水线并行; 内存峰值与GPU挂死风险由
+        # v3.14运行监控+GPU引擎损坏计数≥2自动降级CPU兜底。仅在多线程+GPU时
+        # 一次性提示风险, 用户确认后按所选线程数执行, 不再强制改为1。
         max_workers = self.thread_spin.value()
         if self.gpu_ocr_check.isChecked() and max_workers > 1:
             reply = QMessageBox.question(
-                self, "GPU模式线程数调整",
-                f"当前线程数为 {max_workers}，但「OCR使用GPU处理」模式下\n"
-                "多线程无法加速OCR（OCR在内部单一服务线程串行执行），\n"
-                "反而会增加内存峰值与GPU线程挂死、显存泄漏的风险。\n\n"
-                "将以单线程模式开始处理，是否继续？",
+                self, "GPU模式多线程确认",
+                f"当前线程数为 {max_workers}，「OCR使用GPU处理」模式下\n"
+                "OCR推理由内部单一服务线程串行执行，多线程用于\n"
+                "图像解码与PDF写入阶段的流水线并行。\n\n"
+                "多线程会增加内存峰值与GPU线程挂死的风险\n"
+                "（发生时会自动降级CPU继续处理）。\n\n"
+                "是否按当前线程数继续？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
             if reply != QMessageBox.Yes:
-                self.log("已取消: GPU OCR模式建议单线程"
+                self.log("已取消: GPU OCR多线程需确认后执行"
                          "(可手动调低线程数或改用CPU模式后重试)")
                 self.progress.setFormat("待开始")
                 return
-            self.thread_spin.setValue(1)
-            max_workers = 1
-            self.log("GPU OCR模式: 线程数已调整为1"
-                     "(OCR串行执行, 多线程无加速且增加显存泄漏风险)")
+            self.log(f"GPU OCR模式: 按 {max_workers} 线程执行"
+                     "(OCR推理串行, 多线程用于解码/写PDF流水线; "
+                     "GPU异常自动降级CPU)")
 
         # 创建工作线程
         resolution = float(self.dpi_spin.value())
