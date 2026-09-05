@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.17"
+VERSION = "3.18"
 
 CHANGELOG = [
+    {
+        "version": "3.18",
+        "date": "2026-09-05",
+        "changes": [
+            "文件改名页新增「文件夹命名标准化」功能：①目标命名格式为 全宗号-专业·年限-保管期限-机构代码-件号(专业与年限间用间隔号·, 其余用短横-); ②5个字段均支持两种填写方式: 直接填写(输入框)或引用现有(引用所选目录下现有子目录名对应位置的字段值, 目录无符合格式时字段留空跳过); ③提供预览: 弹窗表格列出每个子目录的原名→新名, 可直接修改后应用; ④执行后自动生成Excel文件记录原目录名与新目录名(openpyxl, 输出目录下 目录改名记录_时间戳.xlsx); ⑤新增选择框「目录标准化后批量重命名目录下文件」(默认不勾), 勾选后完成目录改名即调用「按目录名批量重命名」逻辑对新目录下文件批量命名(单文件=目录名, 多文件=目录名-0001起)",
+        ],
+    },
     {
         "version": "3.17",
         "date": "2026-09-04",
@@ -136,7 +143,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QFileDialog, QTextEdit, QSpinBox, QComboBox,
                              QFormLayout, QGroupBox, QMessageBox, QStackedWidget, QCheckBox,
                              QProgressBar, QDialog, QListWidget, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QAbstractItemView)
+                             QTableWidgetItem, QHeaderView, QAbstractItemView,
+                             QRadioButton)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QRegularExpression
 from PyQt5.QtGui import QFont, QRegularExpressionValidator
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -3127,6 +3135,251 @@ class ExtRenameWorker(QThread):
         self.is_stopped = True
 
 
+class DirStandardizeWorker(QThread):
+    """文件夹命名标准化后台处理线程(v3.18)。
+
+    将所选目录下每个子目录改名为「全宗号-专业·年限-保管期限-机构代码-件号」，
+    字段值来源两种: 直接填写(用户输入的固定值)或引用现有(解析各子目录现有
+    名称对应位置的字段值)。执行后生成Excel记录原名→新名。
+    """
+    log_signal = Signal(str)
+    progress_signal = Signal(int, int)
+    finished_signal = Signal(bool, str)
+
+    # 匹配现有目录名的正则: 全宗号-专业·年限-保管期限-机构代码-件号
+    # (专业限字母, 年限4位数字, 件号3-5位数字; 分隔符允许全角－与·两侧无空格)
+    _FMT_RE = re.compile(
+        r'^([A-Za-z0-9]+)[-－]([A-Za-z]+)[·・](\d{4})[-－]'
+        r'([A-Za-z0-9]+)[-－]([A-Za-z0-9]+)[-－](\d{3,5})$')
+
+    def __init__(self, base_dir, fields, rename_files=False, parent=None):
+        """
+        fields: dict{'全宗号':str,'专业':str,'年限':str,'保管期限':str,
+                     '机构代码':str,'件号':str} —— 非空=直接填写, 空=引用现有
+        rename_files: 目录改名后是否批量重命名目录下文件
+        """
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.fields = fields
+        self.rename_files = rename_files
+        self.is_stopped = False
+        self.plan = []   # [(子目录Path, 新名str), ...] 由 preview() 填充
+
+    def stop(self):
+        self.is_stopped = True
+
+    # ---------- 计划生成(预览与执行共用) ----------
+    def build_plan(self, log=None):
+        """扫描子目录生成改名计划。返回 (plan, 引用失败列表)。
+        plan: [(subdir_path, new_name)]; 引用失败=某字段既无直接填写
+        又无法从现有名解析(或该目录名不符合格式), 该目录跳过并记录。"""
+        plan, skipped = [], []
+        subdirs = sorted([d for d in Path(self.base_dir).iterdir()
+                          if d.is_dir()], key=lambda p: p.name)
+        for sd in subdirs:
+            m = self._FMT_RE.match(sd.name)
+            old_parts = m.groups() if m else None
+            vals = []
+            bad = False
+            for i, key in enumerate(
+                    ('全宗号', '专业', '年限', '保管期限', '机构代码', '件号')):
+                v = (self.fields.get(key) or '').strip()
+                if v:
+                    vals.append(v)            # 直接填写优先
+                elif old_parts:
+                    vals.append(old_parts[i])  # 引用现有目录名对应位置
+                else:
+                    bad = True                 # 无来源, 本目录跳过
+                    break
+            if bad:
+                skipped.append(sd.name)
+                continue
+            new_name = (f"{vals[0]}-{vals[1]}·{vals[2]}-"
+                        f"{vals[3]}-{vals[4]}-{vals[5]}")
+            if new_name == sd.name:
+                continue   # 已符合标准, 无需改名
+            plan.append((sd, new_name))
+        return plan, skipped
+
+    def run(self):
+        try:
+            if not self.plan:
+                self.finished_signal.emit(False, "无待改名目录(全部已符合标准或引用失败)")
+                return
+            total = len(self.plan)
+            done = 0
+            renamed, failed = [], []
+            conflicts = []
+            for sd, new_name in self.plan:
+                if self.is_stopped:
+                    break
+                target = sd.parent / new_name
+                if target.exists() and target != sd:
+                    # 目标名已被占用: 冲突目录不强行改名, 记录后跳过
+                    conflicts.append(f"{sd.name} → {new_name}(目标已存在)")
+                    done += 1
+                    self.progress_signal.emit(done, total)
+                    continue
+                try:
+                    sd.rename(target)
+                    renamed.append((sd.name, new_name))
+                    self.log_signal.emit(f"  • {sd.name} → {new_name}")
+                except Exception as e:
+                    failed.append((sd.name, str(e)))
+                    self.log_signal.emit(f"  × 改名失败 {sd.name}: {e}")
+                done += 1
+                self.progress_signal.emit(done, total)
+
+            # Excel 改名记录
+            xlsx_path = self._write_xlsx(renamed, failed, conflicts)
+            if xlsx_path:
+                self.log_signal.emit(f"改名记录已写入: {xlsx_path}")
+
+            # 勾选了改名后批量重命名目录下文件
+            file_msg = ''
+            if self.rename_files:
+                self.log_signal.emit("开始批量重命名目录下文件(按目录名)...")
+                file_msg = self._rename_files_in_dirs()
+
+            msg = (f"目录改名完成: 成功 {len(renamed)} 个, 失败 {len(failed)} 个, "
+                   f"冲突跳过 {len(conflicts)} 个{file_msg}")
+            self.finished_signal.emit(not self.is_stopped, msg)
+        except Exception as e:
+            self.finished_signal.emit(False, f"处理出错: {e}")
+
+    def _write_xlsx(self, renamed, failed, conflicts):
+        """生成Excel记录(原目录名/新目录名/状态)。失败返回None。"""
+        try:
+            import openpyxl
+        except Exception:
+            self.log_signal.emit("  × 缺少 openpyxl 库, 无法生成Excel记录")
+            return None
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = '目录改名记录'
+            ws.append(['序号', '原目录名', '新目录名', '状态'])
+            for i, (old, new) in enumerate(renamed, 1):
+                ws.append([i, old, new, '成功'])
+            for i, (old, err) in enumerate(failed, 1):
+                ws.append([len(renamed) + i, old, '', f'失败: {err}'])
+            for i, c in enumerate(conflicts, 1):
+                ws.append([len(renamed) + len(failed) + i, c.split(' → ')[0],
+                           c.split(' → ')[1].split('(')[0], '跳过(目标已存在)'])
+            # 列宽
+            for col, w in zip('ABCD', (8, 44, 44, 22)):
+                ws.column_dimensions[col].width = w
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            path = os.path.join(self.base_dir, f"目录改名记录_{ts}.xlsx")
+            wb.save(path)
+            return path
+        except Exception as e:
+            self.log_signal.emit(f"  × Excel记录写入失败: {e}")
+            return None
+
+    def _rename_files_in_dirs(self):
+        """目录改名后按新目录名批量重命名其下文件(与FileRenameWorker同规则:
+        单文件=目录名, 多文件=目录名-0001起)。返回结果摘要字符串。"""
+        total_renamed = 0
+        total_failed = 0
+        # 只处理本轮改名涉及的目录(改名后的新路径)
+        base = Path(self.base_dir)
+        new_dirs = [base / new for _, new in self.plan
+                    if (base / new).is_dir()]
+        for d in sorted(set(new_dirs)):
+            if self.is_stopped:
+                break
+            try:
+                files = sorted([f for f in Path(d).iterdir() if f.is_file()])
+            except Exception:
+                continue
+            if not files:
+                continue
+            for i, f in enumerate(files, start=1):
+                if self.is_stopped:
+                    break
+                new_name = (f"{d.name}{f.suffix}" if len(files) == 1
+                            else f"{d.name}-{i:04d}{f.suffix}")
+                target = d / new_name
+                if f == target:
+                    continue
+                try:
+                    f.rename(target)
+                    total_renamed += 1
+                except Exception:
+                    total_failed += 1
+        return (f"; 文件批量重命名: 成功 {total_renamed} 个, "
+                f"失败 {total_failed} 个")
+
+
+class DirStandardizePreviewDialog(QDialog):
+    """文件夹命名标准化预览对话框(v3.18): 表格列出原名→新名, 可改后确认。"""
+
+    def __init__(self, plan, skipped, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("文件夹命名标准化 - 预览")
+        self.resize(760, 520)
+        self.plan = plan           # [(subdir_path, new_name)]
+        self.skipped = skipped
+        self.confirmed = False
+
+        v = QVBoxLayout(self)
+        tip = QLabel(f"共 {len(plan)} 个目录将改名, {len(skipped)} 个引用失败跳过"
+                     f"{'(目录名不符合格式且字段无直接填写)' if skipped else ''}"
+                     "。\n新目录名列可直接修改, 确认后按表格内容执行:")
+        tip.setStyleSheet("color: #8B949E; font-size: 12px;")
+        v.addWidget(tip)
+
+        self.table = QTableWidget(len(plan), 2)
+        self.table.setHorizontalHeaderLabels(["原目录名", "新目录名(可修改)"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for row, (sd, new_name) in enumerate(plan):
+            it_old = QTableWidgetItem(sd.name)
+            it_old.setFlags(it_old.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 0, it_old)
+            self.table.setItem(row, 1, QTableWidgetItem(new_name))
+        v.addWidget(self.table, 1)
+
+        if skipped:
+            skip_lbl = QLabel("引用失败目录: " + ", ".join(skipped[:8])
+                              + ("..." if len(skipped) > 8 else ""))
+            skip_lbl.setStyleSheet("color: #B45309; font-size: 12px;")
+            skip_lbl.setWordWrap(True)
+            v.addWidget(skip_lbl)
+
+        h = QHBoxLayout()
+        btn_ok = QPushButton("确认改名")
+        btn_ok.setObjectName("ActionBtn")
+        btn_ok.setStyleSheet("background-color: #2196F3;")
+        btn_ok.clicked.connect(self.on_ok)
+        h.addWidget(btn_ok)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("BrowseBtn")
+        btn_cancel.clicked.connect(self.reject)
+        h.addWidget(btn_cancel)
+        h.addStretch()
+        v.addLayout(h)
+
+    def on_ok(self):
+        # 校验新名非空且不含非法字符
+        bad = []
+        self.final_plan = []
+        for row, (sd, _) in enumerate(self.plan):
+            new_name = self.table.item(row, 1).text().strip()
+            if not new_name or any(c in new_name for c in '\\/:*?"<>|'):
+                bad.append(f"第{row + 1}行: {new_name!r}")
+                continue
+            self.final_plan.append((sd, new_name))
+        if bad:
+            QMessageBox.warning(self, "新目录名无效",
+                                "以下新目录名为空或含非法字符(\\ / : * ? \" < > |):\n"
+                                + "\n".join(bad))
+            return
+        self.confirmed = True
+        self.accept()
+
+
 class FileRenamePage(FunctionPage):
     def __init__(self):
         super().__init__("文件改名")
@@ -3180,6 +3433,66 @@ class FileRenamePage(FunctionPage):
 
         group.setLayout(form)
         self.layout.addWidget(group)
+
+        # ====== 功能1b: 文件夹命名标准化(v3.18) ======
+        std_group = QGroupBox("文件夹命名标准化 (格式: 全宗号-专业·年限-保管期限-机构代码-件号)")
+        std_form = QFormLayout()
+
+        self.std_dir_edit = QLineEdit()
+        self.std_dir_edit.setPlaceholderText("其下的子目录将被标准化改名")
+        btn_std_browse = QPushButton("选择文件夹")
+        btn_std_browse.setObjectName("BrowseBtn")
+        btn_std_browse.clicked.connect(self.browse_std_dir)
+        h_std = QHBoxLayout()
+        h_std.addWidget(self.std_dir_edit)
+        h_std.addWidget(btn_std_browse)
+        std_form.addRow("目标目录:", h_std)
+
+        std_form.addRow(QLabel(
+            "各字段填写方式: 选中「直接填写」后在输入框填固定值(对所有目录生效);"
+            " 选中「引用现有」则取各子目录现名对应位置的字段值(目录名不符合格式时该目录跳过):"))
+
+        # 6个字段行: 每行 = 字段名 + (直接填写|引用现有)单选 + 输入框
+        self.std_fields = {}   # key -> (QRadioButton直接, QRadioButton引用, QLineEdit)
+        for key in ('全宗号', '专业', '年限', '保管期限', '机构代码', '件号'):
+            rb_input = QRadioButton("直接填写")
+            rb_ref = QRadioButton("引用现有")
+            rb_ref.setChecked(True)   # 默认引用现有
+            edit = QLineEdit()
+            edit.setEnabled(False)
+            edit.setPlaceholderText("直接填写时输入")
+            rb_input.toggled.connect(lambda on, e=edit: e.setEnabled(on))
+            h = QHBoxLayout()
+            h.addWidget(rb_input)
+            h.addWidget(rb_ref)
+            h.addWidget(edit, 1)
+            std_form.addRow(key + ":", h)
+            self.std_fields[key] = (rb_input, rb_ref, edit)
+
+        # 目录标准化后是否批量重命名目录下文件(默认不勾)
+        self.std_rename_files_check = QCheckBox(
+            "目录标准化后按新目录名批量重命名目录下文件"
+            "(单文件=目录名, 多文件=目录名-0001起, 与「按目录名批量重命名」同规则)")
+        self.std_rename_files_check.setChecked(False)
+        std_form.addRow("", self.std_rename_files_check)
+
+        # 操作按钮
+        std_btn_layout = QHBoxLayout()
+        self.std_preview_btn = QPushButton("预览")
+        self.std_preview_btn.setObjectName("ActionBtn")
+        self.std_preview_btn.setStyleSheet("background-color: #2196F3;")
+        self.std_preview_btn.clicked.connect(self.preview_std_rename)
+        std_btn_layout.addWidget(self.std_preview_btn)
+
+        self.std_exec_btn = QPushButton("开始标准化")
+        self.std_exec_btn.setObjectName("ActionBtn")
+        self.std_exec_btn.clicked.connect(self.execute_std_rename)
+        std_btn_layout.addWidget(self.std_exec_btn)
+        std_btn_layout.addStretch()
+        std_form.addRow("", std_btn_layout)
+
+        std_group.setLayout(std_form)
+        self.layout.addWidget(std_group)
 
         # ====== 功能2: 修改文件扩展名 ======
         ext_group = QGroupBox("修改文件扩展名(递归处理目录及子目录)")
@@ -3236,6 +3549,10 @@ class FileRenamePage(FunctionPage):
             "【按目录名批量重命名】\n"
             "• 单文件：直接以目录名命名；多文件：目录名-0001、目录名-0002...\n"
             "• 自动生成详细日志文件；可选修改JPG文件DPI为600\n"
+            "【文件夹命名标准化】\n"
+            "• 目标格式: 全宗号-专业·年限-保管期限-机构代码-件号 (专业与年限用·间隔)\n"
+            "• 字段可「直接填写」固定值或「引用现有」子目录名对应位置; 预览可改新名\n"
+            "• 执行后自动生成Excel记录原/新目录名; 可选同步批量重命名目录下文件\n"
             "【修改文件扩展名】\n"
             "• 递归扫描目录及子目录，将旧扩展名文件改为新扩展名\n"
             "• 扩展名输入无需点号(如输入 tif 或 .tif 均可)；自动生成日志文件"
@@ -3245,6 +3562,7 @@ class FileRenamePage(FunctionPage):
 
         self.worker = None
         self.ext_worker = None
+        self.std_worker = None
         self.add_log_widget()
 
         # 进度条
@@ -3391,6 +3709,121 @@ class FileRenamePage(FunctionPage):
         
         if success:
             QMessageBox.information(self, "完成", "处理完成！")
+        else:
+            QMessageBox.warning(self, "提示", message)
+
+    # ---------- 文件夹命名标准化功能(v3.18) ----------
+    def browse_std_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择命名标准化的目标目录")
+        if d:
+            self.std_dir_edit.setText(d)
+
+    def _collect_std_fields(self, show_warn=True):
+        """从界面收集字段配置。返回 dict(值非空=直接填写) 或 None(校验失败)。"""
+        fields = {}
+        for key, (rb_input, _rb_ref, edit) in self.std_fields.items():
+            if rb_input.isChecked():
+                v = edit.text().strip()
+                if not v and show_warn:
+                    QMessageBox.warning(self, "提示",
+                                        f"字段「{key}」选中了直接填写, 但输入为空。\n"
+                                        "请填写内容或改选「引用现有」。")
+                    return None
+                fields[key] = v
+            else:
+                fields[key] = ''   # 引用现有
+        return fields
+
+    def preview_std_rename(self):
+        """预览标准化改名(弹窗表格, 新名可修改)"""
+        d = self.std_dir_edit.text().strip()
+        if not d:
+            QMessageBox.warning(self, "提示", "请先选择命名标准化的目标目录")
+            return
+        if not os.path.isdir(d):
+            QMessageBox.warning(self, "错误", "指定的目录不存在")
+            return
+        fields = self._collect_std_fields()
+        if fields is None:
+            return
+
+        try:
+            w = DirStandardizeWorker(d, fields,
+                                     rename_files=self.std_rename_files_check.isChecked())
+            plan, skipped = w.build_plan()
+            if not plan and not skipped:
+                QMessageBox.information(self, "预览",
+                                        "所有子目录已符合标准格式, 无需改名。")
+                return
+            if not plan:
+                QMessageBox.warning(
+                    self, "预览",
+                    f"没有可改名的目录。\n{len(skipped)} 个目录名不符合格式"
+                    "且相关字段未「直接填写」, 无法引用:\n"
+                    + "\n".join(skipped[:10])
+                    + ("..." if len(skipped) > 10 else ""))
+                return
+            dlg = DirStandardizePreviewDialog(plan, skipped, self)
+            if dlg.exec_() == QDialog.Accepted and dlg.confirmed:
+                # 用预览(用户可能已修改)的最终计划执行
+                w.plan = dlg.final_plan
+                self.std_execute_worker(w)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"预览出错: {e}")
+
+    def execute_std_rename(self):
+        """直接执行标准化改名(不经预览弹窗, 内部仍先build_plan)"""
+        d = self.std_dir_edit.text().strip()
+        if not d:
+            QMessageBox.warning(self, "提示", "请先选择命名标准化的目标目录")
+            return
+        if not os.path.isdir(d):
+            QMessageBox.warning(self, "错误", "指定的目录不存在")
+            return
+        fields = self._collect_std_fields()
+        if fields is None:
+            return
+        try:
+            w = DirStandardizeWorker(d, fields,
+                                     rename_files=self.std_rename_files_check.isChecked())
+            plan, skipped = w.build_plan()
+            if not plan:
+                QMessageBox.information(
+                    self, "提示",
+                    "无待改名目录(全部已符合标准"
+                    + (f", 另有 {len(skipped)} 个引用失败跳过)" if skipped else ")"))
+                return
+            reply = QMessageBox.question(
+                self, "确认操作",
+                f"确定将 {len(plan)} 个子目录按标准格式改名吗?\n"
+                + (f"(另有 {len(skipped)} 个目录因引用失败将跳过)\n" if skipped else "")
+                + "此操作会生成Excel改名记录, 但目录改名不可逆!",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            w.plan = plan
+            self.std_execute_worker(w)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"执行出错: {e}")
+
+    def std_execute_worker(self, worker):
+        """启动标准化改名线程并管理按钮状态"""
+        self.std_worker = worker
+        self.std_worker.log_signal.connect(self.log)
+        self.std_worker.progress_signal.connect(self.update_progress)
+        self.std_worker.finished_signal.connect(self.on_std_finished)
+        self.std_worker.start()
+        self.std_exec_btn.setEnabled(False)
+        self.std_preview_btn.setEnabled(False)
+
+    def on_std_finished(self, success, message):
+        """标准化改名完成回调"""
+        self.log(message)
+        self.progress.setFormat("已完成" if success else "已停止/出错")
+        self.std_exec_btn.setEnabled(True)
+        self.std_preview_btn.setEnabled(True)
+        if success:
+            QMessageBox.information(self, "完成", message)
         else:
             QMessageBox.warning(self, "提示", message)
 
