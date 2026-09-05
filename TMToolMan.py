@@ -12,9 +12,44 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.18"
+VERSION = "3.23"
 
 CHANGELOG = [
+    {
+        "version": "3.23",
+        "date": "2026-09-05",
+        "changes": [
+            "文件夹命名标准化的「审计」字段更名为「专业类型」, 输入框缺省值由'审计'改为'SJ'(格式变为 全宗号-专业·专业类型·年限-保管期限-件号, 如 J380-ZY·SJ·2021-Y-0001); 引用现有逻辑不变(旧格式目录无专业类型段仍需直接填写)",
+        ],
+    },
+    {
+        "version": "3.22",
+        "date": "2026-09-05",
+        "changes": [
+            "文件夹命名标准化规则变更：目标格式由 全宗号-专业·年限-保管期限-机构代码-件号 改为 全宗号-专业·审计·年限-保管期限-件号。①字段列表改为 全宗号/专业/审计/年限/保管期限/件号(去掉机构代码, 新增审计); ②「审计」为格式固定段, 界面默认预填'审计'并选中直接填写(可改); ③新格式正则支持中文段(专业/审计允许字母数字汉字); ④兼容旧格式目录作引用源(全宗号/专业/年限/保管期限/件号按位映射, 旧格式无审计段——审计字段需直接填写, 引用预览时显示'旧格式无此段'提示)",
+        ],
+    },
+    {
+        "version": "3.21",
+        "date": "2026-09-05",
+        "changes": [
+            "文件夹命名标准化字段改回每行一条并缩窄窗口：6个字段由3列×2行网格改为每行一条(标签列对齐, 单选「填/引」+限宽120px输入框), 输入框限宽缩短窗口宽度; 分组标题与「标准化后重命名文件」勾选框长文本换行显示, 进一步压缩横向宽度",
+        ],
+    },
+    {
+        "version": "3.20",
+        "date": "2026-09-05",
+        "changes": [
+            "文件改名页三个处理方式改为TAB并列：按目录名批量重命名/文件夹命名标准化/修改文件扩展名原为纵向堆叠(页面过长), 现改为QTabWidget三个标签页并列, 同一时刻只显示一个功能的输入区; 下方功能说明文本随TAB切换自动显示当前功能对应的说明",
+        ],
+    },
+    {
+        "version": "3.19",
+        "date": "2026-09-05",
+        "changes": [
+            "文件夹命名标准化界面压缩与引用可视化：①6个字段由每行一个改为3列×2行网格(每格=字段名+填/引单选+输入框), 大幅缩短功能页长度; ②选择/输入目标目录后, 处于「引用现有」状态的输入框自动显示扫描到的第一个符合格式子目录的对应编码值(只读展示, 让用户预知将引用的内容; 无符合格式目录时提示占位文本), 切回「直接填写」后输入框清空并恢复可编辑",
+        ],
+    },
     {
         "version": "3.18",
         "date": "2026-09-05",
@@ -3136,9 +3171,10 @@ class ExtRenameWorker(QThread):
 
 
 class DirStandardizeWorker(QThread):
-    """文件夹命名标准化后台处理线程(v3.18)。
+    """文件夹命名标准化后台处理线程(v3.18, v3.22改命名规则)。
 
-    将所选目录下每个子目录改名为「全宗号-专业·年限-保管期限-机构代码-件号」，
+    将所选目录下每个子目录改名为
+    「全宗号-专业·专业类型·年限-保管期限-件号」，
     字段值来源两种: 直接填写(用户输入的固定值)或引用现有(解析各子目录现有
     名称对应位置的字段值)。执行后生成Excel记录原名→新名。
     """
@@ -3146,16 +3182,27 @@ class DirStandardizeWorker(QThread):
     progress_signal = Signal(int, int)
     finished_signal = Signal(bool, str)
 
-    # 匹配现有目录名的正则: 全宗号-专业·年限-保管期限-机构代码-件号
-    # (专业限字母, 年限4位数字, 件号3-5位数字; 分隔符允许全角－与·两侧无空格)
+    # v3.22: 字段顺序(与新格式一一对应; 引用现有按此序取值)
+    FIELD_KEYS = ('全宗号', '专业', '专业类型', '年限', '保管期限', '件号')
+    # 新格式固定段「专业类型」的默认值(直接填写可覆盖)
+    AUDIT_DEFAULT = 'SJ'
+
+    # 匹配现有目录名的正则(v3.22新格式): 全宗号-专业·专业类型·年限-保管期限-件号
+    # (专业/专业类型限字母数字汉字, 年限4位数字, 件号3-5位数字; 分隔符允许全角－与·/・)
     _FMT_RE = re.compile(
+        r'^([A-Za-z0-9]+)[-－]([A-Za-z0-9一-龥]+)[·・]'
+        r'([A-Za-z0-9一-龥]+)[·・](\d{4})[-－]'
+        r'([A-Za-z0-9]+)[-－](\d{3,5})$')
+    # 兼容旧格式(v3.18-v3.21): 全宗号-专业·年限-保管期限-机构代码-件号
+    # (引用现有时旧格式目录的 专业/年限/保管期限/件号 仍可被引用, 机构代码被忽略)
+    _FMT_RE_OLD = re.compile(
         r'^([A-Za-z0-9]+)[-－]([A-Za-z]+)[·・](\d{4})[-－]'
         r'([A-Za-z0-9]+)[-－]([A-Za-z0-9]+)[-－](\d{3,5})$')
 
     def __init__(self, base_dir, fields, rename_files=False, parent=None):
         """
-        fields: dict{'全宗号':str,'专业':str,'年限':str,'保管期限':str,
-                     '机构代码':str,'件号':str} —— 非空=直接填写, 空=引用现有
+        fields: dict{'全宗号':str,'专业':str,'专业类型':str,'年限':str,
+                     '保管期限':str,'件号':str} —— 非空=直接填写, 空=引用现有
         rename_files: 目录改名后是否批量重命名目录下文件
         """
         super().__init__(parent)
@@ -3177,29 +3224,45 @@ class DirStandardizeWorker(QThread):
         subdirs = sorted([d for d in Path(self.base_dir).iterdir()
                           if d.is_dir()], key=lambda p: p.name)
         for sd in subdirs:
-            m = self._FMT_RE.match(sd.name)
-            old_parts = m.groups() if m else None
+            old_parts = self._parse_old_name(sd.name)
             vals = []
             bad = False
-            for i, key in enumerate(
-                    ('全宗号', '专业', '年限', '保管期限', '机构代码', '件号')):
+            for i, key in enumerate(self.FIELD_KEYS):
                 v = (self.fields.get(key) or '').strip()
                 if v:
                     vals.append(v)            # 直接填写优先
-                elif old_parts:
+                elif old_parts and old_parts[i]:
                     vals.append(old_parts[i])  # 引用现有目录名对应位置
                 else:
-                    bad = True                 # 无来源, 本目录跳过
+                    # 无来源(目录名不符格式, 或旧格式缺该段如专业类型)→跳过
+                    bad = True
                     break
             if bad:
                 skipped.append(sd.name)
                 continue
-            new_name = (f"{vals[0]}-{vals[1]}·{vals[2]}-"
-                        f"{vals[3]}-{vals[4]}-{vals[5]}")
+            new_name = (f"{vals[0]}-{vals[1]}·{vals[2]}·{vals[3]}-"
+                        f"{vals[4]}-{vals[5]}")
             if new_name == sd.name:
                 continue   # 已符合标准, 无需改名
             plan.append((sd, new_name))
         return plan, skipped
+
+    @classmethod
+    def _parse_old_name(cls, name):
+        """解析现有目录名为新格式字段序(全宗号/专业/专业类型/年限/保管期限/件号)。
+        新格式直接取; 旧格式(v3.18-21)映射时「专业类型」无对应值返回None整体作废
+        ——旧格式无该段, 引用它会产生编造值, 故旧格式仅在「专业类型」直接填写时
+        才可被引用(其余字段按位映射)。"""
+        m = cls._FMT_RE.match(name)
+        if m:
+            return m.groups()
+        mo = cls._FMT_RE_OLD.match(name)
+        if mo:
+            # 旧字段序: 全宗号/专业/年限/保管期限/机构代码/件号
+            # 映射到新序: 全宗号/专业/(专业类型缺)/年限/保管期限/件号
+            return (mo.group(1), mo.group(2), None,
+                    mo.group(3), mo.group(4), mo.group(6))
+        return None
 
     def run(self):
         try:
@@ -3384,7 +3447,12 @@ class FileRenamePage(FunctionPage):
     def __init__(self):
         super().__init__("文件改名")
 
-        # ====== 功能1: 按目录名批量重命名 ======
+        # v3.20: 三个处理方式改为TAB并列(原纵向堆叠导致页面过长)
+        from PyQt5.QtWidgets import QTabWidget
+        self.tabs = QTabWidget()
+        self.layout.addWidget(self.tabs)
+
+        # ====== TAB1: 按目录名批量重命名 ======
         group = QGroupBox("按目录名批量重命名文件")
         form = QFormLayout()
 
@@ -3432,10 +3500,11 @@ class FileRenamePage(FunctionPage):
         form.addRow("", btn_layout)
 
         group.setLayout(form)
-        self.layout.addWidget(group)
+        self.tabs.addTab(group, "按目录名批量重命名")
 
-        # ====== 功能1b: 文件夹命名标准化(v3.18) ======
-        std_group = QGroupBox("文件夹命名标准化 (格式: 全宗号-专业·年限-保管期限-机构代码-件号)")
+        # ====== TAB2: 文件夹命名标准化(v3.18, v3.19紧凑布局) ======
+        std_group = QGroupBox(
+            "文件夹命名标准化\n(格式: 全宗号-专业·专业类型·年限-保管期限-件号)")
         std_form = QFormLayout()
 
         self.std_dir_edit = QLineEdit()
@@ -3449,30 +3518,48 @@ class FileRenamePage(FunctionPage):
         std_form.addRow("目标目录:", h_std)
 
         std_form.addRow(QLabel(
-            "各字段填写方式: 选中「直接填写」后在输入框填固定值(对所有目录生效);"
-            " 选中「引用现有」则取各子目录现名对应位置的字段值(目录名不符合格式时该目录跳过):"))
+            "各字段: 单选「填」=直接填固定值(对所有目录生效); 「引」=引用各子目录现名对应位置"
+            "(输入框显示第一个符合格式目录的值, 只读; 目录名不符合格式时该目录跳过):"))
 
-        # 6个字段行: 每行 = 字段名 + (直接填写|引用现有)单选 + 输入框
-        self.std_fields = {}   # key -> (QRadioButton直接, QRadioButton引用, QLineEdit)
-        for key in ('全宗号', '专业', '年限', '保管期限', '机构代码', '件号'):
-            rb_input = QRadioButton("直接填写")
-            rb_ref = QRadioButton("引用现有")
-            rb_ref.setChecked(True)   # 默认引用现有
+        # v3.21: 6个字段改为每行一条(纵列, 标签列对齐), 输入框限宽缩窄窗口;
+        # 输入框在「引」状态显示从待处理目录提取的编码值(只读)。
+        # v3.22: 字段改为 全宗号/专业/专业类型/年限/保管期限/件号(新命名规则),
+        # 「专业类型」默认预填并选中「填」(格式固定段, v3.23缺省值改为SJ)。
+        self.std_fields = {}   # key -> (QRadioButton填, QRadioButton引, QLineEdit)
+        for key in DirStandardizeWorker.FIELD_KEYS:
+            cell = QHBoxLayout()
+            cell.setSpacing(4)
+            rb_input = QRadioButton("填")
+            rb_input.setToolTip("直接填写: 在输入框填固定值, 对所有目录生效")
+            rb_ref = QRadioButton("引")
+            rb_ref.setToolTip("引用现有: 取各子目录现名对应位置的字段值")
+            if key == '专业类型':
+                rb_input.setChecked(True)   # v3.22: 专业类型为格式固定段, 默认直接填(v3.23起缺省SJ)
+            else:
+                rb_ref.setChecked(True)   # 默认引用现有
             edit = QLineEdit()
-            edit.setEnabled(False)
-            edit.setPlaceholderText("直接填写时输入")
-            rb_input.toggled.connect(lambda on, e=edit: e.setEnabled(on))
-            h = QHBoxLayout()
-            h.addWidget(rb_input)
-            h.addWidget(rb_ref)
-            h.addWidget(edit, 1)
-            std_form.addRow(key + ":", h)
+            edit.setMaximumWidth(120)  # 编码字段都很短, 限宽缩窄窗口
+            if key == '专业类型':
+                # 专业类型为格式固定段: 默认直接填且可编辑
+                edit.setText(DirStandardizeWorker.AUDIT_DEFAULT)
+                edit.setReadOnly(False)
+                edit.setPlaceholderText('')
+            else:
+                edit.setReadOnly(True)    # 引用状态下只读(值来自目录扫描, 防误改后误解)
+                edit.setPlaceholderText("待选目录")
+            rb_input.toggled.connect(
+                lambda on, e=edit: (e.setReadOnly(not on), e.clear()))
+            cell.addWidget(rb_input)
+            cell.addWidget(rb_ref)
+            cell.addWidget(edit)
+            cell.addStretch()
+            std_form.addRow(key + ":", cell)
             self.std_fields[key] = (rb_input, rb_ref, edit)
 
         # 目录标准化后是否批量重命名目录下文件(默认不勾)
         self.std_rename_files_check = QCheckBox(
-            "目录标准化后按新目录名批量重命名目录下文件"
-            "(单文件=目录名, 多文件=目录名-0001起, 与「按目录名批量重命名」同规则)")
+            "标准化后按新目录名批量重命名目录下文件\n"
+            "(单文件=目录名, 多文件=目录名-0001起, 同「按目录名批量重命名」)")
         self.std_rename_files_check.setChecked(False)
         std_form.addRow("", self.std_rename_files_check)
 
@@ -3492,9 +3579,9 @@ class FileRenamePage(FunctionPage):
         std_form.addRow("", std_btn_layout)
 
         std_group.setLayout(std_form)
-        self.layout.addWidget(std_group)
+        self.tabs.addTab(std_group, "文件夹命名标准化")
 
-        # ====== 功能2: 修改文件扩展名 ======
+        # ====== TAB3: 修改文件扩展名 ======
         ext_group = QGroupBox("修改文件扩展名(递归处理目录及子目录)")
         ext_form = QFormLayout()
 
@@ -3541,24 +3628,26 @@ class FileRenamePage(FunctionPage):
         ext_form.addRow("", ext_btn_layout)
 
         ext_group.setLayout(ext_form)
-        self.layout.addWidget(ext_group)
+        self.tabs.addTab(ext_group, "修改文件扩展名")
 
-        # 说明文本
-        info_label = QLabel(
-            "功能说明：\n"
-            "【按目录名批量重命名】\n"
-            "• 单文件：直接以目录名命名；多文件：目录名-0001、目录名-0002...\n"
-            "• 自动生成详细日志文件；可选修改JPG文件DPI为600\n"
-            "【文件夹命名标准化】\n"
-            "• 目标格式: 全宗号-专业·年限-保管期限-机构代码-件号 (专业与年限用·间隔)\n"
-            "• 字段可「直接填写」固定值或「引用现有」子目录名对应位置; 预览可改新名\n"
-            "• 执行后自动生成Excel记录原/新目录名; 可选同步批量重命名目录下文件\n"
-            "【修改文件扩展名】\n"
-            "• 递归扫描目录及子目录，将旧扩展名文件改为新扩展名\n"
-            "• 扩展名输入无需点号(如输入 tif 或 .tif 均可)；自动生成日志文件"
-        )
-        info_label.setStyleSheet("color: #8B949E; font-size: 12px;")
-        self.layout.addWidget(info_label)
+        # 说明文本(随当前TAB切换显示对应说明, v3.20)
+        self.info_label = QLabel()
+        self.info_label.setStyleSheet("color: #8B949E; font-size: 12px;")
+        self._tab_infos = {
+            0: ("【按目录名批量重命名】\n"
+                "• 单文件：直接以目录名命名；多文件：目录名-0001、目录名-0002...\n"
+                "• 自动生成详细日志文件；可选修改JPG文件DPI为600"),
+            1: ("【文件夹命名标准化】\n"
+                "• 目标格式: 全宗号-专业·专业类型·年限-保管期限-件号 (·与-按规则间隔)\n"
+                "• 字段可「直接填写」固定值或「引用现有」子目录名对应位置; 预览可改新名\n"
+                "• 执行后自动生成Excel记录原/新目录名; 可选同步批量重命名目录下文件"),
+            2: ("【修改文件扩展名】\n"
+                "• 递归扫描目录及子目录，将旧扩展名文件改为新扩展名\n"
+                "• 扩展名输入无需点号(如输入 tif 或 .tif 均可)；自动生成日志文件"),
+        }
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._on_tab_changed(0)
+        self.layout.addWidget(self.info_label)
 
         self.worker = None
         self.ext_worker = None
@@ -3569,6 +3658,10 @@ class FileRenamePage(FunctionPage):
         self.progress = QProgressBar()
         self.progress.setFormat("待开始")
         self.layout.addWidget(self.progress)
+
+    def _on_tab_changed(self, idx):
+        """v3.20: TAB切换时更新下方功能说明文本"""
+        self.info_label.setText(self._tab_infos.get(idx, ""))
 
     def browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "选择目录")
@@ -3717,6 +3810,41 @@ class FileRenamePage(FunctionPage):
         d = QFileDialog.getExistingDirectory(self, "选择命名标准化的目标目录")
         if d:
             self.std_dir_edit.setText(d)
+            self._fill_ref_fields(d)
+        # 目录手输也可能有效: 编辑完成(失焦/回车)时也尝试填充
+        self.std_dir_edit.editingFinished.connect(self._on_std_dir_edited)
+
+    def _on_std_dir_edited(self):
+        d = self.std_dir_edit.text().strip()
+        if d and os.path.isdir(d):
+            self._fill_ref_fields(d)
+
+    def _fill_ref_fields(self, base_dir):
+        """v3.19: 扫描目录下第一个符合格式的子目录, 将其编码值填入
+        处于「引用现有」状态的输入框(只读展示, 让用户看到将引用什么)。
+        v3.22: 按新格式解析; 旧格式目录也可作引用源(专业类型段无值时显示为空,
+        该情况需用户将「专业类型」改为直接填写)。"""
+        try:
+            subdirs = sorted([e for e in os.listdir(base_dir)
+                              if os.path.isdir(os.path.join(base_dir, e))])
+        except Exception:
+            return
+        first = None
+        for name in subdirs:
+            parsed = DirStandardizeWorker._parse_old_name(name)
+            if parsed:
+                first = parsed
+                break
+        for i, key in enumerate(DirStandardizeWorker.FIELD_KEYS):
+            _rb_in, rb_ref, edit = self.std_fields[key]
+            if rb_ref.isChecked():          # 只更新引用状态的框
+                if first:
+                    edit.setText(first[i] or '')
+                    edit.setPlaceholderText(
+                        '' if first[i] else '旧格式无此段')
+                else:
+                    edit.clear()
+                    edit.setPlaceholderText('无符合格式目录')
 
     def _collect_std_fields(self, show_warn=True):
         """从界面收集字段配置。返回 dict(值非空=直接填写) 或 None(校验失败)。"""
