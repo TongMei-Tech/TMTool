@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.24"
+VERSION = "3.25"
 
 CHANGELOG = [
+    {
+        "version": "3.25",
+        "date": "2026-09-06",
+        "changes": [
+            "档案馆标准目录的目录类型由单选改为多选框(可同时勾选档案案卷目录+档案案件目录, 缺省两者都选)：一次点击生成两种目录文件, 共享一次编码子目录扫描与机构映射; Worker改为modes列表逐种执行, 每种类型分别校验对应模板存在; 进度按所选类型数累计; 日志文件名含全部所选类型名",
+        ],
+    },
     {
         "version": "3.24",
         "date": "2026-09-06",
@@ -7461,12 +7468,17 @@ class ArchiveCatalogWorker(QThread):
         r'^([A-Z0-9]+)-([A-Z]+)·(\d{4})-([A-Z0-9]+)-([A-Z0-9]+)-(\d{3,4})$')
     _RETENTION = {'Y': '永久', 'D30': '30年', 'D10': '10年'}
 
-    def __init__(self, base_dir, template_path, mode='juan',
+    def __init__(self, base_dir, templates, modes=None,
                  org_map=None, output_dir=None, parent=None):
+        """
+        v3.25: 支持一次生成多种目录。
+        templates: {'juan': 案卷目录模板路径, 'file': 案件目录模板路径}
+        modes: 要生成的目录类型列表, 如 ['juan', 'file'](顺序执行)
+        """
         super().__init__(parent)
         self.base_dir = base_dir
-        self.template_path = template_path
-        self.mode = mode                  # 'juan'=档案案卷目录, 'file'=档案案件目录
+        self.templates = templates        # {mode: template_path}
+        self.modes = list(modes) if modes else ['juan']
         self.org_map = org_map or {}      # {机构代码(JSC等): 机构名称}
         # 输出目录: 缺省=数据目录下「档案馆标准目录」, 可由界面指定
         self.output_dir = output_dir or os.path.join(base_dir, "档案馆标准目录")
@@ -7711,11 +7723,11 @@ class ArchiveCatalogWorker(QThread):
         return rows
 
     # ---------- 填充模板 ----------
-    def _fill_template(self, out_path, rows, wlog):
+    def _fill_template(self, out_path, rows, wlog, template_path=None):
         """按模板表头自适应填数据行(模板首行为表头)。"""
         import openpyxl
         from openpyxl.styles import Alignment
-        wb = openpyxl.load_workbook(self.template_path)
+        wb = openpyxl.load_workbook(template_path or self.templates.get('juan'))
         ws = wb.active
         headers = {}
         for c in range(1, ws.max_column + 1):
@@ -7747,14 +7759,19 @@ class ArchiveCatalogWorker(QThread):
             if not os.path.isdir(self.base_dir):
                 self.finished_signal.emit(False, "所选目录不存在")
                 return
-            if not os.path.isfile(self.template_path):
-                self.finished_signal.emit(False, "模板文件不存在")
-                return
+            for md in self.modes:
+                tp = self.templates.get(md)
+                if not tp or not os.path.isfile(tp):
+                    name = '档案案卷目录' if md == 'juan' else '档案案件目录'
+                    self.finished_signal.emit(False, f"{name}模板文件不存在")
+                    return
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             out_root = self.output_dir
             os.makedirs(out_root, exist_ok=True)
-            mode_name = '档案案卷目录' if self.mode == 'juan' else '档案案件目录'
-            log_path = os.path.join(out_root, f"档案馆目录日志_{mode_name}_{ts}.txt")
+            names = {'juan': '档案案卷目录', 'file': '档案案件目录'}
+            log_path = os.path.join(
+                out_root,
+                f"档案馆目录日志_{'_'.join(names[m] for m in self.modes)}_{ts}.txt")
             logf = open(log_path, 'w', encoding='utf-8')
             import threading
             lock = threading.Lock()
@@ -7765,10 +7782,11 @@ class ArchiveCatalogWorker(QThread):
                     logf.flush()
                 self.log_signal.emit(s)
 
-            wlog(f"{mode_name}生成 - 处理日志")
+            wlog(f"{'+'.join(names[m] for m in self.modes)}生成 - 处理日志")
             wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             wlog(f"指定目录: {self.base_dir}")
-            wlog(f"模板: {self.template_path}")
+            for md in self.modes:
+                wlog(f"模板[{names[md]}]: {self.templates.get(md)}")
             if self.org_map:
                 wlog(f"机构代码对应: {len(self.org_map)} 条")
             else:
@@ -7781,40 +7799,48 @@ class ArchiveCatalogWorker(QThread):
                 self.finished_signal.emit(False, "该目录(含下层)无可用编码目录数据")
                 return
 
-            total = sum(len(v) for v in groups.values())
-            wlog(f"发现 {len(groups)} 个分组 / 共 {total} 个编码子目录")
+            total = sum(len(v) for v in groups.values()) * len(self.modes)
+            wlog(f"发现 {len(groups)} 个分组 / 共 "
+                 f"{sum(len(v) for v in groups.values())} 个编码子目录")
             done = 0
             ok_files = []
             base_name = os.path.basename(os.path.normpath(self.base_dir))
-            for top, code_dirs in sorted(groups.items()):
+            # v3.25: 逐种目录类型生成(modes顺序执行, 共享分组发现结果)
+            for md in self.modes:
                 if self.is_stopped:
                     break
-                top_name = os.path.basename(top)
+                mode_name = names[md]
                 wlog("")
-                wlog(f"── 分组: {top_name} ({len(code_dirs)} 卷) ──")
-                if self.mode == 'juan':
-                    tuples = self._juan_rows(code_dirs, wlog)
-                    keys = ['档号', '全宗号', '年度', '保管期限', '机构问题',
-                            '机构问题代码', '案卷号', '总页数', '卷内文件总件数']
-                else:
-                    tuples = self._file_rows(code_dirs, wlog)
-                    keys = ['所属案卷档号', '全宗号', '年度', '保管期限', '机构问题',
-                            '机构问题代码', '案卷号', '件号', '档号', '文件编号',
-                            '责任者', '题名', '文件日期', '页号', '页数']
-                done += len(code_dirs)
-                self.progress_signal.emit(min(done, total), total)
-                if not tuples:
-                    continue
-                rows = [dict(zip(keys, t)) for t in tuples]
-                # v3.24: 输出文件名=所选目录名+目录类型
-                out_name = f"{base_name}{mode_name}.xlsx"
-                out_path = os.path.join(out_root, out_name)
-                try:
-                    self._fill_template(out_path, rows, wlog)
-                    ok_files.append(out_name)
-                    wlog(f"  ✓ 生成: {out_name} ({len(rows)} 条)")
-                except Exception as e:
-                    wlog(f"  × 生成失败 {out_name}: {e}")
+                wlog(f"══ 开始生成{mode_name} ══")
+                for top, code_dirs in sorted(groups.items()):
+                    if self.is_stopped:
+                        break
+                    top_name = os.path.basename(top)
+                    wlog(f"── 分组: {top_name} ({len(code_dirs)} 卷) ──")
+                    if md == 'juan':
+                        tuples = self._juan_rows(code_dirs, wlog)
+                        keys = ['档号', '全宗号', '年度', '保管期限', '机构问题',
+                                '机构问题代码', '案卷号', '总页数', '卷内文件总件数']
+                    else:
+                        tuples = self._file_rows(code_dirs, wlog)
+                        keys = ['所属案卷档号', '全宗号', '年度', '保管期限',
+                                '机构问题', '机构问题代码', '案卷号', '件号', '档号',
+                                '文件编号', '责任者', '题名', '文件日期', '页号', '页数']
+                    done += len(code_dirs)
+                    self.progress_signal.emit(min(done, total), total)
+                    if not tuples:
+                        continue
+                    rows = [dict(zip(keys, t)) for t in tuples]
+                    # v3.24: 输出文件名=所选目录名+目录类型
+                    out_name = f"{base_name}{mode_name}.xlsx"
+                    out_path = os.path.join(out_root, out_name)
+                    try:
+                        self._fill_template(out_path, rows, wlog,
+                                            template_path=self.templates[md])
+                        ok_files.append(out_name)
+                        wlog(f"  ✓ 生成: {out_name} ({len(rows)} 条)")
+                    except Exception as e:
+                        wlog(f"  × 生成失败 {out_name}: {e}")
 
             wlog("")
             wlog("=" * 70)
@@ -7825,7 +7851,8 @@ class ArchiveCatalogWorker(QThread):
                 self.finished_signal.emit(False, "已停止")
             else:
                 self.finished_signal.emit(
-                    True, f"完成！生成 {len(ok_files)} 个{mode_name}文件 → {out_root}")
+                    True,
+                    f"完成！生成 {len(ok_files)} 个目录文件 → {out_root}")
         except Exception as e:
             self.finished_signal.emit(False, f"处理出错: {e}")
 
@@ -7846,14 +7873,15 @@ class ArchiveCatalogPage(FunctionPage):
         biz_widget = QWidget()
         biz_v = QVBoxLayout(biz_widget)
 
-        # 目录类型选择(单选)
-        mode_box = QGroupBox("目录类型")
+        # 目录类型选择(v3.25: 改多选框, 可同时生成两种, 缺省全选)
+        mode_box = QGroupBox("目录类型(可多选)")
         mode_h = QHBoxLayout()
-        self.mode_juan_rb = QRadioButton("档案案卷目录")
-        self.mode_file_rb = QRadioButton("档案案件目录")
-        self.mode_juan_rb.setChecked(True)
-        mode_h.addWidget(self.mode_juan_rb)
-        mode_h.addWidget(self.mode_file_rb)
+        self.mode_juan_cb = QCheckBox("档案案卷目录")
+        self.mode_file_cb = QCheckBox("档案案件目录")
+        self.mode_juan_cb.setChecked(True)   # 缺省两者都选
+        self.mode_file_cb.setChecked(True)
+        mode_h.addWidget(self.mode_juan_cb)
+        mode_h.addWidget(self.mode_file_cb)
         mode_h.addStretch()
         mode_box.setLayout(mode_h)
         biz_v.addWidget(mode_box)
@@ -7991,12 +8019,23 @@ class ArchiveCatalogPage(FunctionPage):
         if not d or not os.path.isdir(d):
             QMessageBox.warning(self, "提示", "请先选择有效的数据目录")
             return
-        mode = 'juan' if self.mode_juan_rb.isChecked() else 'file'
-        tpl = (self.tpl_juan_edit if mode == 'juan' else self.tpl_file_edit).text().strip()
-        tpl_name = '案卷目录模板' if mode == 'juan' else '案件目录模板'
-        if not tpl or not os.path.isfile(tpl):
-            QMessageBox.warning(self, "提示", f"请先选择{tpl_name}xlsx文件")
+        # v3.25: 多选框收集目录类型(缺省全选), 校验所选类型的模板
+        modes = []
+        if self.mode_juan_cb.isChecked():
+            modes.append('juan')
+        if self.mode_file_cb.isChecked():
+            modes.append('file')
+        if not modes:
+            QMessageBox.warning(self, "提示", "请至少勾选一种目录类型")
             return
+        templates = {'juan': self.tpl_juan_edit.text().strip(),
+                     'file': self.tpl_file_edit.text().strip()}
+        for md in modes:
+            tp = templates[md]
+            tpl_name = '案卷目录模板' if md == 'juan' else '案件目录模板'
+            if not tp or not os.path.isfile(tp):
+                QMessageBox.warning(self, "提示", f"请先选择{tpl_name}xlsx文件")
+                return
         out = self.out_edit.text().strip()
         if not out:
             out = os.path.join(d, "档案馆标准目录")
@@ -8023,12 +8062,13 @@ class ArchiveCatalogPage(FunctionPage):
                     if reply != QMessageBox.Yes:
                         return
         self.log_box.clear()
-        mode_name = '档案案卷目录' if mode == 'juan' else '档案案件目录'
-        self.log(f"开始生成{mode_name}: {d}")
-        self.log(f"模板: {tpl}")
+        names = {'juan': '档案案卷目录', 'file': '档案案件目录'}
+        self.log(f"开始生成 {'+'.join(names[m] for m in modes)}: {d}")
+        for md in modes:
+            self.log(f"模板[{names[md]}]: {templates[md]}")
         self.log(f"输出目录: {out}")
-        self.worker = ArchiveCatalogWorker(d, tpl, mode=mode, org_map=org_map,
-                                           output_dir=out)
+        self.worker = ArchiveCatalogWorker(d, templates, modes=modes,
+                                           org_map=org_map, output_dir=out)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self._update_progress)
         self.worker.finished_signal.connect(self._on_finished)
