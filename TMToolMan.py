@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.23"
+VERSION = "3.24"
 
 CHANGELOG = [
+    {
+        "version": "3.24",
+        "date": "2026-09-06",
+        "changes": [
+            "档案馆标准目录重构为业务目录/文书目录双TAB(业务目录下「档案案卷目录/档案案件目录」二选一)：①业务-档案案卷目录: 每个编码子目录一条, 卷内文件总件数=子目录同名xlsx序号最大值, 总页数=最大序号行页号终止值(如102-232取232); ②业务-档案案件目录: 逐子目录xlsx每序号行一条——案卷号=序号三位编码, 件号=序号, 档号=所属案卷档号-四位件号, 文件编号=文号, 责任者/题名直取, 文件日期=发文日期, 页号含'-'取右侧, 页数=与下一序号页号差值(负值置空; 无下一页号且当前含'-'则为右减左); ③新增「机构代码对应表」选择(表头: 机构代码/机构名称), 解析代码→名称填入机构问题列, 不选则留空手填; ④模板按目录类型分别选择(两个模板文件); ⑤输出文件名=所选目录名+「档案案卷目录」或「档案案件目录」, 输出目录规则不变; ⑥文书目录TAB预留",
+        ],
+    },
     {
         "version": "3.23",
         "date": "2026-09-05",
@@ -7434,28 +7441,33 @@ class FileBatchReplacePage(FunctionPage):
 
 class ArchiveCatalogWorker(QThread):
     """
-    档案馆标准目录生成后台线程：
+    档案馆标准目录生成后台线程(v3.24重构)：
       解析用户指定目录下符合编码规则的子目录名(全宗号-档案类型·年度-保管期限
-      代码-项目号-案卷号, 如 J380-ZY·2021-Y-FGC-0001)，从各子目录内的
-      xlsx(卷内文件目录)提取最大页码，按模板逐条填入，生成标准目录xlsx。
-      - 编码目录不在指定目录的直接下层时，递归向下层查找(按"上级目录"分组输出)
-      - 保管期限: Y=永久, D30=30年, D10=10年
-      - 总页数: 子目录xlsx中序号最大行的页码列的最大页码(如"102-232"取232)
-      - 输出: 指定目录下「档案馆标准目录」子目录, 文件名=编码目录们的上级目录名
+      代码-项目号-案卷号, 如 J380-ZY·2021-Y-JSC-0734)，生成两种业务目录:
+      - mode='juan' 档案案卷目录: 每个编码子目录一条, 从子目录内同名xlsx取
+        总件数(序号最大值)与总页数(最大序号行的页号终止值, 如"102-232"取232)
+      - mode='file' 档案案件目录(按件): 逐个子目录xlsx每条序号行一条,
+        档号=所属案卷档号-4位件号, 页号取"起-止"右侧, 页数=与下一序号页号差值
+      - 机构代码映射: org_map(机构代码→机构名称), 由界面选择的对应表xlsx解析;
+        无对应表时机构列为空由用户手工填
+      - 输出: 用户所选目录名 + 「档案案卷目录」/「档案案件目录」
     """
     log_signal = Signal(str)
     progress_signal = Signal(int, int)
     finished_signal = Signal(bool, str)
 
-    # 编码目录名正则: 全宗号-类型·年度-期限-项目-卷号(卷号4位数字)
+    # 编码目录名正则: 全宗号-类型·年度-期限-项目-卷号(卷号3-4位数字)
     _CODE_RE = re.compile(
         r'^([A-Z0-9]+)-([A-Z]+)·(\d{4})-([A-Z0-9]+)-([A-Z0-9]+)-(\d{3,4})$')
     _RETENTION = {'Y': '永久', 'D30': '30年', 'D10': '10年'}
 
-    def __init__(self, base_dir, template_path, output_dir=None, parent=None):
+    def __init__(self, base_dir, template_path, mode='juan',
+                 org_map=None, output_dir=None, parent=None):
         super().__init__(parent)
         self.base_dir = base_dir
         self.template_path = template_path
+        self.mode = mode                  # 'juan'=档案案卷目录, 'file'=档案案件目录
+        self.org_map = org_map or {}      # {机构代码(JSC等): 机构名称}
         # 输出目录: 缺省=数据目录下「档案馆标准目录」, 可由界面指定
         self.output_dir = output_dir or os.path.join(base_dir, "档案馆标准目录")
         self.is_stopped = False
@@ -7463,14 +7475,55 @@ class ArchiveCatalogWorker(QThread):
     def stop(self):
         self.is_stopped = True
 
-    # ---------- 编码目录发现(递归) ----------
+    # ---------- 机构代码对应表解析 ----------
+    @staticmethod
+    def load_org_map(xlsx_path, wlog=None):
+        """解析机构代码对应表xlsx(表头: 机构代码/机构名称)。
+        返回 {代码: 名称}; 失败返回空dict。"""
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+            ws = wb.active
+            # 找表头行(前5行内含"机构代码")
+            code_col, name_col, start = None, None, None
+            for r in range(1, 6):
+                vals = [str(ws.cell(row=r, column=c).value or '').strip()
+                        for c in range(1, ws.max_column + 1)]
+                if '机构代码' in vals and '机构名称' in vals:
+                    code_col = vals.index('机构代码') + 1
+                    name_col = vals.index('机构名称') + 1
+                    start = r + 1
+                    break
+            if code_col is None:
+                if wlog:
+                    wlog("  × 对应表未找到「机构代码/机构名称」表头")
+                wb.close()
+                return {}
+            m = {}
+            for r in range(start, ws.max_row + 1):
+                code = ws.cell(row=r, column=code_col).value
+                name = ws.cell(row=r, column=name_col).value
+                if code is None or name is None:
+                    continue
+                code = str(code).strip()
+                name = str(name).strip()
+                if code and name:
+                    m[code] = name
+            wb.close()
+            if wlog:
+                wlog(f"  机构代码对应表: 载入 {len(m)} 条映射")
+            return m
+        except Exception as e:
+            if wlog:
+                wlog(f"  × 对应表读取失败: {e}")
+            return {}
+
+    # ---------- 编码目录发现(递归, 按上级分组) ----------
     def _find_code_groups(self):
         """
         递归发现编码目录并按上级目录分组。
         返回 {上级目录绝对路径: [编码子目录绝对路径, ...]}；
         指定目录的直接下层就是编码目录 → 上级=指定目录本身。
-        递归规则: 直接下层无编码目录时, 深入每个下层普通目录继续找,
-        找到的那层的"上级目录"作为输出文件名来源。
         """
         groups = {}
 
@@ -7494,132 +7547,197 @@ class ArchiveCatalogWorker(QThread):
                 groups.setdefault(top, []).extend(code_dirs)
                 return  # 该层已是编码目录层, 不再深入
             for nd in normal_dirs:
-                scan(nd, nd)  # 下层的上级=该普通目录
+                scan(nd, nd)
 
         scan(self.base_dir, self.base_dir)
         return groups
 
-    # ---------- 从子目录xlsx提取最大页码 ----------
-    def _max_page_from_xlsx(self, dir_path, wlog):
-        """子目录内找xlsx, 取序号最大行的页码列最大页码。无有效数据返回None。"""
+    # ---------- 解析子目录xlsx为记录行 ----------
+    @staticmethod
+    def _page_end(page_str):
+        """页号字符串取终止值: '49-260'→260, '102'→102。无效返回None。"""
+        s = str(page_str).strip().replace(' ', '')
+        if not s:
+            return None
+        nums = re.findall(r'\d{1,4}', s)
+        return int(nums[-1]) if nums else None
+
+    @staticmethod
+    def _page_start(page_str):
+        """页号字符串取起始值: '49-260'→49, '102'→102。"""
+        s = str(page_str).strip().replace(' ', '')
+        nums = re.findall(r'\d{1,4}', s)
+        return int(nums[0]) if nums else None
+
+    def _read_inner_rows(self, dir_path, wlog):
+        """读取子目录内与目录同名的xlsx, 返回记录行列表。
+        每行: dict{seq,doc_no,author,title,date,page_str}。
+        兼容多单元结构(单元标题行序号为空则跳过)。"""
+        dir_name = os.path.basename(dir_path)
+        xp = os.path.join(dir_path, dir_name + '.xlsx')
+        if not os.path.isfile(xp):
+            # 退化: 目录内任意xlsx
+            cands = [f for f in sorted(os.listdir(dir_path))
+                     if f.lower().endswith('.xlsx') and not f.startswith('~$')]
+            if not cands:
+                return None
+            xp = os.path.join(dir_path, cands[0])
         try:
             import openpyxl
-        except ImportError:
-            wlog("  × 缺少 openpyxl 库")
+            wb = openpyxl.load_workbook(xp, read_only=True, data_only=True)
+            ws = wb.active
+        except Exception as e:
+            wlog(f"  × 读取xlsx失败 {os.path.basename(xp)}: {e}")
             return None
-        xlsx_files = [f for f in sorted(os.listdir(dir_path))
-                      if f.lower().endswith('.xlsx') and not f.startswith('~$')]
-        if not xlsx_files:
+        # 表头自适应: 前5行内找含"序号"的行
+        header_idx = None
+        cols = {}
+        for r in range(1, 6):
+            rows = list(ws.iter_rows(min_row=r, max_row=r, values_only=True))
+            if not rows:
+                break
+            headers = [str(c).strip() if c is not None else '' for c in rows[0]]
+            if '序号' in headers:
+                header_idx = r
+                for want, aliases in (
+                        ('seq', ['序号']), ('doc_no', ['文号', '文件编号']),
+                        ('author', ['责任者']), ('title', ['题名', '题  名', '题目']),
+                        ('date', ['发文日期', '文件日期', '日期']),
+                        ('page', ['页号', '页码'])):
+                    for a in aliases:
+                        if a in headers:
+                            cols[want] = headers.index(a)
+                            break
+                break
+        if header_idx is None:
+            wb.close()
+            wlog(f"  × {os.path.basename(xp)} 未找到含「序号」的表头行")
             return None
-        best = None
-        for xf in xlsx_files:
-            xp = os.path.join(dir_path, xf)
+        recs = []
+        for row in ws.iter_rows(min_row=header_idx + 1, values_only=True):
+            cells = list(row)
+            if len(cells) <= max(cols.values()):
+                cells += [''] * (max(cols.values()) - len(cells) + 1)
+            g = lambda k: (cells[cols[k]]
+                           if k in cols and cols[k] < len(cells) else None)
+            seq_v = g('seq')
+            if seq_v is None or str(seq_v).strip() == '':
+                continue   # 单元标题行/空行
             try:
-                wb = openpyxl.load_workbook(xp, read_only=True, data_only=True)
-                ws = wb.active
-                # 标题行自适应: 前5行内找含"序号"和"页号"的行
-                header_row_idx, seq_col, page_col = None, None, None
-                for r in range(1, 6):
-                    rows = list(ws.iter_rows(min_row=r, max_row=r, values_only=True))
-                    if not rows:
-                        break
-                    headers = [str(c).strip() if c is not None else '' for c in rows[0]]
-                    if '序号' in headers and '页号' in headers:
-                        header_row_idx = r
-                        seq_col = headers.index('序号')
-                        page_col = headers.index('页号')
-                        break
-                if header_row_idx is None:
-                    wb.close()
-                    continue
-                for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
-                    cells = list(row)
-                    if len(cells) <= max(seq_col, page_col):
-                        continue
-                    seq_v, page_v = cells[seq_col], cells[page_col]
-                    if seq_v is None or page_v is None:
-                        continue
-                    try:
-                        seq_i = int(seq_v)
-                    except (ValueError, TypeError):
-                        continue
-                    page_str = str(page_v).strip().replace(' ', '')
-                    if not page_str:
-                        continue
-                    nums = [int(x) for x in re.findall(r'\d{1,4}', page_str)]
-                    if not nums:
-                        continue
-                    row_max = max(nums)
-                    if best is None or seq_i > best[0] or (seq_i == best[0] and row_max > best[1]):
-                        best = (seq_i, row_max)
-                wb.close()
-            except Exception as e:
-                wlog(f"  × 读取xlsx失败 {xf}: {e}")
-        return best[1] if best else None
+                seq = int(str(seq_v).strip())
+            except ValueError:
+                continue
+            recs.append({
+                'seq': seq,
+                'doc_no': str(g('doc_no') or '').strip(),
+                'author': str(g('author') or '').strip().replace('\n', ''),
+                'title': str(g('title') or '').strip().replace('\n', ''),
+                'date': str(g('date') or '').strip(),
+                'page_str': str(g('page') or '').strip(),
+            })
+        wb.close()
+        return recs
+
+    # ---------- 案卷目录: 每子目录一条 ----------
+    def _juan_rows(self, code_dirs, wlog):
+        """生成案卷级数据行。
+        返回 [(档号,全宗,年度,期限中文,机构名称,机构代码,案卷号,总页数,总件数)]"""
+        rows = []
+        for cd in sorted(code_dirs):
+            name = os.path.basename(cd)
+            m = self._CODE_RE.match(name)
+            fonds, ftype, year, ret, proj, vol = m.groups()
+            retention = self._RETENTION.get(ret, ret)
+            org_name = self.org_map.get(proj, '')
+            recs = self._read_inner_rows(cd, wlog)
+            total_items = max((r['seq'] for r in recs), default=None) if recs else None
+            total_pages = None
+            if recs:
+                max_seq_rec = max(recs, key=lambda r: r['seq'])
+                if max_seq_rec['page_str']:
+                    total_pages = self._page_end(max_seq_rec['page_str'])
+            rows.append((name, fonds, year, retention, org_name, proj,
+                         vol, total_pages, total_items))
+            wlog(f"  {name}: 期限={retention} 机构={org_name or '(空)'} "
+                 f"卷号={vol} 总页数={total_pages} 总件数={total_items}")
+        return rows
+
+    # ---------- 案件目录: 子目录xlsx逐行 ----------
+    def _file_rows(self, code_dirs, wlog):
+        """生成按件级数据行(全部子目录合并)。
+        返回 [(所属案卷档号,全宗,年度,期限中文,机构名称,机构代码,
+               案卷号,件号,档号,文件编号,责任者,题名,文件日期,页号,页数)]"""
+        rows = []
+        for cd in sorted(code_dirs):
+            name = os.path.basename(cd)
+            m = self._CODE_RE.match(name)
+            fonds, ftype, year, ret, proj, vol = m.groups()
+            retention = self._RETENTION.get(ret, ret)
+            org_name = self.org_map.get(proj, '')
+            recs = self._read_inner_rows(cd, wlog)
+            if not recs:
+                wlog(f"  ! {name}: 无有效记录行, 跳过")
+                continue
+            recs.sort(key=lambda r: r['seq'])
+            for i, r in enumerate(recs):
+                seq = r['seq']
+                vol_no3 = f"{seq:03d}"              # 案卷号=序号三位
+                archive_no = f"{name}-{seq:04d}"     # 档号=所属案卷档号-4位件号
+                page_no = None
+                if r['page_str']:
+                    # 页号: 含"-"取右侧
+                    s = r['page_str'].replace(' ', '')
+                    if '-' in s:
+                        page_no = self._page_end(s)
+                    else:
+                        page_no = self._page_start(s)
+                # 页数: 与下一序号页号的差值
+                pages = None
+                cur_end = self._page_end(r['page_str']) if r['page_str'] else None
+                nxt = recs[i + 1] if i + 1 < len(recs) else None
+                if nxt is not None and nxt['page_str']:
+                    nxt_start = self._page_start(nxt['page_str'])
+                    if cur_end is not None and nxt_start is not None:
+                        diff = nxt_start - cur_end
+                        pages = diff if diff >= 0 else None   # 不为负
+                elif cur_end is not None and '-' in r['page_str'].replace(' ', ''):
+                    # 无下一页号且当前含"-": 右-左
+                    ps = self._page_start(r['page_str'])
+                    if ps is not None:
+                        pages = cur_end - ps
+                rows.append((name, fonds, year, retention, org_name, proj,
+                             vol_no3, seq, archive_no, r['doc_no'], r['author'],
+                             r['title'], r['date'], page_no, pages))
+        return rows
 
     # ---------- 填充模板 ----------
     def _fill_template(self, out_path, rows, wlog):
-        """按模板结构追加数据行。
-        rows=[(档号,全宗,类型,年度,期限代码,期限中文,项目,卷号,页数),...]"""
+        """按模板表头自适应填数据行(模板首行为表头)。"""
         import openpyxl
         from openpyxl.styles import Alignment
         wb = openpyxl.load_workbook(self.template_path)
         ws = wb.active
-        # 找模板首个数据行: 首个"档号/案卷级档号"列有值的下一行, 否则表头后一行
-        start_row = None
-        for r in range(1, min(ws.max_row, 20) + 1):
-            for c in range(1, ws.max_column + 1):
-                v = ws.cell(row=r, column=c).value
-                if v is not None and ('档号' in str(v)):
-                    start_row = r + 1
-                    break
-            if start_row:
-                break
-        if start_row is None:
-            start_row = ws.max_row + 1
-        # 列自适应: 按表头关键字定位各列(缺省按顺序)
         headers = {}
         for c in range(1, ws.max_column + 1):
-            v = ws.cell(row=start_row - 1, column=c).value
+            v = ws.cell(row=1, column=c).value
             if v is None:
                 continue
-            v = str(v).strip()
-            headers[v] = c
-        col_map = {}
-        for key, aliases in [('档号', ['档号', '案卷级档号', '案卷号档号']),
-                             ('全宗', ['全宗号', '全宗']),
-                             ('类型', ['档案类型', '门类代码', '类型']),
-                             ('年度', ['年度', '年份']),
-                             ('期限代码', ['保管期限代码', '期限代码']),
-                             ('期限', ['保管期限', '期限']),
-                             ('项目', ['项目号', '项目代码', '项目']),
-                             ('卷号', ['案卷号', '卷号']),
-                             ('页数', ['总页数', '页数'])]:
-            for a in aliases:
-                if a in headers:
-                    col_map[key] = headers[a]
-                    break
-        center = Alignment(horizontal='center', vertical='center')
-        for i, (code, fonds, ftype, year, ret_code, retention, proj, vol, pages) in enumerate(rows):
+            headers[str(v).strip()] = c
+        start_row = 2
+        center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        int_cols = {'件号', '页号', '页数', '总页数', '卷内文件总件数',
+                    '案卷号', '年度', '全宗号'}
+        for i, row in enumerate(rows):
             r = start_row + i
-            if '档号' in col_map:
-                ws.cell(row=r, column=col_map['档号'], value=code)
-            if '全宗' in col_map:
-                ws.cell(row=r, column=col_map['全宗'], value=fonds)
-            if '类型' in col_map:
-                ws.cell(row=r, column=col_map['类型'], value=ftype)
-            if '年度' in col_map:
-                ws.cell(row=r, column=col_map['年度'], value=int(year))
-            if '期限代码' in col_map:
-                ws.cell(row=r, column=col_map['期限代码'], value=ret_code)
-            if '期限' in col_map:
-                ws.cell(row=r, column=col_map['期限'], value=retention)
-            if '项目' in col_map:
-                ws.cell(row=r, column=col_map['项目'], value=proj)
-            if '卷号' in col_map:
-                ws.cell(row=r, column=col_map['卷号'], value=int(vol))
-            if '页数' in col_map and pages is not None:
-                ws.cell(row=r, column=col_map['页数'], value=pages)
+            for key, val in row.items():
+                if key not in headers or val is None or val == '':
+                    continue
+                try:
+                    if key in int_cols and val is not None and val != '':
+                        val = int(val)
+                except (ValueError, TypeError):
+                    pass
+                ws.cell(row=r, column=headers[key], value=val)
             for c in range(1, ws.max_column + 1):
                 ws.cell(row=r, column=c).alignment = center
         wb.save(out_path)
@@ -7635,7 +7753,8 @@ class ArchiveCatalogWorker(QThread):
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             out_root = self.output_dir
             os.makedirs(out_root, exist_ok=True)
-            log_path = os.path.join(out_root, f"档案馆目录日志_{ts}.txt")
+            mode_name = '档案案卷目录' if self.mode == 'juan' else '档案案件目录'
+            log_path = os.path.join(out_root, f"档案馆目录日志_{mode_name}_{ts}.txt")
             logf = open(log_path, 'w', encoding='utf-8')
             import threading
             lock = threading.Lock()
@@ -7646,10 +7765,14 @@ class ArchiveCatalogWorker(QThread):
                     logf.flush()
                 self.log_signal.emit(s)
 
-            wlog("档案馆标准目录生成 - 处理日志")
+            wlog(f"{mode_name}生成 - 处理日志")
             wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             wlog(f"指定目录: {self.base_dir}")
             wlog(f"模板: {self.template_path}")
+            if self.org_map:
+                wlog(f"机构代码对应: {len(self.org_map)} 条")
+            else:
+                wlog("机构代码对应: 未选择(机构列为空, 需手工填写)")
             wlog("=" * 70)
 
             groups = self._find_code_groups()
@@ -7662,27 +7785,29 @@ class ArchiveCatalogWorker(QThread):
             wlog(f"发现 {len(groups)} 个分组 / 共 {total} 个编码子目录")
             done = 0
             ok_files = []
+            base_name = os.path.basename(os.path.normpath(self.base_dir))
             for top, code_dirs in sorted(groups.items()):
                 if self.is_stopped:
                     break
                 top_name = os.path.basename(top)
                 wlog("")
                 wlog(f"── 分组: {top_name} ({len(code_dirs)} 卷) ──")
-                rows = []
-                for cd in sorted(code_dirs):
-                    m = self._CODE_RE.match(os.path.basename(cd))
-                    fonds, ftype, year, code_ret, proj, vol = m.groups()
-                    retention = self._RETENTION.get(code_ret, code_ret)
-                    pages = self._max_page_from_xlsx(cd, wlog)
-                    full_code = os.path.basename(cd)
-                    wlog(f"  {full_code}: 全宗={fonds} 类型={ftype} 年度={year} "
-                         f"期限={retention} 项目={proj} 卷号={vol} 页数={pages}")
-                    rows.append((full_code, fonds, ftype, year, code_ret, retention, proj, vol, pages))
-                    done += 1
-                    self.progress_signal.emit(done, total)
-                if not rows:
+                if self.mode == 'juan':
+                    tuples = self._juan_rows(code_dirs, wlog)
+                    keys = ['档号', '全宗号', '年度', '保管期限', '机构问题',
+                            '机构问题代码', '案卷号', '总页数', '卷内文件总件数']
+                else:
+                    tuples = self._file_rows(code_dirs, wlog)
+                    keys = ['所属案卷档号', '全宗号', '年度', '保管期限', '机构问题',
+                            '机构问题代码', '案卷号', '件号', '档号', '文件编号',
+                            '责任者', '题名', '文件日期', '页号', '页数']
+                done += len(code_dirs)
+                self.progress_signal.emit(min(done, total), total)
+                if not tuples:
                     continue
-                out_name = f"{top_name}.xlsx"
+                rows = [dict(zip(keys, t)) for t in tuples]
+                # v3.24: 输出文件名=所选目录名+目录类型
+                out_name = f"{base_name}{mode_name}.xlsx"
                 out_path = os.path.join(out_root, out_name)
                 try:
                     self._fill_template(out_path, rows, wlog)
@@ -7700,21 +7825,40 @@ class ArchiveCatalogWorker(QThread):
                 self.finished_signal.emit(False, "已停止")
             else:
                 self.finished_signal.emit(
-                    True, f"完成！生成 {len(ok_files)} 个标准目录文件 → {out_root}")
+                    True, f"完成！生成 {len(ok_files)} 个{mode_name}文件 → {out_root}")
         except Exception as e:
             self.finished_signal.emit(False, f"处理出错: {e}")
 
 
 class ArchiveCatalogPage(FunctionPage):
-    """档案馆标准目录生成页：解析编码子目录名+提取页数，按模板批量生成xlsx"""
+    """档案馆标准目录生成页(v3.24重构)：
+    业务目录TAB(档案案卷目录/档案案件目录二选一) + 文书目录TAB(保留原有)。"""
 
     def __init__(self):
         super().__init__("档案馆标准目录")
         self.worker = None
 
-        group = QGroupBox("生成档案馆标准目录（科技类案卷级）")
-        form = QFormLayout()
+        from PyQt5.QtWidgets import QTabWidget
+        self.tabs = QTabWidget()
+        self.layout.addWidget(self.tabs)
 
+        # ====== TAB1: 业务目录 ======
+        biz_widget = QWidget()
+        biz_v = QVBoxLayout(biz_widget)
+
+        # 目录类型选择(单选)
+        mode_box = QGroupBox("目录类型")
+        mode_h = QHBoxLayout()
+        self.mode_juan_rb = QRadioButton("档案案卷目录")
+        self.mode_file_rb = QRadioButton("档案案件目录")
+        self.mode_juan_rb.setChecked(True)
+        mode_h.addWidget(self.mode_juan_rb)
+        mode_h.addWidget(self.mode_file_rb)
+        mode_h.addStretch()
+        mode_box.setLayout(mode_h)
+        biz_v.addWidget(mode_box)
+
+        form = QFormLayout()
         self.dir_edit = QLineEdit()
         self.dir_edit.setPlaceholderText("选择包含编码子目录的目录")
         btn_browse = QPushButton("选择文件夹")
@@ -7725,41 +7869,76 @@ class ArchiveCatalogPage(FunctionPage):
         h1.addWidget(btn_browse)
         form.addRow("数据目录:", h1)
 
-        self.tpl_edit = QLineEdit()
-        self.tpl_edit.setPlaceholderText("选择档案馆标准目录模板xlsx")
-        btn_tpl = QPushButton("选择模板")
-        btn_tpl.setObjectName("BrowseBtn")
-        btn_tpl.clicked.connect(self.browse_template)
+        # 两个模板(按当前目录类型选用其一)
+        self.tpl_juan_edit = QLineEdit()
+        self.tpl_juan_edit.setPlaceholderText("档案案卷目录模板xlsx(案卷级)")
+        btn_tj = QPushButton("选择模板")
+        btn_tj.setObjectName("BrowseBtn")
+        btn_tj.clicked.connect(lambda: self.browse_template(self.tpl_juan_edit))
         h2 = QHBoxLayout()
-        h2.addWidget(self.tpl_edit)
-        h2.addWidget(btn_tpl)
-        form.addRow("模板文件:", h2)
+        h2.addWidget(self.tpl_juan_edit)
+        h2.addWidget(btn_tj)
+        form.addRow("案卷目录模板:", h2)
 
-        # 输出目录: 缺省=数据目录下「档案馆标准目录」, 用户可改
+        self.tpl_file_edit = QLineEdit()
+        self.tpl_file_edit.setPlaceholderText("档案案件目录模板xlsx(按件级)")
+        btn_tf = QPushButton("选择模板")
+        btn_tf.setObjectName("BrowseBtn")
+        btn_tf.clicked.connect(lambda: self.browse_template(self.tpl_file_edit))
+        h3 = QHBoxLayout()
+        h3.addWidget(self.tpl_file_edit)
+        h3.addWidget(btn_tf)
+        form.addRow("案件目录模板:", h3)
+
+        # 机构代码对应表(可选)
+        self.org_edit = QLineEdit()
+        self.org_edit.setPlaceholderText("可选: 机构代码对应表xlsx(不选则机构列留空手填)")
+        btn_org = QPushButton("选择对应表")
+        btn_org.setObjectName("BrowseBtn")
+        btn_org.clicked.connect(self.browse_org)
+        h4 = QHBoxLayout()
+        h4.addWidget(self.org_edit)
+        h4.addWidget(btn_org)
+        form.addRow("机构代码对应表:", h4)
+
+        # 输出目录
         self.out_edit = QLineEdit()
         self.out_edit.setPlaceholderText("输出目录(缺省: 数据目录\\档案馆标准目录)")
         btn_out = QPushButton("选择文件夹")
         btn_out.setObjectName("BrowseBtn")
         btn_out.clicked.connect(self.browse_out)
-        h3 = QHBoxLayout()
-        h3.addWidget(self.out_edit)
-        h3.addWidget(btn_out)
-        form.addRow("输出目录:", h3)
+        h5 = QHBoxLayout()
+        h5.addWidget(self.out_edit)
+        h5.addWidget(btn_out)
+        form.addRow("输出目录:", h5)
+        biz_v.addLayout(form)
 
-        group.setLayout(form)
-        self.layout.addWidget(group)
-
-        info = QLabel(
-            "功能说明：\n"
-            "• 解析子目录编码 全宗号-类型·年度-期限代码-项目号-案卷号\n"
-            "  (如 J380-ZY·2021-Y-FGC-0001)\n"
-            "• 案卷级档号=目录名; 期限 Y=永久 D30=30年 D10=10年\n"
-            "• 总页数=子目录xlsx中序号最大行的页码最大值(如102-232取232)\n"
-            "• 编码目录不在直接下层时自动向下层递归查找\n"
-            "• 输出到「档案馆标准目录」子目录, 文件名=编码目录的上级目录名"
+        biz_info = QLabel(
+            "【档案案卷目录】每个编码子目录一条; 卷内文件总件数=子目录同名xlsx"
+            "序号最大值; 总页数=最大序号行页号终止值(如102-232取232)\n"
+            "【档案案件目录】子目录xlsx逐序号行填入; 档号=所属案卷档号-4位件号; "
+            "页号取\"起-止\"右侧; 页数=与下一序号页号差值(负值不算, 无下一页号"
+            "且含\"-\"时=右减左)\n"
+            "编码: 全宗号-类型·年度-期限-项目号-案卷号; 期限Y=永久 D30=30年 D10=10年; "
+            "输出文件名=所选目录名+目录类型"
         )
-        info.setStyleSheet("color: #666; font-size: 12px;")
-        self.layout.addWidget(info)
+        biz_info.setStyleSheet("color: #666; font-size: 12px;")
+        biz_info.setWordWrap(True)
+        biz_v.addWidget(biz_info)
+        biz_v.addStretch()
+        self.tabs.addTab(biz_widget, "业务目录")
+
+        # ====== TAB2: 文书目录 ======
+        doc_widget = QWidget()
+        doc_v = QVBoxLayout(doc_widget)
+        doc_info = QLabel(
+            "【文书目录】沿用原有科技类案卷级目录生成逻辑。\n"
+            "请切换到「业务目录」TAB使用新功能; 文书目录功能规划中。"
+        )
+        doc_info.setStyleSheet("color: #666; font-size: 12px;")
+        doc_v.addWidget(doc_info)
+        doc_v.addStretch()
+        self.tabs.addTab(doc_widget, "文书目录")
 
         btn_layout = QHBoxLayout()
         self.start_btn = QPushButton("生成目录")
@@ -7784,7 +7963,6 @@ class ArchiveCatalogPage(FunctionPage):
         d = QFileDialog.getExistingDirectory(self, "选择数据目录")
         if d:
             self.dir_edit.setText(d)
-            # 输出框为空时自动填缺省(数据目录\档案馆标准目录); 用户改过则不覆盖
             if not self.out_edit.text().strip():
                 self.out_edit.setText(os.path.join(d, "档案馆标准目录"))
 
@@ -7793,20 +7971,31 @@ class ArchiveCatalogPage(FunctionPage):
         if d:
             self.out_edit.setText(d)
 
-    def browse_template(self):
+    def browse_template(self, edit):
         f, _ = QFileDialog.getOpenFileName(
             self, "选择模板xlsx", "", "Excel文件 (*.xlsx)")
         if f:
-            self.tpl_edit.setText(f)
+            edit.setText(f)
+
+    def browse_org(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "选择机构代码对应表xlsx", "", "Excel文件 (*.xlsx)")
+        if f:
+            self.org_edit.setText(f)
 
     def start(self):
+        if self.tabs.currentIndex() != 0:
+            QMessageBox.information(self, "提示", "请切换到「业务目录」TAB后开始")
+            return
         d = self.dir_edit.text().strip()
-        t = self.tpl_edit.text().strip()
         if not d or not os.path.isdir(d):
             QMessageBox.warning(self, "提示", "请先选择有效的数据目录")
             return
-        if not t or not os.path.isfile(t):
-            QMessageBox.warning(self, "提示", "请先选择模板xlsx文件")
+        mode = 'juan' if self.mode_juan_rb.isChecked() else 'file'
+        tpl = (self.tpl_juan_edit if mode == 'juan' else self.tpl_file_edit).text().strip()
+        tpl_name = '案卷目录模板' if mode == 'juan' else '案件目录模板'
+        if not tpl or not os.path.isfile(tpl):
+            QMessageBox.warning(self, "提示", f"请先选择{tpl_name}xlsx文件")
             return
         out = self.out_edit.text().strip()
         if not out:
@@ -7817,11 +8006,29 @@ class ArchiveCatalogPage(FunctionPage):
         except Exception as e:
             QMessageBox.warning(self, "错误", f"无法创建输出目录: {e}")
             return
+        # 机构代码对应表(可选)
+        org_map = {}
+        org_p = self.org_edit.text().strip()
+        if org_p:
+            if not os.path.isfile(org_p):
+                QMessageBox.warning(self, "提示", "机构代码对应表文件不存在, 已忽略")
+            else:
+                org_map = ArchiveCatalogWorker.load_org_map(org_p, self.log)
+                if not org_map:
+                    reply = QMessageBox.question(
+                        self, "提示",
+                        "机构代码对应表未解析到有效映射(需含「机构代码/机构名称」表头)。\n"
+                        "是否继续(机构列将留空, 需手工填写)?",
+                        QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                    if reply != QMessageBox.Yes:
+                        return
         self.log_box.clear()
-        self.log(f"开始生成: {d}")
-        self.log(f"模板: {t}")
+        mode_name = '档案案卷目录' if mode == 'juan' else '档案案件目录'
+        self.log(f"开始生成{mode_name}: {d}")
+        self.log(f"模板: {tpl}")
         self.log(f"输出目录: {out}")
-        self.worker = ArchiveCatalogWorker(d, t, output_dir=out)
+        self.worker = ArchiveCatalogWorker(d, tpl, mode=mode, org_map=org_map,
+                                           output_dir=out)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self._update_progress)
         self.worker.finished_signal.connect(self._on_finished)
