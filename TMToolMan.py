@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.25"
+VERSION = "3.26"
 
 CHANGELOG = [
+    {
+        "version": "3.26",
+        "date": "2026-09-10",
+        "changes": [
+            "修复GPU模式JPG转双层PDF段错误崩溃(崩溃日志20260910: OCR服务线程在paddleocr img_decode内部np.frombuffer→cv2.imdecode发生access violation, GPU模式4工作线程运行中)：①各工作线程调用OCR前用PIL预解码图像为BGR连续ndarray(np.array拷贝+ascontiguousarray, 非np.asarray共享内存——共享视图在PIL关闭后指向已释放内存恰是段错误形态), 传ndarray给ocr()——paddleocr接受ndarray时check_img直接透传, 服务线程内完全不再执行文件读取与cv2.imdecode(崩溃点移出); ②首次探测/复探/CPU重探测三处探测图同样预解码; ③预解码失败回退原路径模式(尽力而为); ④ocr()三次调用点(首试/参数兼容重试/重建后重试)统一改用同一输入对象",
+        ],
+    },
     {
         "version": "3.25",
         "date": "2026-09-06",
@@ -932,7 +939,27 @@ class FileSplitWorker(QThread):
             return None
         return self._ocr
 
-    def _ocr_page(self, image_path, logf, wlog):
+    def _preload_img_arr(self, image_path):
+        """v3.26: 在调用方(工作线程)预解码图像为BGR ndarray。
+        背景(崩溃日志20260910): GPU模式多线程下OCR服务线程在paddleocr
+        img_decode内部(np.frombuffer→cv2.imdecode)发生access violation段错误
+        ——GPU推理上下文内存损坏波及服务线程内的C层解码路径。
+        对策: 服务线程外的各工作线程用PIL解码(不经cv2), 传ndarray给ocr()
+        ——paddleocr接受ndarray, check_img直接透传, 服务线程内完全不再执行
+        文件读取与cv2.imdecode(崩溃点被移出)。
+        返回BGR连续数组(与cv2.imread通道序一致); 失败返回None(回退路径模式)。
+        注意: 必须np.array(拷贝)——np.asarray与PIL共享内存, 图像close后数组
+        指向已释放内存, 恰是access violation形态。"""
+        try:
+            import numpy as _np
+            with Image.open(image_path) as _im:
+                _rgb = _im.convert('RGB')
+                _bgr = _np.array(_rgb)[:, :, ::-1]   # RGB→BGR, 同cv2.imread
+                return _np.ascontiguousarray(_bgr)
+        except Exception:
+            return None
+
+    def _ocr_page(self, image_path, logf, wlog, img_arr=None):
         """
         对单页做 OCR，返回片段列表 [(文本, x0, y0, x1), ...]。
         x1 为片段右边界，用于列定位。
@@ -961,8 +988,11 @@ class FileSplitWorker(QThread):
             return []
         result = None
         _mem_fail = False
+        # v3.26: 优先用调用方预解码的ndarray(服务线程内不再读文件/cv2.imdecode,
+        # 规避20260910崩溃); 预解码失败回退路径模式(仍走img_decode, 尽力而为)。
+        _ocr_input = img_arr if img_arr is not None else image_path
         try:
-            result = ocr.ocr(image_path, cls=True)
+            result = ocr.ocr(_ocr_input, cls=True)
         except (Exception, SystemExit) as e:
             # v3.12: 必须同时捕获 SystemExit——paddleocr 在 cv2 缩放内存不足时内部调用
             # sys.exit(0)(崩溃日志20260901)。SystemExit 继承 BaseException, 仅捕获
@@ -983,10 +1013,10 @@ class FileSplitWorker(QThread):
             if not _engine_broken:
                 # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
                 try:
-                    result = ocr.ocr(image_path)
+                    result = ocr.ocr(_ocr_input)
                 except (Exception, SystemExit):
                     try:
-                        result = ocr.predict(image_path)
+                        result = ocr.predict(_ocr_input)
                     except (Exception, SystemExit) as _e3:
                         e2 = _e3
                         result = None
@@ -1041,7 +1071,7 @@ class FileSplitWorker(QThread):
                         # 重建实例若仍报同类错误(显存/上下文问题未消除),
                         # 继续重试同样有access violation风险, 该页直接放弃文本层。
                         try:
-                            result = _ocr2.ocr(image_path, cls=True)
+                            result = _ocr2.ocr(_ocr_input, cls=True)
                         except (Exception, SystemExit):
                             result = None
                 else:
@@ -5747,6 +5777,7 @@ class JpgToPdfWorker(QThread):
     # 复用分件功能的本地 PaddleOCR(多配置兼容初始化+初始化锁+中文路径安全)
     _get_ocr = FileSplitWorker._get_ocr
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
+    _preload_img_arr = FileSplitWorker._preload_img_arr   # v3.26: 预解码(崩溃修复)
     _ocr_page = FileSplitWorker._ocr_page
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
     # OCR服务线程机制(定义在 FileSplitWorker 内, 两处共享同一实现):
@@ -5802,8 +5833,10 @@ class JpgToPdfWorker(QThread):
             self._make_probe_image(_probe)
             self._ocr = None              # 丢弃旧实例(降级时可能已损坏)
             self._ocr_pages_since_init = 0
+            _pa = self._preload_img_arr(_probe)   # v3.26: 探测也预解码
             st, _res = self._ocr_svc_call(
-                lambda: self._ocr_page(_probe, None, lambda s: None),
+                lambda: self._ocr_page(_probe, None, lambda s: None,
+                                       img_arr=_pa),
                 timeout=60)
             if st == 'ok' and _res:
                 return True
@@ -5857,8 +5890,10 @@ class JpgToPdfWorker(QThread):
                     # GPU上"能跑但识别不出任何内容"的半失效状态(该状态下每页
                     # frags为空 → 生成单层PDF)。要求识别出文字才算探测通过。
                     self._make_probe_image(_probe)
+                    _p_arr = self._preload_img_arr(_probe)   # v3.26: 探测预解码
                     st, _res = self._ocr_svc_call(
-                        lambda: self._ocr_page(_probe, None, lambda s: None),
+                        lambda: self._ocr_page(_probe, None, lambda s: None,
+                                               img_arr=_p_arr),
                         timeout=120)
                     if st == 'ok' and _res:
                         self.log_signal.emit("  OCR推理探测通过(识别到文字)")
@@ -5884,8 +5919,10 @@ class JpgToPdfWorker(QThread):
                     _p2 = os.path.join(output_dir, '_ocr_probe.png')
                     try:
                         self._make_probe_image(_p2)
+                        _p2_arr = self._preload_img_arr(_p2)   # v3.26: 探测预解码
                         st2, _r2 = self._ocr_svc_call(
-                            lambda: self._ocr_page(_p2, None, lambda s: None),
+                            lambda: self._ocr_page(_p2, None, lambda s: None,
+                                                   img_arr=_p2_arr),
                             timeout=120)
                         if st2 == 'ok' and _r2:
                             self.log_signal.emit("  CPU模式OCR探测通过(识别到文字), 继续生成双层PDF")
@@ -5982,11 +6019,16 @@ class JpgToPdfWorker(QThread):
                 # OCR文本层(坐标从像素换算到PDF点)——逐页日志, 挂起时可见最后处理到哪
                 self.log_signal.emit(f"    OCR: {os.path.basename(jpg_path)} "
                                      f"({len(jpg_paths)}张中第{page_idx+1}张)")
+                # v3.26: 在工作线程预解码图像为ndarray再提交服务线程——服务线程内
+                # 不再执行文件读取与cv2.imdecode(20260910崩溃点), 解码压力也
+                # 从服务线程移到各工作线程并行完成。
+                _arr = self._preload_img_arr(jpg_path)
                 # OCR走服务线程(天然串行=替代ocr锁), 单页180秒超时。
                 # 中途挂死→尝试一次CPU重建并重试本页; 仍失败则该页无文本层,
                 # 继续处理后续页(不再永久阻塞——这是旧版4线程卡死的直接原因)。
                 st, frags = self._ocr_svc_call(
-                    lambda p=jpg_path: self._ocr_page(p, None, lambda s: None),
+                    lambda a=_arr: self._ocr_page(jpg_path, None,
+                                                  lambda s: None, img_arr=a),
                     timeout=180)
                 if st == 'timeout':
                     self.log_signal.emit(
@@ -5995,7 +6037,8 @@ class JpgToPdfWorker(QThread):
                         f'OCR单页超时180秒: {os.path.basename(jpg_path)}')
                     if self._rebuild_ocr_cpu():
                         st, frags = self._ocr_svc_call(
-                            lambda p=jpg_path: self._ocr_page(p, None, lambda s: None),
+                            lambda a=_arr: self._ocr_page(
+                                jpg_path, None, lambda s: None, img_arr=a),
                             timeout=180)
                 if st != 'ok':
                     if st == 'error':
