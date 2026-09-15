@@ -3966,6 +3966,337 @@ class BlackCircleRemoverPage(QWidget):
                     self._show_before_preview(new_idx)
 
 
+# ============================ 有效区域展示(独立功能, 不记录版本日志) ============================
+class ValidRegionWorker(QThread):
+    """有效区域展示后台线程：扫描目录树JPG, 分析核心文字区域并写入sqlite。
+
+    只读源文件做分析, 数据(区域尺寸)存独立数据库 valid_regions.db,
+    不修改任何源文件。
+    """
+    log_signal = Signal(str)
+    progress_signal = Signal(int, int)
+    finished_signal = Signal(bool, str)
+
+    def __init__(self, base_dir, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        self.is_stopped = False
+
+    def stop(self):
+        self.is_stopped = True
+
+    # ---------- 数据库 ----------
+    @staticmethod
+    def _db_path():
+        """数据库放程序目录(打包后=exe所在目录)。"""
+        if getattr(sys, 'frozen', False):
+            d = os.path.dirname(sys.executable)
+        else:
+            d = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(d, 'valid_regions.db')
+
+    def _db(self):
+        import sqlite3
+        conn = sqlite3.connect(self._db_path())
+        conn.execute("""CREATE TABLE IF NOT EXISTS valid_regions (
+            file_path TEXT PRIMARY KEY,
+            file_name TEXT,
+            dir_path TEXT,
+            img_w INTEGER, img_h INTEGER,
+            x0 INTEGER, y0 INTEGER, x1 INTEGER, y1 INTEGER,
+            region_w INTEGER, region_h INTEGER,
+            analyzed_at TEXT)""")
+        return conn
+
+    # ---------- 核心文字区域分析 ----------
+    @staticmethod
+    def analyze_region(img_path):
+        """分析JPG核心文字区域: 二值化后按行列投影密度确定文字包围盒。
+        返回 (img_w, img_h, x0, y0, x1, y1) 像素坐标(含边界); 无文字返回None。
+        思路: 降采样→自适应阈值(暗于均值-25视为文字)→行列投影→密度阈值
+        切出核心区→坐标按比例还原。纯显示用, 精度到缩略图级别足够。"""
+        with Image.open(img_path) as im:
+            im = im.convert('L')
+            W, H = im.size
+            # 降采样(最长边≤1600, 避免大图全量运算)
+            scale = min(1.0, 1600.0 / max(W, H))
+            if scale < 1.0:
+                sw, sh = max(1, int(W * scale)), max(1, int(H * scale))
+                im2 = im.resize((sw, sh))
+            else:
+                sw, sh, im2 = W, H, im
+            arr = np.asarray(im2, dtype=np.uint8)
+        # 自适应阈值: 偏暗像素视为文字
+        thr = max(1, int(arr.mean()) - 25)
+        dark = arr < thr
+        if not dark.any():
+            return None
+        row_density = dark.sum(axis=1) / sw
+        col_density = dark.sum(axis=0) / sh
+        r_thr = max(0.004, dark.sum() / (sw * sh) * 0.25)
+        rows = np.where(row_density > r_thr)[0]
+        cols = np.where(col_density > r_thr)[0]
+        if len(rows) == 0 or len(cols) == 0:
+            return None
+        y0, y1 = int(rows[0]), int(rows[-1])
+        x0, x1 = int(cols[0]), int(cols[-1])
+        if scale < 1.0:
+            x0, x1 = int(x0 / scale), int(x1 / scale)
+            y0, y1 = int(y0 / scale), int(y1 / scale)
+        x1 = min(W - 1, x1)
+        y1 = min(H - 1, y1)
+        return (W, H, x0, y0, x1, y1)
+
+    def run(self):
+        try:
+            jpgs = []
+            for root, dirs, files in os.walk(self.base_dir):
+                dirs.sort()
+                for f in sorted(files):
+                    if f.lower().endswith('.jpg'):
+                        jpgs.append(os.path.join(root, f))
+            total = len(jpgs)
+            if total == 0:
+                self.finished_signal.emit(False, "该目录(含子目录)下未找到JPG文件")
+                return
+            self.log_signal.emit(f"共找到 {total} 个JPG文件, 开始分析...")
+            conn = self._db()
+            done = ok = 0
+            for p in jpgs:
+                if self.is_stopped:
+                    break
+                try:
+                    r = self.analyze_region(p)
+                    if r:
+                        W, H, x0, y0, x1, y1 = r
+                        conn.execute(
+                            "INSERT OR REPLACE INTO valid_regions VALUES "
+                            "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (p, os.path.basename(p), os.path.dirname(p),
+                             W, H, x0, y0, x1, y1, x1 - x0 + 1, y1 - y0 + 1,
+                             datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                        ok += 1
+                    else:
+                        # 无文字区域也记录(空区域), 便于界面区分"已分析无文字"
+                        conn.execute(
+                            "INSERT OR REPLACE INTO valid_regions VALUES "
+                            "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (p, os.path.basename(p), os.path.dirname(p),
+                             0, 0, 0, 0, 0, 0, 0, 0,
+                             datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                except Exception as e:
+                    self.log_signal.emit(f"  × 分析失败 {os.path.basename(p)}: {e}")
+                done += 1
+                if done % 10 == 0 or done == total:
+                    self.progress_signal.emit(done, total)
+                    conn.commit()
+            conn.commit()
+            conn.close()
+            if self.is_stopped:
+                self.finished_signal.emit(False, f"已停止(已完成 {done}/{total})")
+            else:
+                self.finished_signal.emit(
+                    True, f"分析完成: {done}/{total} 个文件, {ok} 个含文字区域"
+                          f"(数据已存 {os.path.basename(self._db_path())})")
+        except Exception as e:
+            self.finished_signal.emit(False, f"处理出错: {e}")
+
+
+class ValidRegionPage(QWidget):
+    """有效区域展示页: 分析目录树JPG核心文字区域→sqlite; 树形浏览+预览红框标注。
+    只读源文件, 预览标注仅为显示(内存中画框), 不落盘不修改源文件。"""
+
+    def __init__(self):
+        super().__init__()
+        self.worker = None
+        v = QVBoxLayout(self)
+
+        group = QGroupBox("JPG核心文字区域分析")
+        form = QFormLayout()
+        self.dir_edit = QLineEdit()
+        self.dir_edit.setPlaceholderText("选择目录(处理其下及所有子目录的JPG)")
+        btn = QPushButton("选择文件夹")
+        btn.setObjectName("BrowseBtn")
+        btn.clicked.connect(self.browse_dir)
+        h = QHBoxLayout()
+        h.addWidget(self.dir_edit)
+        h.addWidget(btn)
+        form.addRow("目标目录:", h)
+        group.setLayout(form)
+        v.addWidget(group)
+
+        btn_h = QHBoxLayout()
+        self.analyze_btn = QPushButton("分析有效区域")
+        self.analyze_btn.setObjectName("ActionBtn")
+        self.analyze_btn.clicked.connect(self.start_analyze)
+        btn_h.addWidget(self.analyze_btn)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("ActionBtn")
+        self.stop_btn.setStyleSheet("background-color: #DA3633; color: white;")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_analyze)
+        btn_h.addWidget(self.stop_btn)
+        self.load_btn = QPushButton("刷新文件树")
+        self.load_btn.setObjectName("BrowseBtn")
+        self.load_btn.clicked.connect(self.load_tree)
+        btn_h.addWidget(self.load_btn)
+        btn_h.addStretch()
+        v.addLayout(btn_h)
+
+        # 树形文件列表 + 预览图 左右分栏
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["文件", "区域尺寸"])
+        self.tree.itemClicked.connect(self.on_file_clicked)
+        self.splitter.addWidget(self.tree)
+        self.preview = QLabel("选择左侧文件后在此预览")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(400, 400)
+        self.splitter.addWidget(self.preview)
+        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(1, 3)
+        v.addWidget(self.splitter, 1)
+
+        self.progress = QProgressBar()
+        self.progress.setFormat("待开始")
+        v.addWidget(self.progress)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(120)
+        v.addWidget(self.log_box)
+
+    def log(self, msg):
+        self.log_box.append(f">> {msg}")
+
+    # ---------- 数据库读取 ----------
+    def _db_conn(self):
+        import sqlite3
+        p = ValidRegionWorker._db_path()
+        if not os.path.exists(p):
+            return None
+        return sqlite3.connect(p)
+
+    def load_tree(self):
+        """从数据库加载已分析文件, 按目录分组构建两级树。"""
+        self.tree.clear()
+        conn = self._db_conn()
+        if conn is None:
+            self.log("暂无分析数据, 请先选择目录并点击「分析有效区域」")
+            return
+        try:
+            rows = conn.execute(
+                "SELECT file_path, file_name, dir_path, region_w, region_h "
+                "FROM valid_regions ORDER BY file_path").fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            self.log("数据库为空, 请先分析")
+            return
+        # 只显示当前所选目录下的记录(未选目录则显示全部)
+        base = self.dir_edit.text().strip()
+        if base:
+            base = os.path.normpath(base)
+            rows = [r for r in rows
+                    if os.path.normpath(r[0]).startswith(base + os.sep)
+                    or os.path.normpath(r[2]) == base]
+        dir_nodes = {}
+        for fp, name, dp, rw, rh in rows:
+            dpn = os.path.normpath(dp)
+            if dpn not in dir_nodes:
+                node = QTreeWidgetItem(self.tree,
+                                       [dpn.split(os.sep)[-1] or dpn, ''])
+                node.setData(0, Qt.UserRole, dpn)   # 目录节点存目录路径
+                dir_nodes[dpn] = node
+            node = dir_nodes[dpn]
+            size_txt = f"{rw}×{rh}" if rw else "无文字区域"
+            child = QTreeWidgetItem(node, [name, size_txt])
+            child.setData(0, Qt.UserRole, fp)       # 文件节点存完整路径
+        self.tree.expandAll()
+        self.log(f"已加载 {len(rows)} 条记录"
+                 + (f"(目录: {base})" if base else ""))
+
+    def on_file_clicked(self, item, col):
+        """点击文件节点: 从数据库取区域坐标, 预览图上画红框(纯显示)。"""
+        fp = item.data(0, Qt.UserRole)
+        if not fp or item.childCount() > 0:   # 目录节点无文件路径
+            return
+        conn = self._db_conn()
+        if conn is None:
+            self.preview.setText("暂无数据库")
+            return
+        try:
+            target = conn.execute(
+                "SELECT img_w, img_h, x0, y0, x1, y1 "
+                "FROM valid_regions WHERE file_path=?", (fp,)).fetchone()
+        finally:
+            conn.close()
+        if target is None:
+            self.preview.setText("数据库中无此文件记录")
+            return
+        W, H, x0, y0, x1, y1 = target
+        if not os.path.isfile(fp):
+            self.preview.setText("文件不存在: " + fp)
+            return
+        pm = QPixmap(fp)
+        if pm.isNull():
+            self.preview.setText("无法读取图像")
+            return
+        # 在内存副本上画红框(仅显示, 不影响源文件)
+        if W and x1 > x0:
+            painter = QPainter(pm)
+            pen = QPen(QColor(255, 0, 0), max(2, pm.width() // 300))
+            painter.setPen(pen)
+            painter.drawRect(x0, y0, x1 - x0, y1 - y0)
+            painter.end()
+        # 缩放适配预览框(保持比例)
+        scaled = pm.scaled(self.preview.width(), self.preview.height(),
+                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.preview.setPixmap(scaled)
+        self.log(f"预览: {fp}"
+                 + (f" | 有效区域 ({x0},{y0})-({x1},{y1}) 尺寸 "
+                    f"{x1-x0+1}×{y1-y0+1}" if W else " | 无文字区域"))
+
+    def browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "选择目标目录")
+        if d:
+            self.dir_edit.setText(d)
+            self.load_tree()
+
+    def start_analyze(self):
+        d = self.dir_edit.text().strip()
+        if not d or not os.path.isdir(d):
+            QMessageBox.warning(self, "提示", "请先选择有效的目标目录")
+            return
+        self.log_box.clear()
+        self.log(f"开始分析: {d}")
+        self.worker = ValidRegionWorker(d)
+        self.worker.log_signal.connect(self.log)
+        self.worker.progress_signal.connect(self._on_progress)
+        self.worker.finished_signal.connect(self._on_finished)
+        self.worker.start()
+        self.analyze_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    def stop_analyze(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.log("正在停止...")
+
+    def _on_progress(self, cur, total):
+        pct = cur / total * 100 if total else 0
+        self.progress.setValue(int(pct))
+        self.progress.setFormat(f"{cur} / {total} ({pct:.0f}%)")
+
+    def _on_finished(self, ok, msg):
+        self.log(msg)
+        self.progress.setFormat("已完成" if ok else "已停止/失败")
+        self.analyze_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        if ok:
+            self.load_tree()
+
+
 # 测试代码
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -3980,11 +4311,14 @@ if __name__ == "__main__":
     except:
         pass
     
-    window = BlackCircleRemoverPage()
+    # 主窗口改为TAB: 黑圈去除 / 有效区域展示
+    window = QTabWidget()
+    window.addTab(BlackCircleRemoverPage(), "黑圈去除")
+    window.addTab(ValidRegionPage(), "有效区域展示")
     window.setWindowTitle("同美图像质检工具 v" + VERSION)
     window.setGeometry(100, 100, 1400, 900)
     window.show()
     window.raise_()  # 确保窗口显示在最前面
     window.activateWindow()  # 激活窗口
-    
+
     sys.exit(app.exec_())
