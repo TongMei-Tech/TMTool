@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.26"
+VERSION = "3.27"
 
 CHANGELOG = [
+    {
+        "version": "3.27",
+        "date": "2026-09-28",
+        "changes": [
+            "排查GPU模式JPG转双层PDF长时间处理大文件(单线程+单文件100+页, 生成十几个PDF后)出现成串『Windows fatal exception: access violation』单行提示(20260928, 其后无Current thread堆栈, 当日崩溃日志0字节=无真实致命崩溃记录)：faulthandler在Windows上以向量异常处理器方式工作, 显卡驱动内部「触发异常→自行捕获」的显存探测会被它先打印一行——成串单行提示(无堆栈)≠程序崩溃, 处理仍在正常进行; 真崩溃=提示行后紧跟线程堆栈且程序退出。同时削减驱动侧诱因并留痕说明：①分段边界GPU缓存释放(empty_cache)由每分段一次改为每6分段一次——auto_growth分配器复用自留池空闲块本就是抗碎片行为, 而大文件时自适应CHUNK=8页意味着单个百页文件要空转十余次「全量归还驱动→下段重新申请」循环, 十几个文件后驱动侧显存碎片化, 高负载下驱动内部开始用异常探测做分配(即成串提示的直接来源); 目录结束处仍无条件释放, 200页引擎例行重建也会释放; ②GPU模式新增每_OCR_ENGINE_RECYCLE_DIRS(5)个目录整实例重建OCR引擎(_svc_recycle_engine, 服务线程内丢弃实例+GC+empty_cache, 下次OCR懒重建)——与200页页数阈值互补(大文件目录凑满200页前碎片已累积), 实例级销毁重建是唯一能彻底归还驱动侧资源的显存整理方式; ③运行监控采样改用NVML读全卡显存(nvml.dll句柄模块级缓存), 不再从监控线程并发调用paddle CUDA API(memory_allocated等), 消除与OCR服务线程推理的并发驱动入口; 顺带修复NVML兜底路径的栈越界隐患(原给nvmlDeviceGetMemoryInfo传两个独立c_ulonglong共16字节且不保证相邻, 驱动要写整个nvmlMemory_t≥24字节→栈越界写, 改为分配带余量的结构体缓冲); ④启动时崩溃日志写入说明性备注、GPU模式启动时界面日志提示, 告知单行『Windows fatal exception』为驱动内部已处理异常、非程序崩溃",
+        ],
+    },
     {
         "version": "3.26",
         "date": "2026-09-10",
@@ -248,6 +255,21 @@ def _setup_crash_log():
         _fh = open(crash_path, 'a', encoding='utf-8')
         faulthandler.enable(file=_fh, all_threads=True)
         _setup_crash_log._fh = _fh
+        # v3.27: 说明性备注。faulthandler在Windows上以向量异常处理器方式工作,
+        # 显卡驱动(NVIDIA CUDA/NVML)内部「触发异常→自行捕获」的显存探测也会被它
+        # 先看到并打印一行"Windows fatal exception: access violation"。这类
+        # 【单行、其后没有"Current thread"堆栈】的记录=驱动内部已处理的异常,
+        # 程序并未崩溃(GPU长时间高负载时常见, 成串出现); 真崩溃=提示行后紧跟
+        # 线程堆栈且程序退出。写入备注避免用户(及排查者)误判。
+        _fh.write(
+            f"\n{'=' * 80}\n程序启动 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            "说明: 本文件由faulthandler崩溃日志机制写入。Windows下显卡驱动内部会以"
+            "「触发异常→自行捕获」方式做显存探测, faulthandler会在其被驱动接住前"
+            "先打印一行『Windows fatal exception: access violation』——这类"
+            "【单行、其后无Current thread堆栈】的记录不代表程序崩溃;\n"
+            "真崩溃的特征: 提示行后紧跟线程堆栈(Current thread ... most recent call "
+            "first)且程序退出。\n")
+        _fh.flush()
     except Exception:
         pass
 
@@ -340,44 +362,50 @@ def _proc_mem_mb():
     return 0.0
 
 
+# NVML句柄模块级缓存: None=未尝试, False=不可用(缓存失败结果, 避免每次采样
+# 都重试加载nvml.dll), dict=已初始化(nvml句柄+设备句柄)。
+_NVML = None
 def _gpu_mem_info():
-    """GPU显存信息(v3.14): 返回 (已用MB, 总MB, paddle已分配MB), 获取失败返回None。
-    优先用 paddle CUDA API(与推理同源, 反映paddle实际占用); 失败再试 NVML(nvml.dll)。
-    本函数只在OCR服务线程/监控线程调用, 避免与其他CUDA操作并发。"""
-    # ① paddle CUDA(与推理同源)
-    try:
-        import paddle
-        if hasattr(paddle.device, 'cuda') and paddle.device.is_compiled_with_cuda():
-            if int(paddle.device.cuda.device_count()) > 0:
-                alloc = reserved = 0.0
-                try:
-                    alloc = float(paddle.device.cuda.memory_allocated()) / 1048576.0
-                    reserved = float(paddle.device.cuda.memory_reserved()) / 1048576.0
-                except Exception:
-                    pass
-                return (alloc, reserved, 'paddle')
-    except Exception:
-        pass
-    # ② NVML(不依赖paddle, 反映全卡显存——含其他进程占用)
+    """GPU显存信息(v3.27): 返回 (全卡已用MB, 总MB, 'nvml'), 获取失败返回None。
+    ★ v3.27改: 只用NVML(nvml.dll)读全卡显存, 不再从本函数调用paddle CUDA API
+    (memory_allocated/memory_reserved)——本函数由运行监控线程每10秒调用, 原实现
+    会在监控线程与OCR服务线程的GPU推理【并发】进入CUDA驱动(驱动虽会串行化调用,
+    但多一个并发入口是长时间高负载下的额外压力)。NVML是独立于CUDA上下文的
+    监控专用接口(nvidia-smi同款), 从任意线程调用都安全; 反映全卡显存
+    (含其他进程占用)。
+    另修一个隐患: 旧版给nvmlDeviceGetMemoryInfo传两个独立的c_ulonglong(共16字节,
+    且不保证相邻), 而驱动要写整个nvmlMemory_t结构体(≥24字节)——栈越界写。
+    改为分配足量的结构体缓冲。"""
+    global _NVML
+    if _NVML is False:
+        return None
     try:
         import ctypes as _ct2
-        nvml = _ct2.CDLL('nvml.dll')
-        if nvml.nvmlInit_v2() == 0:
+        if _NVML is None:
             try:
+                nvml = _ct2.CDLL('nvml.dll')
+                if nvml.nvmlInit_v2() != 0:
+                    _NVML = False
+                    return None
                 h = _ct2.c_void_p()
-                if nvml.nvmlDeviceGetHandleByIndex_v2(0, _ct2.byref(h)) == 0:
-                    free = _ct2.c_ulonglong()
-                    total = _ct2.c_ulonglong()
-                    if nvml.nvmlDeviceGetMemoryInfo(h, _ct2.byref(free),
-                                                    _ct2.byref(total)) == 0:
-                        used = (total.value - free.value) / 1048576.0
-                        tot = total.value / 1048576.0
-                        return (used, tot, 'nvml')
-            finally:
-                try:
-                    nvml.nvmlShutdown()
-                except Exception:
-                    pass
+                if nvml.nvmlDeviceGetHandleByIndex_v2(0, _ct2.byref(h)) != 0:
+                    _NVML = False
+                    return None
+                _NVML = {'nvml': nvml, 'h': h}
+            except Exception:
+                _NVML = False
+                return None
+        nvml, h = _NVML['nvml'], _NVML['h']
+        # nvmlMemory_t: free/total/reserved(各8字节, 个别版本字段更多)——
+        # 多留3个字段余量, 分配大于驱动写入尺寸即安全。
+        class _NvmlMem(_ct2.Structure):
+            _fields_ = [(n, _ct2.c_ulonglong) for n in
+                        ('free', 'total', 'reserved', 'pad1', 'pad2', 'pad3')]
+        mem = _NvmlMem()
+        if nvml.nvmlDeviceGetMemoryInfo(h, _ct2.byref(mem)) == 0:
+            used = (mem.total - mem.free) / 1048576.0
+            tot = mem.total / 1048576.0
+            return (used, tot, 'nvml')
     except Exception:
         pass
     return None
@@ -723,6 +751,39 @@ class FileSplitWorker(QThread):
         except Exception:
             pass
 
+    # v3.27: GPU模式下按处理目录数例行重建OCR引擎。
+    # 页数阈值(_OCR_RECYCLE_PAGES=200)之外的补充: 大文件目录(单文件100+页,
+    # 自适应CHUNK只有8页)要很久才凑满200页, 而连续十几个大目录的持续GPU负载
+    # 会让驱动侧显存碎片持续累积(20260928: 单线程GPU模式十几个大PDF后,
+    # faulthandler成串打印驱动内部已自行处理的"access violation"单行)。
+    # 实例级销毁重建是唯一能彻底归还驱动侧资源的显存"整理"方式,
+    # 代价仅数秒模型重载(下次OCR时懒重建)。
+    _OCR_ENGINE_RECYCLE_DIRS = 5
+
+    def _svc_recycle_engine(self):
+        """在OCR服务线程内整实例重建OCR引擎: 丢弃旧实例+GC+GPU缓存释放。
+        与推理经同一服务线程天然串行, 安全; 服务线程不可用时跳过
+        (下一个目录组还会再试)。重建本身不构造新实例——下次 _ocr_page
+        内的 _get_ocr() 会在服务线程上按当前配置懒构造。"""
+        try:
+            def _do():
+                self._ocr = None
+                self._ocr_pages_since_init = 0
+                import gc as _gc
+                _gc.collect()
+                if getattr(self, 'use_gpu_ocr', False):
+                    try:
+                        import paddle as _pd
+                        if hasattr(_pd.device, 'cuda'):
+                            _pd.device.cuda.empty_cache()
+                    except Exception:
+                        pass
+                return True
+            st, _ = self._ocr_svc_call(_do, timeout=120)
+            return st == 'ok'
+        except Exception:
+            return False
+
     # ---------- v3.14: GPU运行监控日志 ----------
     # 背景: GPU模式4线程转PDF仍崩溃(access violation), 崩溃点无从定位。
     # 此处建立周期采样: 每10秒记录 进程工作集/GPU显存/活跃线程数/OCR服务队列
@@ -783,7 +844,8 @@ class FileSplitWorker(QThread):
                 f.write(f"TMToolMan GPU运行监控  启动: {datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write(f"解释器: {bits}位  工作线程数: {getattr(self, 'max_workers', '?')}  "
                         f"{'| ' + note if note else ''}\n")
-                f.write("采样: 每10秒 | mem=进程工作集 gpu=显存(paddle分配/保留 或 全卡已用/总量) "
+                f.write("采样: 每10秒 | mem=进程工作集 gpu=全卡显存已用/总量(NVML, v3.27起"
+                        "不再并发调用paddle CUDA API) "
                         "threads=活跃线程 ocr_q=OCR服务队列积压 pages=引擎累计页数 "
                         "gpu_fail=GPU引擎损坏计数 gpu_mode=当前是否GPU推理\n")
                 f.write("=" * 100 + "\n")
@@ -5552,6 +5614,7 @@ class JpgToPdfWorker(QThread):
                                            # v3.16起非永久: 每OCR_REPROBE_DIRS个目录复探)
         self._dirs_since_broken = 0         # v3.16: OCR降级后已处理的目录数(复探计数)
         self._gpu_engine_failures = 0       # v3.14: GPU引擎损坏累计(≥2次全局降级CPU)
+        self._dirs_since_engine_recycle = 0  # v3.27: 距上次按目录数例行重建的目录数
         # v3.14: GPU运行监控日志——4线程GPU模式下周期采样进程内存/GPU显存/线程数/
         # OCR队列深度, 写入输出目录 run_monitor_时间戳.txt, 协助定位崩溃点。
         self._run_mon_path = None           # 监控日志路径(None=不启用)
@@ -5594,6 +5657,19 @@ class JpgToPdfWorker(QThread):
                 self.log_signal.emit("  GPU OCR模式多线程: OCR推理仍串行执行, "
                                      "多线程用于图像解码/PDF写入流水线(有内存峰值与"
                                      "GPU挂死风险, 已由运行监控与自动降级CPU兜底)")
+            if self.use_gpu_ocr:
+                # v3.27: 提前说明驱动级"假崩溃"提示, 避免误判。GPU长时间高负载时
+                # 显卡驱动内部会用「触发异常→自行捕获」的方式做显存探测,
+                # faulthandler(崩溃日志机制, Windows上以向量异常处理器方式工作)
+                # 在异常被驱动接住之前就会先打印一行"Windows fatal exception:
+                # access violation"。这类【单行、其后没有Current thread堆栈】的
+                # 提示≠程序崩溃, 处理仍在正常进行; 真崩溃的特征是提示行后紧跟
+                # 线程堆栈且程序退出。
+                self.log_signal.emit(
+                    "  提示: GPU长时间高负载时, 崩溃日志可能出现成串单行"
+                    "『Windows fatal exception: access violation』(其后无堆栈)——"
+                    "这是显卡驱动内部已自行处理的异常, 处理仍在正常进行, 并非程序"
+                    "崩溃; 若其后出现Current thread堆栈且程序退出才是真崩溃")
 
             # v3.14: GPU模式启动运行监控(每10秒采样内存/显存/线程/队列, 崩溃定位用)
             self._start_run_monitor(self.output_dir,
@@ -5787,6 +5863,7 @@ class JpgToPdfWorker(QThread):
     _ocr_svc_call = FileSplitWorker._ocr_svc_call
     _rebuild_ocr_cpu = FileSplitWorker._rebuild_ocr_cpu
     _svc_empty_cache = FileSplitWorker._svc_empty_cache
+    _svc_recycle_engine = FileSplitWorker._svc_recycle_engine  # v3.27: 按目录数引擎重建
     # v3.14: GPU运行监控(同定义于 FileSplitWorker, 依赖 __init__ 中 _run_mon_* 属性)
     _run_monitor_line = FileSplitWorker._run_monitor_line
     _run_monitor_loop = FileSplitWorker._run_monitor_loop
@@ -5794,6 +5871,7 @@ class JpgToPdfWorker(QThread):
     _stop_run_monitor = FileSplitWorker._stop_run_monitor
     # 类属性别名: 例行重建阈值(方法别名不携带类属性, 须显式同步)
     _OCR_RECYCLE_PAGES = FileSplitWorker._OCR_RECYCLE_PAGES
+    _OCR_ENGINE_RECYCLE_DIRS = FileSplitWorker._OCR_ENGINE_RECYCLE_DIRS
 
     def _ocr_local_available(self):
         """本地OCR是否可用(初始化一次)。"""
@@ -6003,6 +6081,7 @@ class JpgToPdfWorker(QThread):
                 pass
             seg_paths = []
             page_no = 0
+            _chunks_since_cache_flush = 0  # v3.27: 分段边界GPU缓存释放节流计数
             for page_idx, jpg_path in enumerate(jpg_paths):
                 if self.is_stopped:
                     break
@@ -6158,9 +6237,19 @@ class JpgToPdfWorker(QThread):
                     doc.close()
                     seg_paths.append(_seg)
                     doc = fitz.open()  # 重置doc, C++侧旧内存随close释放
-                    # v3.9: 分段重置同时释放GPU缓存——原仅每目录结束释放一次,
-                    # 数百页超长目录在单目录处理期间显存/内存会持续增长。
-                    self._svc_empty_cache()
+                    # v3.27: 分段边界的GPU缓存释放(empty_cache)改为按分段数节流——
+                    # v3.9的「每分段释放」在自适应CHUNK=8(大文件)时等于每8页一次
+                    # 「全量归还驱动→下段再重新申请」, 单个百页文件就要空转十余次
+                    # 释放循环, 十几个文件后驱动侧显存碎片化, 长时间高负载下驱动
+                    # 内部开始用「异常+自捕获」方式探测分配(faulthandler因此成串
+                    # 打印"Windows fatal exception: access violation"单行, 20260928)。
+                    # auto_growth分配器本就会复用自留池内的空闲块——保留池子反而是
+                    # 抗碎片行为。改为每6个分段才真正释放一次; 目录结束处仍无条件
+                    # 释放(见process_single_directory), 200页引擎例行重建也会释放。
+                    _chunks_since_cache_flush += 1
+                    if _chunks_since_cache_flush >= 6:
+                        _chunks_since_cache_flush = 0
+                        self._svc_empty_cache()
 
             # 收尾: 存最后一段
             if seg_paths:
@@ -6278,6 +6367,20 @@ class JpgToPdfWorker(QThread):
             import gc as _gc
             _gc.collect()
             self._svc_empty_cache()
+            # v3.27: GPU模式下每 _OCR_ENGINE_RECYCLE_DIRS 个目录整实例重建引擎
+            # (与200页页数阈值互补——大文件目录凑满200页之前, 驱动侧碎片已累积)。
+            # 实例级销毁重建是唯一能彻底归还驱动侧资源的显存"整理"方式。
+            if getattr(self, 'use_gpu_ocr', False):
+                self._dirs_since_engine_recycle = \
+                    getattr(self, '_dirs_since_engine_recycle', 0) + 1
+                if self._dirs_since_engine_recycle >= self._OCR_ENGINE_RECYCLE_DIRS:
+                    self._dirs_since_engine_recycle = 0
+                    self.log_signal.emit(
+                        f"  OCR引擎例行重建(每{self._OCR_ENGINE_RECYCLE_DIRS}个目录, "
+                        f"整理GPU显存碎片, 下次OCR时数秒重载模型)")
+                    self._run_monitor_line(
+                        f'OCR引擎例行重建(每{self._OCR_ENGINE_RECYCLE_DIRS}目录阈值)')
+                    self._svc_recycle_engine()
         except Exception:
             pass
 
