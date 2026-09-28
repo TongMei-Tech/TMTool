@@ -12,9 +12,18 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.27"
+VERSION = "3.28"
 
 CHANGELOG = [
+    {
+        "version": "3.28",
+        "date": "2026-09-28",
+        "changes": [
+            "用户确认20260928场景中成串『Windows fatal exception: access violation』伴随程序异常退出(系统级崩溃)——修正v3.27『单行提示≠崩溃』的绝对化表述, 崩溃日志备注与GPU模式界面提示改为分级表述: 偶发单行=显卡驱动内部已自行处理的异常探测, 程序未受影响; 成串出现=GPU驱动/显存状态恶化的征兆, 程序可能在此时点前后access violation崩溃退出, 建议停止本批改用CPU模式完成并反馈崩溃日志与run_monitor采样",
+            "新增_drop_ocr_safe()并用于_rebuild_ocr_cpu/_reprobe_ocr: OCR实例丢弃一律优先提交到OCR服务线程内GC析构(=实例创建线程)——此前两处在工作线程直接self._ocr=None, GPU predictor的C++析构(含CUDA上下文teardown)可能在非创建线程执行, 跨线程teardown是access violation的已知诱因; 服务线程不可用/超时(正挂死在旧实例上)时把实例钉入_ocr_orphans孤儿列表永不在其他线程析构(按次泄漏, 每轮运行至多数个实例, 以可承受泄漏换取不崩溃, 进程退出由OS回收)",
+            "待证: 需用户提供完整崩溃日志(成串提示行之后若有Current thread堆栈即崩溃点线程/帧)与该批次输出目录的run_monitor_时间戳.txt(崩溃前显存/内存趋势)进一步精确定位; 若GPU路径仍崩, 计划实施OCR子进程隔离(推理崩溃只损失子进程, 父进程自动重启或降级CPU, 不再连带整个程序退出)",
+        ],
+    },
     {
         "version": "3.27",
         "date": "2026-09-28",
@@ -255,20 +264,24 @@ def _setup_crash_log():
         _fh = open(crash_path, 'a', encoding='utf-8')
         faulthandler.enable(file=_fh, all_threads=True)
         _setup_crash_log._fh = _fh
-        # v3.27: 说明性备注。faulthandler在Windows上以向量异常处理器方式工作,
-        # 显卡驱动(NVIDIA CUDA/NVML)内部「触发异常→自行捕获」的显存探测也会被它
-        # 先看到并打印一行"Windows fatal exception: access violation"。这类
-        # 【单行、其后没有"Current thread"堆栈】的记录=驱动内部已处理的异常,
-        # 程序并未崩溃(GPU长时间高负载时常见, 成串出现); 真崩溃=提示行后紧跟
-        # 线程堆栈且程序退出。写入备注避免用户(及排查者)误判。
+        # v3.27/v3.28: 说明性备注(分级表述)。faulthandler在Windows上以向量异常
+        # 处理器方式工作, 显卡驱动(NVIDIA CUDA/NVML)内部「触发异常→自行捕获」的
+        # 显存探测也会被它先看到并打印一行"Windows fatal exception: ..."。
+        # 【偶发单行】=驱动内部已处理的异常, 程序未受影响;
+        # 【成串出现】=GPU驱动/显存状态恶化的征兆, 程序可能在此时点前后
+        # access violation崩溃退出(20260928实测: 单线程GPU模式十几个大PDF后
+        # 成串出现并伴随程序异常退出)——出现成串记录时建议停止本批,
+        # 改用CPU模式完成后再反馈日志给开发者。
         _fh.write(
             f"\n{'=' * 80}\n程序启动 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            "说明: 本文件由faulthandler崩溃日志机制写入。Windows下显卡驱动内部会以"
-            "「触发异常→自行捕获」方式做显存探测, faulthandler会在其被驱动接住前"
-            "先打印一行『Windows fatal exception: access violation』——这类"
-            "【单行、其后无Current thread堆栈】的记录不代表程序崩溃;\n"
-            "真崩溃的特征: 提示行后紧跟线程堆栈(Current thread ... most recent call "
-            "first)且程序退出。\n")
+            "说明: 本文件由faulthandler崩溃日志机制写入。『Windows fatal exception: "
+            "access violation』类记录请分级看待:\n"
+            "  偶发单行(其后无Current thread堆栈)=显卡驱动内部已自行处理的异常探测,"
+            "程序未受影响;\n"
+            "  成串出现=GPU驱动/显存状态恶化的征兆, 程序可能在此时点前后崩溃退出"
+            "(若其后还有Current thread堆栈, 堆栈即崩溃点)。\n"
+            "出现成串记录时建议停止本批、改用CPU模式完成, 并将本文件与输出目录下"
+            "run_monitor_时间戳.txt一并反馈。\n")
         _fh.flush()
     except Exception:
         pass
@@ -715,7 +728,7 @@ class FileSplitWorker(QThread):
             self.log_signal.emit("  → OCR引擎切换为CPU重建(丢弃挂死的GPU实例)")
             self._run_monitor_line('GPU→CPU重建(推理挂死或引擎连续损坏, 后续全部CPU推理)')
             self.use_gpu_ocr = False
-            self._ocr = None
+            self._drop_ocr_safe()   # v3.28: 服务线程内析构/钉孤儿, 防跨线程CUDA teardown
             # 全局paddle place已设为GPU, 强制切回CPU(失败不影响重建——
             # 新实例构造时 use_gpu=False 会以CPU place创建)
             try:
@@ -783,6 +796,35 @@ class FileSplitWorker(QThread):
             return st == 'ok'
         except Exception:
             return False
+
+    def _drop_ocr_safe(self):
+        """v3.28: 安全丢弃当前OCR实例(仅从工作线程调用)。
+        背景(20260928崩溃场景): GPU predictor的C++析构含CUDA上下文teardown,
+        若实例在【非创建线程】被GC析构(此前 _rebuild_ocr_cpu/_reprobe_ocr 在
+        工作线程直接 self._ocr=None), 跨线程teardown本身就是access violation
+        的已知诱因。
+        对策: 把丢弃+GC提交到OCR服务线程执行(实例的创建线程, 析构线程正确);
+        服务线程不可用/超时(正挂死在旧实例上)时, 把实例钉入孤儿列表永不在
+        其他线程析构——按次泄漏(每轮运行至多数个实例, 数百MB级显存),
+        以可承受的泄漏换取不崩溃, 进程退出时由OS统一回收。
+        ★ 不得在本方法内再经 _ocr_svc_call 调用自身路径(服务线程上会自等待)。"""
+        old = self._ocr
+        self._ocr = None
+        self._ocr_pages_since_init = 0
+        if old is None:
+            return
+
+        def _do():
+            import gc as _gc
+            _gc.collect()   # old引用计数归零后, 析构发生在服务线程(创建线程)
+            return True
+        st, _ = self._ocr_svc_call(_do, timeout=10)
+        if st != 'ok':
+            if not hasattr(self, '_ocr_orphans'):
+                self._ocr_orphans = []
+            self._ocr_orphans.append(old)   # 钉住: 永不在当前线程析构
+            self._run_monitor_line(
+                'OCR旧实例无法在服务线程析构, 已钉入孤儿列表(防跨线程CUDA teardown崩溃)')
 
     # ---------- v3.14: GPU运行监控日志 ----------
     # 背景: GPU模式4线程转PDF仍崩溃(access violation), 崩溃点无从定位。
@@ -5658,18 +5700,15 @@ class JpgToPdfWorker(QThread):
                                      "多线程用于图像解码/PDF写入流水线(有内存峰值与"
                                      "GPU挂死风险, 已由运行监控与自动降级CPU兜底)")
             if self.use_gpu_ocr:
-                # v3.27: 提前说明驱动级"假崩溃"提示, 避免误判。GPU长时间高负载时
-                # 显卡驱动内部会用「触发异常→自行捕获」的方式做显存探测,
-                # faulthandler(崩溃日志机制, Windows上以向量异常处理器方式工作)
-                # 在异常被驱动接住之前就会先打印一行"Windows fatal exception:
-                # access violation"。这类【单行、其后没有Current thread堆栈】的
-                # 提示≠程序崩溃, 处理仍在正常进行; 真崩溃的特征是提示行后紧跟
-                # 线程堆栈且程序退出。
+                # v3.27/v3.28: 分级说明(修正v3.27"并非崩溃"的绝对化表述——
+                # 20260928实测成串出现时可伴随程序access violation崩溃退出)。
+                # 偶发单行=驱动内部已处理异常; 成串出现=GPU驱动/显存状态恶化征兆,
+                # 建议停止本批改用CPU模式完成。
                 self.log_signal.emit(
-                    "  提示: GPU长时间高负载时, 崩溃日志可能出现成串单行"
-                    "『Windows fatal exception: access violation』(其后无堆栈)——"
-                    "这是显卡驱动内部已自行处理的异常, 处理仍在正常进行, 并非程序"
-                    "崩溃; 若其后出现Current thread堆栈且程序退出才是真崩溃")
+                    "  提示: 崩溃日志中『Windows fatal exception: access violation』"
+                    "类记录请分级看待——偶发单行是显卡驱动内部已自行处理的异常, "
+                    "处理仍正常; 若【成串出现】说明GPU驱动/显存状态正在恶化, "
+                    "程序可能在随后崩溃退出, 建议停止本批并改用CPU模式完成")
 
             # v3.14: GPU模式启动运行监控(每10秒采样内存/显存/线程/队列, 崩溃定位用)
             self._start_run_monitor(self.output_dir,
@@ -5864,6 +5903,7 @@ class JpgToPdfWorker(QThread):
     _rebuild_ocr_cpu = FileSplitWorker._rebuild_ocr_cpu
     _svc_empty_cache = FileSplitWorker._svc_empty_cache
     _svc_recycle_engine = FileSplitWorker._svc_recycle_engine  # v3.27: 按目录数引擎重建
+    _drop_ocr_safe = FileSplitWorker._drop_ocr_safe  # v3.28: 跨线程析构安全丢弃
     # v3.14: GPU运行监控(同定义于 FileSplitWorker, 依赖 __init__ 中 _run_mon_* 属性)
     _run_monitor_line = FileSplitWorker._run_monitor_line
     _run_monitor_loop = FileSplitWorker._run_monitor_loop
@@ -5909,8 +5949,8 @@ class JpgToPdfWorker(QThread):
         _probe = os.path.join(output_dir, '_ocr_probe.png')
         try:
             self._make_probe_image(_probe)
-            self._ocr = None              # 丢弃旧实例(降级时可能已损坏)
-            self._ocr_pages_since_init = 0
+            self._drop_ocr_safe()   # v3.28: 丢弃旧实例(降级时可能已损坏)——
+                                    # 服务线程内析构/钉孤儿, 防跨线程CUDA teardown
             _pa = self._preload_img_arr(_probe)   # v3.26: 探测也预解码
             st, _res = self._ocr_svc_call(
                 lambda: self._ocr_page(_probe, None, lambda s: None,
