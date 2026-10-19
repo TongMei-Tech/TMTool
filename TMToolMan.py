@@ -12,9 +12,30 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.28"
+VERSION = "3.31"
 
 CHANGELOG = [
+    {
+        "version": "3.31",
+        "date": "2026-10-19",
+        "changes": [
+            "替换目录设置窗口新增预览图缩放：①右侧JPG预览改为QGraphicsView，鼠标滚轮向上放大/向下缩小(以光标位置为缩放中心，范围5%~2000%)，按住左键可拖动平移查看局部；②预览区下方实时显示当前缩放百分比，并提供「适应窗口」按钮，切换文件或点击该按钮时自动恢复适应窗口；③切换子目录/文件时自动重置缩放，避免沿用上一张图的倍率；④预览解码上限4096px，放大后仍保留足够细节且控制内存占用",
+        ],
+    },
+    {
+        "version": "3.30",
+        "date": "2026-10-19",
+        "changes": [
+            "文件批量替换改为按目标子目录分别设定起止范围(替代v3.29的单个起始文件选择)：①「起始文件名」改为「替换目录列表」只读多行框，点击框或「设置替换目录」按钮打开设置窗口；②窗口左侧列出目标目录下包含JPG的子目录(绿色✓=已设置完整，红色⚠加粗=未设置完整)，右侧显示所选子目录的全部JPG文件列表与大图预览，顶部实时显示当前子目录的起始/终止目录文件与「已设置 X/Y 个目录」；③提供「设为起始目录文件」「设为终止目录文件」按钮，终止文件不得小于起始文件(可相同)，起始文件必须为「基础名-四位编号」；④点击「返回」校验每个子目录的起止设置，不完整时标明问题项并阻止关闭；⑤设置按目标目录(绝对路径归一化)存入程序目录 SQLite 数据库 file_replace_ranges.db(表 replace_ranges)，下次选择同一目录自动载入；⑥主程序按每个子目录的起止范围替换，起始文件编号须与JPG源目录同名基础名文件编号严格对应，编号≥起始编号的源文件数不足时该子目录报错、不替换并记录日志，多余源文件忽略；⑦设置窗口根据JPG源目录提前提示源文件缺失/不足(不阻断保存，处理时仍校验)",
+        ],
+    },
+    {
+        "version": "3.29",
+        "date": "2026-10-19",
+        "changes": [
+            "文件批量替换的「起始文件名」改为预览选择：点击输入框或「预览选择」按钮打开新窗口，以预览方式显示JPG源目录(含子目录)下的所有JPG文件，支持左右箭头按钮/键盘左右键(按住可连续翻页)/Home·End首尾/PageUp·PageDown跳转10页；找到起始页后点击「确认选择」，自动回填该页文件名并解析末尾四位编号，按原有规则交给主程序处理；输入框改为只读，避免手输编号；JPG源目录变更时自动清空已选起始文件，防止沿用旧目录的选择",
+        ],
+    },
     {
         "version": "3.28",
         "date": "2026-09-28",
@@ -212,13 +233,16 @@ import shutil
 # PyQt5 中信号为 pyqtSignal，通过别名统一为 Signal，保持下游写法不变。
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
-                             QFileDialog, QTextEdit, QSpinBox, QComboBox,
+                             QFileDialog, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox,
                              QFormLayout, QGroupBox, QMessageBox, QStackedWidget, QCheckBox,
-                             QProgressBar, QDialog, QListWidget, QTableWidget,
+                             QProgressBar, QDialog, QListWidget, QListWidgetItem, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView,
-                             QRadioButton)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QRegularExpression
-from PyQt5.QtGui import QFont, QRegularExpressionValidator
+                             QRadioButton, QSplitter, QGraphicsView, QGraphicsScene,
+                             QGraphicsPixmapItem)
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal as Signal, QRegularExpression,
+                         QSize, QEvent, QTimer)
+from PyQt5.QtGui import (QFont, QRegularExpressionValidator, QImageReader,
+                         QPixmap, QColor, QPainter)
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # 注：cv2 与 numpy 已改为在 AutoPagingWorker.add_number_to_image 中延迟导入，
@@ -7204,35 +7228,78 @@ class PdfToOfdPage(FunctionPage):
             QMessageBox.warning(self, "提示", message)
 
 
+# ==================== 文件批量替换: 范围与文件工具(v3.30) ====================
+# 起始/终止目录文件基于目标子目录内的JPG文件；起始文件必须为「基础名-四位编号」，
+# 其编号与JPG源目录中的同名基础名文件编号严格对应。
+_RANGE_NUM_RE = re.compile(r'^(.+)-(\d{4})$')
+
+
+def _file_trailing_num(fname):
+    """文件名(不含扩展名)末尾1-4位数字编号; 无数字返回None。"""
+    m = re.search(r'(\d{1,4})$', os.path.splitext(fname)[0])
+    return int(m.group(1)) if m else None
+
+
+def _range_start_num(fname):
+    """严格解析起始文件编号(基础名-四位编号); 不符合返回None。"""
+    m = _RANGE_NUM_RE.match(os.path.splitext(fname)[0])
+    return int(m.group(2)) if m else None
+
+
+def _jpg_range_files(dir_path):
+    """目录下 jpg/jpeg 文件，按末尾编号升序(无编号的按名称排最后)。"""
+    files = [f for f in os.listdir(dir_path)
+             if f.lower().endswith(('.jpg', '.jpeg'))
+             and os.path.isfile(os.path.join(dir_path, f))]
+
+    def key(f):
+        n = _file_trailing_num(f)
+        return (0, n, f.lower()) if n is not None else (1, 0, f.lower())
+
+    files.sort(key=key)
+    return files
+
+
+def _jpg_subdirs(target_dir):
+    """目标目录下包含 jpg/jpeg 文件的直接子目录名(按名称升序)。"""
+    out = []
+    try:
+        for name in sorted(os.listdir(target_dir), key=str.lower):
+            p = os.path.join(target_dir, name)
+            if os.path.isdir(p) and _jpg_range_files(p):
+                out.append(name)
+    except Exception:
+        pass
+    return out
+# ========================================================================
+
+
 class FileBatchReplaceWorker(QThread):
-    """文件批量替换后台处理线程 - 将输出的JPG批量替换目标目录中的图片
+    """文件批量替换后台处理线程(v3.30) - 按目标子目录的起始/终止文件范围替换。
 
     规则:
-    1. 扫描 JPG 目录(含子目录)中的 jpg 文件，文件名去除最后四位数字编号和最后一个
-       "-"后得到基础名，与目标目录下的同名子目录匹配；
-    2. 仅处理编号 >= 起始编号的文件:
-       - 只需复制1个 → 直接覆盖目标同名文件；
-       - 复制多个(N个) → 源文件从最小编号起连续占位(最小编号处覆盖目标同名文件，
-         源编号不连续时也按升序归位)；目标子目录中编号 > 最小编号的现有文件
-         从 最小编号+N 起按升序重新编号预留空位(从编号最大的文件开始改名避免重复)，
-         再将新文件复制到目标目录。
-    3. 每个目标子目录替换完成后, 在该子目录下生成/更新 Directory.txt:
-       记录替换后的文件名清单(不含扩展名, 每行一个), 供分件功能
-       读取目录页与后续文件偏移量。
+    1. 扫描JPG目录(含子目录)，按文件名基础名(去掉"-四位编号")分组；
+       基础名与目标目录下的子目录名同名(不区分大小写)即匹配。
+    2. 用户为每个目标子目录设置起始/终止目录文件；替换范围 = 该子目录中
+       从起始文件到终止文件(含)之间的文件。
+    3. 起始文件的编号必须与JPG源目录中同名基础名的文件编号严格对应；
+       源目录中编号 >= 起始编号的可用文件数必须 >= 范围内目标文件数，
+       否则该子目录报错、不替换并记录日志。
+    4. 源文件按编号升序依次覆盖范围内目标文件(保留目标文件名)，
+       多余源文件忽略；每个子目录替换后更新 Directory.txt。
     """
     log_signal = Signal(str)
     progress_signal = Signal(int, int)
     finished_signal = Signal(bool, str)
 
-    _NUM_RE = re.compile(r'^(.+)-(\d{4})$')  # 基础名 + "-" + 四位数字编号
-
-    def __init__(self, jpg_dir, target_dir, start_num, parent=None):
+    def __init__(self, jpg_dir, target_dir, ranges, parent=None):
         super().__init__(parent)
         self.jpg_dir = jpg_dir
         self.target_dir = target_dir
-        self.start_num = start_num
+        self.ranges = dict(ranges or {})  # {子目录: (起始文件名, 终止文件名)}
         self.is_stopped = False
         self._log_file = None  # 当前处理日志文件句柄
+
 
     def stop(self):
         self.is_stopped = True
@@ -7251,13 +7318,14 @@ class FileBatchReplaceWorker(QThread):
     def _parse_name(cls, fname):
         """文件名去除扩展名、最后一个"-"及末尾四位数字编号，返回 (基础名, 编号)；不匹配返回 None"""
         stem = os.path.splitext(fname)[0]
-        m = cls._NUM_RE.match(stem)
+        m = _RANGE_NUM_RE.match(stem)
         if not m:
             return None
         return m.group(1), int(m.group(2))
 
     def _collect_sources(self):
-        """扫描JPG目录(含子目录)，按基础名分组，返回 ({基础名: [(编号, 完整路径), ...]}, 跳过数)"""
+        """扫描JPG目录(含子目录)，按基础名(不区分大小写)分组。
+        返回 ({基础名小写: [(编号, 完整路径), ...]}, 跳过数)。"""
         groups = {}
         skipped = 0
         for root, _dirs, files in os.walk(self.jpg_dir):
@@ -7269,83 +7337,72 @@ class FileBatchReplaceWorker(QThread):
                     skipped += 1
                     continue
                 base, num = parsed
-                if num < self.start_num:
-                    continue
-                groups.setdefault(base, []).append((num, os.path.join(root, f)))
-        for base in groups:
-            groups[base].sort(key=lambda t: t[0])
+                groups.setdefault(base.lower(), []).append(
+                    (num, os.path.join(root, f)))
+        for key in groups:
+            groups[key].sort(key=lambda t: t[0])
         return groups, skipped
 
-    def _replace_group(self, base, new_files):
-        """处理单个基础名分组，返回 (成功复制数, 失败数)"""
-        target_sub = os.path.join(self.target_dir, base)
-        if not os.path.isdir(target_sub):
-            # 目标目录无同名子目录 → 新建后直接复制(无需改名)
-            os.makedirs(target_sub, exist_ok=True)
-            self._wlog(f"  目标无同名子目录，新建: {base}")
+    def _replace_range(self, subdir, start_file, end_file, source_group):
+        """按起始/终止文件替换一个目标子目录。
 
-        n = len(new_files)
-        nums_new = {num for num, _ in new_files}
-        min_new = min(nums_new)
+        source_group: [(源编号, 源路径), ...] 已按编号升序。
+        返回 (成功覆盖数, 错误信息)；错误信息为空表示全部成功。
+        源文件不足/起始编号不对应时在复制前返回，不修改目标文件。
+        """
+        sub_path = os.path.join(self.target_dir, subdir)
+        if not os.path.isdir(sub_path):
+            return 0, f"目标子目录不存在: {sub_path}"
+        try:
+            target_files = _jpg_range_files(sub_path)
+        except Exception as e:
+            return 0, f"读取目标子目录失败: {e}"
+        if start_file not in target_files or end_file not in target_files:
+            return 0, (f"起始/终止文件不存在: {start_file} / {end_file}")
+        s_idx = target_files.index(start_file)
+        e_idx = target_files.index(end_file)
+        if s_idx > e_idx:
+            return 0, "终止文件小于起始文件"
+        start_num = _range_start_num(start_file)
+        if start_num is None:
+            return 0, f"起始文件名不含四位编号: {start_file}"
 
-        # 目标子目录现有文件(任意扩展名)中符合「基础名-四位编号」的文件
-        existing = []  # [(编号, 文件名)]
-        pat = re.compile(r'^' + re.escape(base) + r'-(\d{4})\.[^.]+$')
-        for f in os.listdir(target_sub):
-            if not os.path.isfile(os.path.join(target_sub, f)):
-                continue
-            m = pat.match(f)
-            if m:
-                existing.append((int(m.group(1)), f))
-
-        if n > 1:
-            # 源文件从 min_new 起连续占位(占 min_new..min_new+N-1)；目标现有编号 > min_new 的
-            # 文件从 min_new+N 起按升序重新编号。例: 源 0002/0003 替换时，目标 0002 被覆盖，
-            # 目标原 0003 改名 0004、后续依次类推，替换后编号连续无空洞。
-            # (旧逻辑统一平移 N-1，源编号不连续时改名与待复制编号冲突会跳过整组，已废弃)
-            fill_start = min_new + n
-            push_asc = sorted([t for t in existing if t[0] > min_new],
-                              key=lambda t: t[0])
-            num_map = {num: fill_start + i for i, (num, _f) in enumerate(push_asc)}
-            # 从编号最大的文件开始改名：目标编号若与未改名文件重名，其原编号必更大、
-            # 已先行改走，不会发生中间覆盖；编号不变的文件跳过。
-            for num, fname in sorted(push_asc, reverse=True):
-                new_num = num_map[num]
-                if new_num == num:
-                    continue
-                _stem, ext = os.path.splitext(fname)
-                new_name = f"{base}-{new_num:04d}{ext}"
-                os.rename(os.path.join(target_sub, fname),
-                          os.path.join(target_sub, new_name))
-                self._wlog(f"  改名: {fname} → {new_name}")
-
-        # 改名完成后复制新文件；仍保留在原编号上的目标同名文件才会被覆盖
-        overwrite_nums = set()
-        if n == 1:
-            if any(e_num == new_files[0][0] for e_num, _ in existing):
-                overwrite_nums.add(new_files[0][0])
-        elif any(e_num == min_new for e_num, _ in existing):
-            overwrite_nums.add(min_new)
+        range_files = target_files[s_idx:e_idx + 1]
+        need = len(range_files)
+        if not source_group:
+            return 0, f"JPG源目录中未找到基础名为「{subdir}」的文件"
+        # 起始编号严格对应: 源目录必须存在与起始文件同编号的文件
+        if not any(num == start_num for num, _p in source_group):
+            return 0, (f"JPG源目录缺少编号 {start_num:04d} 的文件，"
+                       f"起始编号须严格对应")
+        candidates = [(num, p) for num, p in source_group if num >= start_num]
+        if len(candidates) < need:
+            return 0, (f"JPG源文件不足: 范围需 {need} 个，源目录仅有 "
+                       f"{len(candidates)} 个(编号≥{start_num:04d})")
+        use = candidates[:need]
+        extra = len(candidates) - need
+        if extra > 0:
+            self._wlog(f"  源目录另有多余 {extra} 个文件(编号≥{start_num:04d})，已忽略")
 
         ok = 0
-        target_stems = []
-        for i, (num, src_path) in enumerate(new_files):
-            # 复制N个时按占位编号落盘(源编号不连续时自动归位)；单个时保持源编号
-            target_num = num if n == 1 else min_new + i
-            ext = os.path.splitext(src_path)[1]
-            target_name = f"{base}-{target_num:04d}{ext}"
-            shutil.copy2(src_path, os.path.join(target_sub, target_name))
-            target_stems.append(f"{base}-{target_num:04d}")
-            if target_num != num:
-                self._wlog(f"  复制改名: {os.path.basename(src_path)} → {target_name}")
-            else:
-                act = "覆盖" if num in overwrite_nums else "复制"
-                self._wlog(f"  {act}: {target_name}")
-            ok += 1
+        stems = []
+        for target_name, (src_num, src_path) in zip(range_files, use):
+            try:
+                # 保留目标文件名(含扩展名)覆盖，确保目标目录编号不变
+                shutil.copy2(src_path, os.path.join(sub_path, target_name))
+                stems.append(os.path.splitext(target_name)[0])
+                ok += 1
+                if src_num == start_num and ok == 1:
+                    self._wlog(f"  起始编号严格对应: {src_num:04d} → {target_name}")
+                else:
+                    self._wlog(f"  覆盖: {target_name} ← {os.path.basename(src_path)}")
+            except Exception as e:
+                self._wlog(f"  × 覆盖失败: {target_name}: {e}")
         if ok:
-            # 生成 Directory.txt: 记录替换后在目标目录中的文件名清单(不含扩展名), 供分件读取偏移量
-            self._write_directory_txt(target_sub, target_stems)
-        return ok, 0
+            self._write_directory_txt(sub_path, stems)
+        if ok < need:
+            return ok, f"仅成功替换 {ok}/{need} 个文件"
+        return ok, ''
 
     def _write_directory_txt(self, target_sub, new_stems):
         """在目标子目录下生成/更新 Directory.txt: 记录替换后的文件名清单
@@ -7392,40 +7449,50 @@ class FileBatchReplaceWorker(QThread):
             self._wlog(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             self._wlog(f"JPG源目录: {self.jpg_dir}")
             self._wlog(f"目标目录: {self.target_dir}")
-            self._wlog(f"起始编号: {self.start_num:04d} (仅处理编号 >= 起始编号的文件)")
+            self._wlog(f"替换目录数: {len(self.ranges)}")
+            for name in sorted(self.ranges, key=str.lower):
+                start, end = self.ranges[name]
+                self._wlog(f"  {name}: {start} → {end}")
             self._wlog("=" * 70)
+
+            if not self.ranges:
+                self._wlog("没有设置任何替换目录")
+                logf.close()
+                logf = None
+                self._log_file = None
+                self.finished_signal.emit(False, "没有设置任何替换目录")
+                return
 
             groups, skipped = self._collect_sources()
             if skipped:
                 self._wlog(f"跳过 {skipped} 个文件名不含「-四位数字编号」的文件")
-            if not groups:
-                self._wlog("未找到符合替换条件的JPG文件")
-                logf.close()
-                logf = None
-                self._log_file = None
-                self.finished_signal.emit(False, f"未找到符合替换条件的JPG文件(起始编号 {self.start_num:04d})")
-                return
 
-            self._wlog(f"共 {len(groups)} 个基础名分组待替换")
-            total = len(groups)
+            total = len(self.ranges)
             done = 0
             total_ok = 0
-            total_fail = 0
-            for i, base in enumerate(sorted(groups), 1):
+            failed_dirs = 0
+            for i, subdir in enumerate(sorted(self.ranges, key=str.lower), 1):
                 if self.is_stopped:
                     self._wlog("用户停止处理")
                     break
-                new_files = groups[base]
+                start_file, end_file = self.ranges[subdir]
                 self._wlog("")
-                self._wlog(f"[{i}/{total}] {base} (待复制 {len(new_files)} 个文件)")
+                self._wlog(f"[{i}/{total}] {subdir}")
+                self._wlog(f"  范围: {start_file} → {end_file}")
                 try:
-                    ok, fail = self._replace_group(base, new_files)
+                    ok, err = self._replace_range(
+                        subdir, start_file, end_file, groups.get(subdir.lower()))
                     total_ok += ok
-                    total_fail += fail
-                    self._wlog(f"  结果: 复制 {ok} 个文件" + (f"，失败 {fail} 个" if fail else ""))
+                    if err:
+                        failed_dirs += 1
+                        self._wlog(f"  [错误] {err}")
+                        self._wlog("  结果: 该子目录未完成替换"
+                                   + (f"(已替换 {ok} 个)" if ok else ""))
+                    else:
+                        self._wlog(f"  结果: 替换 {ok} 个文件")
                 except Exception as e:
                     import traceback
-                    total_fail += len(new_files)
+                    failed_dirs += 1
                     self._wlog(f"  [异常] {e}")
                     self._wlog(traceback.format_exc())
                 done += 1
@@ -7434,16 +7501,23 @@ class FileBatchReplaceWorker(QThread):
             self._wlog("")
             self._wlog("=" * 70)
             self._wlog(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            self._wlog(f"总计: 处理 {done}/{total} 组，复制 {total_ok} 个文件，失败 {total_fail} 个")
+            self._wlog(f"总计: 处理 {done}/{total} 个目录，替换 {total_ok} 个文件，"
+                       f"失败 {failed_dirs} 个目录")
             if self.is_stopped:
                 self._wlog("注意: 处理被用户中途停止")
             logf.close()
             logf = None
             self._log_file = None
 
-            msg = (f"替换完成！处理 {done}/{total} 组，复制 {total_ok} 个文件。\n"
-                   f"日志: {os.path.basename(log_path)}")
-            self.finished_signal.emit(not self.is_stopped, msg)
+            if self.is_stopped:
+                msg = (f"已停止！处理 {done}/{total} 个目录，替换 {total_ok} 个文件"
+                       + (f"，{failed_dirs} 个目录失败(详见日志)" if failed_dirs else "")
+                       + f"。\n日志: {os.path.basename(log_path)}")
+            else:
+                msg = (f"替换完成！处理 {done}/{total} 个目录，替换 {total_ok} 个文件"
+                       + (f"，{failed_dirs} 个目录失败(详见日志)" if failed_dirs else "")
+                       + f"。\n日志: {os.path.basename(log_path)}")
+            self.finished_signal.emit(not self.is_stopped and failed_dirs == 0, msg)
         except Exception as e:
             import traceback
             self.log_signal.emit(traceback.format_exc())
@@ -7456,13 +7530,750 @@ class FileBatchReplaceWorker(QThread):
             self.finished_signal.emit(False, f"处理出错: {e}")
 
 
+class ReplaceRangeStore:
+    """替换目录范围设置的SQLite持久化(v3.30)。
+
+    按目标目录(绝对路径归一化)保存每个子目录的起始/终止目录文件名，
+    数据库文件位于程序目录 file_replace_ranges.db。
+    """
+
+    def __init__(self):
+        if getattr(sys, 'frozen', False):
+            app_dir = os.path.dirname(sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+        self.db_path = os.path.join(app_dir, 'file_replace_ranges.db')
+
+    @staticmethod
+    def _key(target_dir):
+        return os.path.normcase(os.path.abspath(target_dir))
+
+    def _connect(self):
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS replace_ranges ("
+            "target_dir TEXT NOT NULL, subdir TEXT NOT NULL, "
+            "start_file TEXT NOT NULL, end_file TEXT NOT NULL, "
+            "updated_at TEXT NOT NULL, "
+            "PRIMARY KEY (target_dir, subdir))")
+        conn.commit()
+        return conn
+
+    def load(self, target_dir):
+        """读取目标目录已保存的设置，返回 {子目录: (起始文件, 终止文件)}。"""
+        conn = None
+        try:
+            conn = self._connect()
+            rows = conn.execute(
+                "SELECT subdir, start_file, end_file FROM replace_ranges "
+                "WHERE target_dir=?", (self._key(target_dir),)).fetchall()
+            return {r[0]: (r[1], r[2]) for r in rows}
+        except Exception:
+            return {}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def save(self, target_dir, ranges):
+        """整目录覆盖保存，返回 (ok, 错误信息)。"""
+        conn = None
+        try:
+            conn = self._connect()
+            key = self._key(target_dir)
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            rows = [(key, sub, s, e, ts)
+                    for sub, (s, e) in sorted(ranges.items(), key=lambda kv: kv[0].lower())]
+            with conn:
+                conn.execute("DELETE FROM replace_ranges WHERE target_dir=?", (key,))
+                conn.executemany(
+                    "INSERT OR REPLACE INTO replace_ranges "
+                    "(target_dir, subdir, start_file, end_file, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)", rows)
+            return True, ''
+        except Exception as e:
+            return False, str(e)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+class ClickableReadOnlyPlainTextEdit(QPlainTextEdit):
+    """只读多行输入框: 鼠标左键点击时发出 clicked 信号(用于点击即打开替换目录设置窗口)。"""
+
+    clicked = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class ZoomableImageView(QGraphicsView):
+    """JPG预览控件(v3.31): 鼠标滚轮以光标为中心缩放，按住左键拖动平移。"""
+
+    zoom_changed = Signal(float)
+    ZOOM_MIN = 0.05
+    ZOOM_MAX = 20.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pix_item = QGraphicsPixmapItem()
+        self._pix_item.setTransformationMode(Qt.SmoothTransformation)
+        self._pix_item.setVisible(False)
+        self._scene.addItem(self._pix_item)
+        self._msg_item = self._scene.addText('')
+        self._msg_item.setDefaultTextColor(QColor('#7f8c8d'))
+        self._msg_item.setVisible(False)
+        self._zoom = 1.0
+        self._fit_mode = True
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setFocusPolicy(Qt.NoFocus)  # 不抢键盘焦点，保留对话框←/→切换文件
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setAlignment(Qt.AlignCenter)
+        self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        self.setStyleSheet(
+            "QGraphicsView { background: #ffffff; border: 1px solid #bdc3c7;"
+            " border-radius: 3px; }")
+        self.show_message('未选择文件')
+
+    def has_image(self):
+        return self._pix_item.isVisible() and not self._pix_item.pixmap().isNull()
+
+    def current_zoom(self):
+        return self._zoom if self.has_image() else 0.0
+
+    def set_image(self, path):
+        """加载图片并按窗口大小自适应显示; 解码上限4096px，保证放大清晰度。"""
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid() and max(size.width(), size.height()) > 4096:
+            ratio = 4096.0 / max(size.width(), size.height())
+            reader.setScaledSize(QSize(max(1, int(size.width() * ratio)),
+                                       max(1, int(size.height() * ratio))))
+        image = reader.read()
+        if image.isNull():
+            self.show_message("无法预览该文件\n" + reader.errorString())
+            return False
+        self._msg_item.setVisible(False)
+        self._pix_item.setPixmap(QPixmap.fromImage(image))
+        self._pix_item.setVisible(True)
+        self._scene.setSceneRect(self._pix_item.boundingRect())
+        self.reset_zoom()
+        return True
+
+    def show_message(self, text):
+        """无图/加载失败时在预览区居中显示提示文字。"""
+        self._pix_item.setVisible(False)
+        self._msg_item.setPlainText(text)
+        self._msg_item.setVisible(True)
+        self._scene.setSceneRect(self._msg_item.boundingRect())
+        self._fit_mode = True
+        self.fitInView(self._msg_item, Qt.KeepAspectRatio)
+        self._zoom = 0.0
+        self.zoom_changed.emit(0.0)
+
+    def reset_zoom(self):
+        """恢复为适应窗口大小。"""
+        if not self.has_image():
+            return
+        self._fit_mode = True
+        self.fitInView(self._pix_item, Qt.KeepAspectRatio)
+        self._zoom = self.transform().m11()
+        self.zoom_changed.emit(self._zoom)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._fit_mode:
+            return
+        if self.has_image():
+            self.fitInView(self._pix_item, Qt.KeepAspectRatio)
+            self._zoom = self.transform().m11()
+            self.zoom_changed.emit(self._zoom)
+        elif self._msg_item.isVisible():
+            self.fitInView(self._msg_item, Qt.KeepAspectRatio)
+
+    def wheelEvent(self, event):
+        """滚轮缩放: 向上放大，向下缩小，以光标位置为缩放中心。"""
+        if not self.has_image():
+            event.accept()
+            return
+        delta = event.angleDelta().y()
+        if not delta:
+            event.accept()
+            return
+        factor = 1.15 if delta > 0 else 1.0 / 1.15
+        target = self._zoom * factor
+        if target < self.ZOOM_MIN or target > self.ZOOM_MAX:
+            event.accept()
+            return
+        self._fit_mode = False
+        self._zoom = target
+        self.scale(factor, factor)
+        self.zoom_changed.emit(self._zoom)
+        event.accept()
+
+
+class ReplaceRangeDialog(QDialog):
+    """文件批量替换-替换目录列表设置对话框(v3.30)。
+
+    左侧列出目标目录下包含JPG文件的子目录(已设置=绿色✓，未设置=红色⚠)，
+    右侧显示所选子目录全部JPG文件的预览(支持滚轮缩放/拖拽平移，v3.31)；顶部显示当前子目录的起始/终止目录文件
+    与整体进度。点击「设为起始目录文件」/「设为终止目录文件」设定范围，点击「返回」
+    校验完整性并保存到本地SQLite数据库。
+    """
+
+    def __init__(self, target_dir, ranges=None, jpg_dir='', parent=None):
+        super().__init__(parent)
+        self.target_dir = target_dir
+        self.jpg_dir = jpg_dir or ''
+        self.store = ReplaceRangeStore()
+        self.subdirs = _jpg_subdirs(target_dir)
+        self._files_cache = {}
+        self._src_groups = None
+        self.ranges = {}          # {子目录: [起始文件, 终止文件]}
+        self.current = ''
+        self.current_file = ''
+
+        self._load_initial(ranges)
+        self._build_ui()
+        self._update_dir_items()
+        if self.subdirs:
+            self.dir_list.setCurrentRow(0)  # 触发 on_subdir_changed
+        else:
+            self._update_header()
+
+    def _load_initial(self, ranges):
+        """载入已保存设置: 优先用调用方传入的(内存最新)，否则读数据库；
+        丢弃子目录/文件已不存在或顺序错误的旧记录。"""
+        saved = dict(ranges) if ranges is not None else self.store.load(self.target_dir)
+        for sub in self.subdirs:
+            val = saved.get(sub)
+            if not val:
+                continue
+            start, end = val[0], val[1]
+            files = self._files(sub)
+            if (start in files and end in files
+                    and files.index(start) <= files.index(end)
+                    and _range_start_num(start) is not None):
+                self.ranges[sub] = [start, end]
+
+    def _files(self, subdir):
+        """子目录内JPG文件列表(按末尾编号升序，缓存)。"""
+        if subdir not in self._files_cache:
+            try:
+                self._files_cache[subdir] = _jpg_range_files(
+                    os.path.join(self.target_dir, subdir))
+            except Exception:
+                self._files_cache[subdir] = []
+        return self._files_cache[subdir]
+
+    def _build_ui(self):
+        self.setWindowTitle("设置替换目录 - 按子目录选择起始/终止目录文件")
+        self.resize(1180, 780)
+        self.setMinimumSize(920, 620)
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+
+        top = QHBoxLayout()
+        self.subdir_label = QLabel("当前子目录: —")
+        self.subdir_label.setStyleSheet(
+            "font-size: 16px; font-weight: bold; color: #1a5276;")
+        self.subdir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        top.addWidget(self.subdir_label, 1)
+        self.stat_label = QLabel("已设置 0 / 0 个目录")
+        self.stat_label.setStyleSheet("font-weight: bold; font-size: 13px;")
+        top.addWidget(self.stat_label)
+        v.addLayout(top)
+
+        sel = QHBoxLayout()
+        self.start_label = QLabel("起始目录文件: 未设置")
+        self.end_label = QLabel("终止目录文件: 未设置")
+        for lab in (self.start_label, self.end_label):
+            lab.setWordWrap(True)
+            lab.setMinimumHeight(28)
+            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        sel.addWidget(self.start_label, 1)
+        sel.addWidget(self.end_label, 1)
+        v.addLayout(sel)
+
+        split = QSplitter(Qt.Horizontal)
+        self.dir_list = QListWidget()
+        self.dir_list.setMinimumWidth(300)
+        self.dir_list.setMaximumWidth(480)
+        self.dir_list.currentRowChanged.connect(self.on_subdir_changed)
+        split.addWidget(self.dir_list)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(6, 0, 0, 0)
+        rv.setSpacing(6)
+
+        self.image_view = ZoomableImageView()
+        self.image_view.setMinimumSize(480, 320)
+        self.image_view.zoom_changed.connect(self._on_zoom_changed)
+        rv.addWidget(self.image_view, 3)
+
+        zoom_bar = QHBoxLayout()
+        zoom_hint = QLabel("预览: 鼠标滚轮缩放，按住左键拖动")
+        zoom_hint.setStyleSheet("font-size: 12px; color: #7f8c8d;")
+        zoom_bar.addWidget(zoom_hint)
+        zoom_bar.addStretch()
+        self.zoom_label = QLabel("—")
+        self.zoom_label.setMinimumWidth(56)
+        self.zoom_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.zoom_label.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #1a5276;")
+        zoom_bar.addWidget(self.zoom_label)
+        self.btn_fit_view = QPushButton("适应窗口")
+        self.btn_fit_view.setObjectName("BrowseBtn")
+        self.btn_fit_view.setAutoDefault(False)
+        self.btn_fit_view.clicked.connect(self.image_view.reset_zoom)
+        zoom_bar.addWidget(self.btn_fit_view)
+        rv.addLayout(zoom_bar)
+
+        self.file_hint = QLabel("子目录内JPG文件(点击切换预览):")
+        rv.addWidget(self.file_hint)
+        self.file_list = QListWidget()
+        self.file_list.setMinimumHeight(140)
+        self.file_list.currentRowChanged.connect(self.on_file_changed)
+        rv.addWidget(self.file_list, 2)
+
+        act = QHBoxLayout()
+        self.btn_set_start = QPushButton("设为起始目录文件")
+        self.btn_set_start.setObjectName("ActionBtn")
+        self.btn_set_start.setAutoDefault(False)
+        self.btn_set_start.clicked.connect(self.set_start_file)
+        act.addWidget(self.btn_set_start)
+        self.btn_set_end = QPushButton("设为终止目录文件")
+        self.btn_set_end.setObjectName("ActionBtn")
+        self.btn_set_end.setAutoDefault(False)
+        self.btn_set_end.clicked.connect(self.set_end_file)
+        act.addWidget(self.btn_set_end)
+        act.addStretch()
+        rv.addLayout(act)
+
+        nav = QHBoxLayout()
+        self.prev_btn = QPushButton("◀ 上一个")
+        self.prev_btn.setObjectName("BrowseBtn")
+        self.prev_btn.setAutoDefault(False)
+        self.prev_btn.clicked.connect(self.prev_file)
+        nav.addWidget(self.prev_btn)
+        self.page_label = QLabel()
+        self.page_label.setAlignment(Qt.AlignCenter)
+        self.page_label.setMinimumWidth(120)
+        self.page_label.setStyleSheet("font-weight: bold;")
+        nav.addWidget(self.page_label)
+        self.next_btn = QPushButton("下一个 ▶")
+        self.next_btn.setObjectName("BrowseBtn")
+        self.next_btn.setAutoDefault(False)
+        self.next_btn.clicked.connect(self.next_file)
+        nav.addWidget(self.next_btn)
+        nav.addStretch()
+        rv.addLayout(nav)
+
+        self.source_hint = QLabel("")
+        self.source_hint.setWordWrap(True)
+        self.source_hint.setStyleSheet("font-size: 12px; color: #7f8c8d;")
+        rv.addWidget(self.source_hint)
+
+        split.addWidget(right)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([320, 860])
+        v.addWidget(split, 1)
+
+        tip = QLabel(
+            "提示: 左侧绿色✓=已设置完整，红色⚠=未设置完整; 起始文件必须形如"
+            "「基础名-0002.jpg」; 终止文件不得小于起始文件(可相同); "
+            "所有子目录设置完成后点击「返回」保存。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #7f8c8d; font-size: 12px;")
+        v.addWidget(tip)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        self.btn_return = QPushButton("返回(保存设置)")
+        self.btn_return.setObjectName("ActionBtn")
+        self.btn_return.setDefault(True)
+        self.btn_return.clicked.connect(self.on_return)
+        btns.addWidget(self.btn_return)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("BrowseBtn")
+        cancel_btn.setAutoDefault(False)
+        cancel_btn.clicked.connect(self.reject)
+        btns.addWidget(cancel_btn)
+        v.addLayout(btns)
+
+    # ---------- 左侧子目录列表 ----------
+    def _update_dir_items(self):
+        """刷新左侧列表: 已完成项绿色✓，未完成项红色⚠加粗。"""
+        self.dir_list.blockSignals(True)
+        self.dir_list.clear()
+        for sub in self.subdirs:
+            rng = self.ranges.get(sub)
+            complete = bool(rng and rng[0] and rng[1])
+            if complete:
+                text = "✓ {}\n     {} → {}".format(sub, rng[0], rng[1])
+                item = QListWidgetItem(text)
+                item.setForeground(QColor('#1B5E20'))
+                item.setBackground(QColor('#E8F5E9'))
+            elif rng and rng[0]:
+                text = "⚠ {}\n     起始={}，缺终止文件".format(sub, rng[0])
+                item = QListWidgetItem(text)
+                item.setForeground(QColor('#B71C1C'))
+                item.setBackground(QColor('#FFEBEE'))
+                fnt = item.font()
+                fnt.setBold(True)
+                item.setFont(fnt)
+            else:
+                text = "⚠ {}\n     未设置起始/终止文件".format(sub)
+                item = QListWidgetItem(text)
+                item.setForeground(QColor('#B71C1C'))
+                item.setBackground(QColor('#FFEBEE'))
+                fnt = item.font()
+                fnt.setBold(True)
+                item.setFont(fnt)
+            item.setData(Qt.UserRole, sub)
+            self.dir_list.addItem(item)
+        if self.current in self.subdirs:
+            self.dir_list.setCurrentRow(self.subdirs.index(self.current))
+        self.dir_list.blockSignals(False)
+
+    def _update_header(self):
+        """刷新顶部当前子目录、起止文件与整体进度。"""
+        rng = self.ranges.get(self.current)
+        start = rng[0] if rng else ''
+        end = rng[1] if rng else ''
+        self.subdir_label.setText("当前子目录: " + (self.current or "—"))
+        self.start_label.setText("起始目录文件: " + (start or "未设置"))
+        self.end_label.setText("终止目录文件: " + (end or "未设置"))
+        done = sum(1 for s in self.subdirs
+                   if self.ranges.get(s) and self.ranges[s][1])
+        total = len(self.subdirs)
+        self.stat_label.setText("已设置 {} / {} 个目录".format(done, total))
+        self.stat_label.setStyleSheet(
+            "font-weight: bold; font-size: 13px; color: {};".format(
+                '#1B5E20' if done == total else '#B45309'))
+        style = ("background-color: {}; border: 1px solid {}; border-radius: 3px;"
+                 "padding: 4px 8px; font-weight: bold; color: {};")
+        if start:
+            self.start_label.setStyleSheet(
+                style.format('#E8F5E9', '#81C784', '#1B5E20'))
+        else:
+            self.start_label.setStyleSheet(
+                style.format('#FFF8E1', '#F0C36D', '#6D4C41'))
+        if end:
+            self.end_label.setStyleSheet(
+                style.format('#E3F2FD', '#64B5F6', '#0D47A1'))
+        else:
+            self.end_label.setStyleSheet(
+                style.format('#FFF8E1', '#F0C36D', '#6D4C41'))
+
+    def on_subdir_changed(self, row):
+        """切换左侧子目录: 右侧刷新文件列表与预览。"""
+        if row < 0 or row >= len(self.subdirs):
+            return
+        self.current = self.subdirs[row]
+        files = self._files(self.current)
+        self._rebuild_file_list(files)
+        self._update_header()
+        self._update_source_hint()
+        rng = self.ranges.get(self.current)
+        target = 0
+        if rng and rng[0] in files:
+            target = files.index(rng[0])
+        if files:
+            self.file_list.setCurrentRow(target)  # 触发 on_file_changed
+        else:
+            self.current_file = ''
+            self.image_view.show_message("该子目录下没有JPG文件")
+
+    def _rebuild_file_list(self, files):
+        """重建右侧文件列表，标注【起】【止】与范围内底色。"""
+        rng = self.ranges.get(self.current)
+        start = rng[0] if rng else None
+        end = rng[1] if rng else None
+        s_idx = files.index(start) if start in files else -1
+        e_idx = files.index(end) if end in files else -1
+        self.file_list.blockSignals(True)
+        self.file_list.clear()
+        for i, fname in enumerate(files):
+            if i == s_idx and i == e_idx:
+                mark = '   【起=止】'
+            elif i == s_idx:
+                mark = '   【起】'
+            elif i == e_idx:
+                mark = '   【止】'
+            else:
+                mark = ''
+            item = QListWidgetItem(fname + mark)
+            item.setData(Qt.UserRole, fname)
+            if 0 <= s_idx <= i <= e_idx:
+                item.setBackground(QColor('#E8F5E9'))
+            if i == s_idx:
+                item.setForeground(QColor('#1B5E20'))
+            elif i == e_idx:
+                item.setForeground(QColor('#0D47A1'))
+            if i == s_idx or i == e_idx:
+                fnt = item.font()
+                fnt.setBold(True)
+                item.setFont(fnt)
+            self.file_list.addItem(item)
+        self.file_list.blockSignals(False)
+
+    def on_file_changed(self, row):
+        """右侧文件列表选中项变化时刷新预览。"""
+        count = self.file_list.count()
+        if row < 0 or row >= count:
+            self.current_file = ''
+            self.page_label.setText("0 / 0")
+            return
+        item = self.file_list.item(row)
+        self.current_file = item.data(Qt.UserRole) or ''
+        self.file_hint.setText(
+            "子目录内JPG文件(【起】起始目录文件, 【止】终止目录文件):")
+        self.page_label.setText("{} / {}".format(row + 1, count))
+        self.prev_btn.setEnabled(row > 0)
+        self.next_btn.setEnabled(row < count - 1)
+        self._reload_image()
+
+    def _reload_image(self):
+        """加载当前文件到预览区(支持滚轮缩放，切换文件时自动适应窗口)。"""
+        if not self.current or not self.current_file:
+            return
+        path = os.path.join(self.target_dir, self.current, self.current_file)
+        try:
+            self.image_view.set_image(path)
+        except Exception as e:
+            self.image_view.show_message(f"预览出错: {e}")
+
+    def _on_zoom_changed(self, zoom):
+        """预览缩放比例变化时刷新百分比显示。"""
+        if zoom <= 0:
+            self.zoom_label.setText("—")
+        else:
+            self.zoom_label.setText("{:.0f}%".format(zoom * 100))
+    def prev_file(self):
+        row = self.file_list.currentRow()
+        if row > 0:
+            self.file_list.setCurrentRow(row - 1)
+
+    def next_file(self):
+        row = self.file_list.currentRow()
+        if 0 <= row < self.file_list.count() - 1:
+            self.file_list.setCurrentRow(row + 1)
+
+    def _jump(self, delta):
+        count = self.file_list.count()
+        if not count:
+            return
+        row = max(0, min(count - 1, self.file_list.currentRow() + delta))
+        self.file_list.setCurrentRow(row)
+
+    def keyPressEvent(self, event):
+        """键盘切换文件: ←/→ 逐个, Home/End 首尾, PageUp/PageDown 跳转10个。"""
+        key = event.key()
+        if key == Qt.Key_Left:
+            self.prev_file()
+        elif key == Qt.Key_Right:
+            self.next_file()
+        elif key == Qt.Key_Home:
+            if self.file_list.count():
+                self.file_list.setCurrentRow(0)
+        elif key == Qt.Key_End:
+            if self.file_list.count():
+                self.file_list.setCurrentRow(self.file_list.count() - 1)
+        elif key == Qt.Key_PageUp:
+            self._jump(-10)
+        elif key == Qt.Key_PageDown:
+            self._jump(10)
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def _after_change(self):
+        """起止设置变更后刷新列表/顶部/源文件检查，并保持当前选中文件。"""
+        files = self._files(self.current)
+        self._rebuild_file_list(files)
+        if self.current_file in files:
+            self.file_list.setCurrentRow(files.index(self.current_file))
+        self._update_dir_items()
+        self._update_header()
+        self._update_source_hint()
+
+    def set_start_file(self):
+        """将当前文件设为起始目录文件(必须含末尾四位编号)。"""
+        if not self.current or not self.current_file:
+            QMessageBox.information(self, "提示", "请先在右侧文件列表中选择一个文件")
+            return
+        if _range_start_num(self.current_file) is None:
+            QMessageBox.warning(
+                self, "提示",
+                "所选文件「{}」不含末尾四位编号，无法作为起始目录文件。\n"
+                "请选择形如「基础名-0002.jpg」的文件。".format(self.current_file))
+            return
+        files = self._files(self.current)
+        rng = self.ranges.get(self.current)
+        end = rng[1] if rng else ''
+        if end and (end not in files
+                    or files.index(end) < files.index(self.current_file)):
+            end = ''
+            QMessageBox.information(
+                self, "提示",
+                "新的起始文件晚于原终止文件，已清除终止目录文件设置，请重新设置。")
+        self.ranges[self.current] = [self.current_file, end]
+        self._after_change()
+
+    def set_end_file(self):
+        """将当前文件设为终止目录文件(不得小于起始文件，可相同)。"""
+        if not self.current or not self.current_file:
+            QMessageBox.information(self, "提示", "请先在右侧文件列表中选择一个文件")
+            return
+        rng = self.ranges.get(self.current)
+        if not rng or not rng[0]:
+            QMessageBox.warning(self, "提示", "请先设置起始目录文件")
+            return
+        files = self._files(self.current)
+        if (self.current_file in files and rng[0] in files
+                and files.index(self.current_file) < files.index(rng[0])):
+            QMessageBox.warning(
+                self, "提示",
+                "终止目录文件不能小于起始目录文件「{}」。".format(rng[0]))
+            return
+        self.ranges[self.current] = [rng[0], self.current_file]
+        self._after_change()
+
+    def _scan_sources(self):
+        """扫描JPG源目录(含子目录)并按基础名分组，用于提前提示源文件是否足够。"""
+        groups = {}
+        if not self.jpg_dir or not os.path.isdir(self.jpg_dir):
+            return groups
+        try:
+            for root, _dirs, files in os.walk(self.jpg_dir):
+                for f in files:
+                    if not f.lower().endswith(('.jpg', '.jpeg')):
+                        continue
+                    parsed = FileBatchReplaceWorker._parse_name(f)
+                    if parsed is None:
+                        continue
+                    groups.setdefault(parsed[0].lower(), []).append(
+                        (parsed[1], os.path.join(root, f)))
+        except Exception:
+            return {}
+        for key in groups:
+            groups[key].sort(key=lambda t: t[0])
+        return groups
+
+    def _update_source_hint(self):
+        """根据JPG源目录提示当前范围能否替换(不阻断保存，处理时仍会校验)。"""
+        rng = self.ranges.get(self.current)
+        if not self.jpg_dir or not os.path.isdir(self.jpg_dir) or not rng or not rng[1]:
+            self.source_hint.setText("")
+            return
+        files = self._files(self.current)
+        start, end = rng[0], rng[1]
+        if start not in files or end not in files:
+            self.source_hint.setText("")
+            return
+        need = files.index(end) - files.index(start) + 1
+        if self._src_groups is None:
+            self._src_groups = self._scan_sources()
+        group = self._src_groups.get(self.current.lower(), [])
+        start_num = _range_start_num(start)
+        if not group:
+            self.source_hint.setStyleSheet("font-size: 12px; color: #B71C1C;")
+            self.source_hint.setText(
+                "⚠ JPG源目录中未找到基础名为该子目录的文件，替换时将报错跳过")
+            return
+        if start_num is None or not any(n == start_num for n, _p in group):
+            self.source_hint.setStyleSheet("font-size: 12px; color: #B71C1C;")
+            self.source_hint.setText(
+                "⚠ JPG源目录缺少编号 {} 的文件(起始编号须严格对应)，替换时将报错跳过"
+                .format('----' if start_num is None else '{:04d}'.format(start_num)))
+            return
+        avail = sum(1 for n, _p in group if n >= start_num)
+        if avail < need:
+            self.source_hint.setStyleSheet("font-size: 12px; color: #B71C1C;")
+            self.source_hint.setText(
+                "⚠ JPG源文件不足: 范围需 {} 个，源目录仅有 {} 个(编号≥{:04d})，"
+                "替换时将报错跳过".format(need, avail, start_num))
+        else:
+            self.source_hint.setStyleSheet("font-size: 12px; color: #1B5E20;")
+            self.source_hint.setText(
+                "源文件检查: 可替换(范围需 {} 个，源目录可用 {} 个)".format(need, avail))
+
+    def on_return(self):
+        """校验每个子目录的起止设置，全部完整则保存并关闭。"""
+        problems = []
+        for sub in self.subdirs:
+            files = self._files(sub)
+            rng = self.ranges.get(sub)
+            if not rng or not rng[0] or not rng[1]:
+                problems.append("{}: 未设置起始/终止目录文件".format(sub))
+                continue
+            start, end = rng[0], rng[1]
+            if start not in files or end not in files:
+                problems.append("{}: 起始或终止文件已不存在".format(sub))
+                self.ranges.pop(sub, None)
+                continue
+            if files.index(start) > files.index(end):
+                problems.append("{}: 终止文件小于起始文件".format(sub))
+                continue
+            if _range_start_num(start) is None:
+                problems.append("{}: 起始文件名不含四位编号".format(sub))
+        if problems:
+            self._update_dir_items()
+            self._update_header()
+            msg = "以下子目录未设置完整(红色⚠项)，请逐项设置后再返回:\n\n"
+            msg += "\n".join(problems[:15])
+            if len(problems) > 15:
+                msg += "\n…共 {} 项".format(len(problems))
+            QMessageBox.warning(self, "设置未完成", msg)
+            for sub in self.subdirs:
+                if any(p.startswith(sub + ':') for p in problems):
+                    self.dir_list.setCurrentRow(self.subdirs.index(sub))
+                    break
+            return
+        ok, err = self.store.save(self.target_dir, self.ranges)
+        if not ok:
+            QMessageBox.warning(
+                self, "保存失败",
+                "设置无法写入本地数据库，本次设置仅在当前运行有效:\n{}".format(err))
+        self.accept()
+
+
 class FileBatchReplacePage(FunctionPage):
-    """文件批量替换功能页：将输出的JPG替换目标目录中的图片"""
+    """文件批量替换功能页：按目标子目录设定的起止范围替换图片(v3.30)"""
 
     def __init__(self):
         super().__init__("文件批量替换")
-        group = QGroupBox("文件批量替换 (将输出的JPG替换目标目录中的图片)")
+        group = QGroupBox("文件批量替换 (按目标子目录设定的起止范围替换图片)")
         form = QFormLayout()
+
+        self.ranges = {}              # {子目录: (起始文件, 终止文件)}
+        self._ranges_target_key = ''
+        self._range_store = None
 
         self.jpg_dir = QLineEdit()
         self.jpg_dir.setPlaceholderText("选择包含输出JPG的目录(含子目录)")
@@ -7481,37 +8292,52 @@ class FileBatchReplacePage(FunctionPage):
         h2 = QHBoxLayout()
         h2.addWidget(self.target_dir)
         h2.addWidget(btn_browse_target)
+        # 目标目录变更后自动载入该目录已保存的替换范围设置
+        self.target_dir.textChanged.connect(self.on_target_dir_changed)
+        self.target_dir.editingFinished.connect(self._load_ranges_for_target)
 
-        self.start_num = QLineEdit()
-        self.start_num.setPlaceholderText("例如 0002，仅处理编号不小于此编号的文件")
+        self.range_edit = ClickableReadOnlyPlainTextEdit()
+        self.range_edit.setPlaceholderText(
+            "点击此处或右侧「设置替换目录」按钮，为每个子目录设置起始/终止目录文件")
+        self.range_edit.setToolTip("点击后选择目标目录下的子目录，并为其设置起始/终止目录文件")
+        self.range_edit.setMaximumHeight(110)
+        self.range_edit.clicked.connect(self.open_range_dialog)
+        btn_set_ranges = QPushButton("设置替换目录")
+        btn_set_ranges.setObjectName("BrowseBtn")
+        btn_set_ranges.clicked.connect(self.open_range_dialog)
+        h3 = QHBoxLayout()
+        h3.addWidget(self.range_edit)
+        h3.addWidget(btn_set_ranges)
 
         form.addRow("JPG源目录:", h1)
         form.addRow("目标目录:", h2)
-        form.addRow("起始文件名:", self.start_num)
+        form.addRow("替换目录列表:", h3)
         group.setLayout(form)
         self.layout.addWidget(group)
 
         info_label = QLabel(
             "功能说明：\n"
-            "• 扫描JPG源目录(含子目录)，文件名去除最后四位数字编号和最后一个\"-\"得到基础名，与目标目录下同名子目录匹配\n"
-            "• 仅处理编号不小于起始编号的文件(缺省扩展名jpg，如输入 0002；留空默认从 0001 开始)\n"
-            "• 只复制1个文件 → 直接覆盖目标同名文件；复制N个文件 → 源文件从最小编号起连续占位\n"
-            "  (最小编号处覆盖目标同名文件)，目标中编号大于最小编号的现有文件从 最小编号+N 起\n"
-            "  按升序重新编号预留空位(从编号最大的文件开始改名)，再复制新文件，替换后编号连续\n"
+            "• 点击「替换目录列表」为目标目录下的每个子目录设置「起始目录文件」和「终止目录文件」，\n"
+            "  设置结果按目标目录保存在本地数据库(file_replace_ranges.db)，下次自动载入\n"
+            "• 弹窗左侧为目标目录下包含JPG文件的子目录列表：绿色✓=已设置完整，红色⚠=未设置完整\n"
+            "• 起始目录文件必须形如「基础名-四位编号.jpg」，其编号须与JPG源目录中\n"
+            "  同名基础名的文件编号严格对应；终止文件不得小于起始文件(可相同)\n"
+            "• 替换范围 = 起始文件到终止文件(含)之间的全部JPG文件；\n"
+            "  JPG源目录中编号≥起始编号的文件数必须≥范围内目标文件数，否则报错跳过该子目录并记录日志\n"
+            "• 源文件按编号升序依次覆盖范围内目标文件(保留目标文件名)，多余源文件忽略\n"
             "• 处理日志生成在目标目录下\n"
-            "• 替换后在每个目标子目录生成 Directory.txt(记录替换后的文件名清单, 不含扩展名),\n"
-            "  供分件功能读取目录页与文件偏移量\n"
-            "• 注意：此操作会修改目标目录文件(改名/覆盖)，建议先备份"
+            "• 替换后在每个目标子目录生成/更新 Directory.txt(记录替换后的文件名清单, 不含扩展名)\n"
+            "• 注意：此操作会覆盖目标目录文件，建议先备份"
         )
         info_label.setStyleSheet("color: #8B949E; font-size: 12px;")
         self.layout.addWidget(info_label)
 
         # 按钮区域
         btn_layout = QHBoxLayout()
-        btn_exec = QPushButton("开始替换")
-        btn_exec.setObjectName("ActionBtn")
-        btn_exec.clicked.connect(self.execute)
-        btn_layout.addWidget(btn_exec)
+        self.btn_exec = QPushButton("开始替换")
+        self.btn_exec.setObjectName("ActionBtn")
+        self.btn_exec.clicked.connect(self.execute)
+        btn_layout.addWidget(self.btn_exec)
 
         self.stop_btn = QPushButton("停止处理")
         self.stop_btn.setObjectName("ActionBtn")
@@ -7538,6 +8364,85 @@ class FileBatchReplacePage(FunctionPage):
         d = QFileDialog.getExistingDirectory(self, "选择目标目录")
         if d:
             self.target_dir.setText(d)
+            self._load_ranges_for_target()
+
+    def on_target_dir_changed(self, _text=None):
+        """目标目录文本变化时清空显示(避免沿用旧目录的设置)，待编辑完成后重新载入。"""
+        d = self.target_dir.text().strip()
+        key = os.path.normcase(os.path.abspath(d)) if d else ''
+        if key != self._ranges_target_key:
+            self._ranges_target_key = ''
+            self.ranges = {}
+            self.refresh_range_display()
+
+    def _get_range_store(self):
+        if self._range_store is None:
+            try:
+                self._range_store = ReplaceRangeStore()
+            except Exception as e:
+                self.log(f"打开替换范围设置数据库失败: {e}")
+        return self._range_store
+
+    def _load_ranges_for_target(self):
+        """目录变更时从SQLite载入该目标目录已保存的起止设置。"""
+        d = self.target_dir.text().strip()
+        key = os.path.normcase(os.path.abspath(d)) if d else ''
+        if key == self._ranges_target_key:
+            return
+        self._ranges_target_key = key
+        self.ranges = {}
+        if d:
+            store = self._get_range_store()
+            if store is not None:
+                self.ranges = dict(store.load(d))
+        self.refresh_range_display()
+
+    def refresh_range_display(self):
+        """在「替换目录列表」中显示已设置的每个子目录起止文件。"""
+        if not self.ranges:
+            self.range_edit.clear()
+            self.range_edit.setPlaceholderText(
+                "点击此处或右侧「设置替换目录」按钮，为每个子目录设置起始/终止目录文件")
+            return
+        lines = []
+        for sub, (start, end) in sorted(self.ranges.items(),
+                                        key=lambda kv: kv[0].lower()):
+            lines.append(f"✓ {sub}:  {start} → {end}")
+        self.range_edit.setPlainText("\n".join(lines))
+
+    def open_range_dialog(self):
+        """打开替换目录设置窗口: 左侧子目录、右侧文件预览，设置起止文件。"""
+        target_d = self.target_dir.text().strip()
+        if not target_d:
+            QMessageBox.warning(self, "提示", "请先选择目标目录")
+            return
+        if not os.path.isdir(target_d):
+            QMessageBox.warning(self, "错误", "目标目录不存在")
+            return
+        if not _jpg_subdirs(target_d):
+            QMessageBox.warning(
+                self, "提示",
+                "目标目录下没有包含JPG文件的子目录，无法设置替换范围")
+            return
+        self._load_ranges_for_target()
+        dlg = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            dlg = ReplaceRangeDialog(
+                target_d, ranges=self.ranges,
+                jpg_dir=self.jpg_dir.text().strip(), parent=self)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开替换目录设置窗口失败: {e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        if dlg is None:
+            return
+        if dlg.exec_() == QDialog.Accepted:
+            self.ranges = {k: (v[0], v[1]) for k, v in dlg.ranges.items()}
+            self._ranges_target_key = os.path.normcase(os.path.abspath(target_d))
+            self.refresh_range_display()
+            self.log(f"已保存 {len(self.ranges)} 个子目录的替换范围设置")
+        dlg.deleteLater()
 
     def execute(self):
         jpg_d = self.jpg_dir.text().strip()
@@ -7552,30 +8457,56 @@ class FileBatchReplacePage(FunctionPage):
         if not target_d:
             QMessageBox.warning(self, "提示", "请先选择目标目录")
             return
+        if not os.path.isdir(target_d):
+            QMessageBox.warning(self, "错误", "目标目录不存在")
+            return
 
-        # 解析起始编号(缺省扩展名jpg，如 "0002" 或 "0002.jpg")
-        s = self.start_num.text().strip()
-        if s:
-            s = os.path.splitext(s)[0]
-            if not s.isdigit():
-                QMessageBox.warning(self, "错误", "起始文件名须为数字编号，例如 0002")
-                return
-            start_num = int(s)
-        else:
-            start_num = 1
+        self._load_ranges_for_target()
+        subdirs = _jpg_subdirs(target_d)
+        if not subdirs:
+            QMessageBox.warning(self, "提示",
+                                "目标目录下没有包含JPG文件的子目录")
+            return
 
-        # 目标目录不存在则自动创建
-        if not os.path.exists(target_d):
-            try:
-                os.makedirs(target_d, exist_ok=True)
-            except Exception as e:
-                QMessageBox.warning(self, "错误", f"无法创建目标目录: {e}")
-                return
+        # 处理前再次校验: 每个子目录都必须有有效的起止文件
+        missing = []
+        invalid = []
+        for sub in subdirs:
+            rng = self.ranges.get(sub)
+            if not rng or not rng[0] or not rng[1]:
+                missing.append(sub)
+                continue
+            files = _jpg_range_files(os.path.join(target_d, sub))
+            start, end = rng[0], rng[1]
+            if start not in files or end not in files:
+                invalid.append(f"{sub}: 起始/终止文件已不存在")
+            elif files.index(start) > files.index(end):
+                invalid.append(f"{sub}: 终止文件小于起始文件")
+            elif _range_start_num(start) is None:
+                invalid.append(f"{sub}: 起始文件名不含四位编号")
+        if missing or invalid:
+            msg = "替换目录设置不完整，请点击「设置替换目录」逐项设置：\n\n"
+            if missing:
+                msg += "未设置起止文件: " + "、".join(missing[:10])
+                if len(missing) > 10:
+                    msg += " 等"
+                msg += "\n"
+            if invalid:
+                msg += "\n".join(invalid[:10])
+            QMessageBox.warning(self, "提示", msg)
+            return
 
+        ranges = {sub: (self.ranges[sub][0], self.ranges[sub][1])
+                  for sub in subdirs}
+
+        detail = "\n".join(
+            f"  {sub}: {ranges[sub][0]} → {ranges[sub][1]}"
+            for sub in sorted(ranges, key=str.lower))
         reply = QMessageBox.question(
             self, "确认操作",
-            f"将从编号 {start_num:04d} 开始，用JPG源目录的文件替换目标目录中的图片。\n"
-            f"目标目录中的现有文件可能被改名或覆盖，建议先备份。\n\n确定开始吗？",
+            f"将按以下 {len(ranges)} 个子目录的起止范围，用JPG源目录的文件替换\n"
+            f"目标目录中的图片：\n\n{detail}\n\n"
+            f"目标目录中的现有文件将被覆盖，建议先备份。\n\n确定开始吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -7588,19 +8519,19 @@ class FileBatchReplacePage(FunctionPage):
         self.log("开始替换...")
         self.log(f"JPG源目录: {jpg_d}")
         self.log(f"目标目录: {target_d}")
-        self.log(f"起始编号: {start_num:04d}")
+        self.log(f"替换目录数: {len(ranges)}")
+        for sub in sorted(ranges, key=str.lower):
+            self.log(f"  {sub}: {ranges[sub][0]} → {ranges[sub][1]}")
         self.log("=" * 50)
 
         self.worker = FileBatchReplaceWorker(
-            jpg_dir=jpg_d, target_dir=target_d, start_num=start_num)
+            jpg_dir=jpg_d, target_dir=target_d, ranges=ranges)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.finished_signal.connect(self.on_finished)
         self.worker.start()
 
-        btn = self.findChild(QPushButton, "ActionBtn")
-        if btn and btn.text() == "开始替换":
-            btn.setEnabled(False)
+        self.btn_exec.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
     def stop_processing(self):
@@ -7619,11 +8550,14 @@ class FileBatchReplacePage(FunctionPage):
     def on_finished(self, success, message):
         """处理完成回调"""
         self.log(message)
-        self.progress.setFormat("已完成" if success else "已停止")
+        if success:
+            self.progress.setFormat("已完成")
+        elif message.startswith("已停止"):
+            self.progress.setFormat("已停止")
+        else:
+            self.progress.setFormat("已完成(有错误)")
 
-        btn = self.findChild(QPushButton, "ActionBtn")
-        if btn and btn.text() == "开始替换":
-            btn.setEnabled(True)
+        self.btn_exec.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
         if success:
