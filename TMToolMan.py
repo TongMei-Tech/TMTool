@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.32"
+VERSION = "3.33"
 
 CHANGELOG = [
+    {
+        "version": "3.33",
+        "date": "2026-10-20",
+        "changes": [
+            "界面按HomeAplication深色科技风格重做并修复布局问题：①整体改为深色主题(主背景#161d31/侧栏#283046/内容卡片#273357/强调色#3fa7ff)，无边框窗口+自定义标题栏(拖动/双击最大化/边缘拉伸)+左侧可折叠菜单栏(250↔80px动画)+阴影内容卡片，修复QStackedWidget/QTabWidget以调色板浅灰自绘导致的内容区大片浅色块(QSS显式透明背景)；②修复左侧菜单汉字显示为<span>编码的问题(QPushButton不支持HTML富文本，改为图标+文字纯文本拼接)；③重构页面布局消除控件被拉伸/布局偏下：各功能页改尾部stretch吸收富余空间的顶部对齐布局(修复QLayout.removeItem制造null空洞导致minimumSize计算的段错误)，文件改名三个选项卡高度随各自内容自适应(消除选项卡底部大片空白与按钮-结果框过远问题)，文件夹命名标准化6字段改3行×2列网格压缩高度；④窗口初始尺寸定为1354x851(启动不再强制最大化)，该尺寸下全部11个功能页无需滚动条即可完整展示",
+        ],
+    },
     {
         "version": "3.32",
         "date": "2026-10-20",
@@ -245,7 +252,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QProgressBar, QDialog, QListWidget, QListWidgetItem, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QRadioButton, QSplitter, QGraphicsView, QGraphicsScene,
-                             QGraphicsPixmapItem)
+                             QGraphicsPixmapItem, QTabWidget)
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal as Signal, QRegularExpression,
                          QSize, QEvent, QTimer)
 from PyQt5.QtGui import (QFont, QRegularExpressionValidator, QImageReader,
@@ -457,140 +464,214 @@ def _gpu_mem_info():
 
 
 class TechStyle:
-    """浅色页面样式表(参照 ImageCheckTool 浅色风格)"""
-    MAIN_BG = "#ecf0f1"
-    PANEL_BG = "#ffffff"
-    TEXT_COLOR = "#2c3e50"
-    ACCENT_COLOR = "#1a5276"
-    BTN_HOVER = "#2980b9"
+    """深色页面样式表(参照 HomeAplication1.0 深色科技风:
+    侧栏 rgb(40,48,70)、背景 rgb(22,29,49)、细节卡片 rgb(39,51,87))"""
+    MAIN_BG = "#161d31"        # 窗口背景(HomeAplication 底色)
+    PANEL_BG = "#283046"       # 左侧菜单栏(HomeAplication 侧栏色)
+    CARD_BG = "#273357"        # 内容卡片(HomeAplication 细节色)
+    TEXT_COLOR = "#fffff8"     # 主文字(HomeAplication 白色系)
+    ACCENT_COLOR = "#3fa7ff"   # 强调色(选中指示条/焦点/进度)
+    BTN_HOVER = "#3498db"
 
     QSS = f"""
-    QMainWindow {{ background-color: {MAIN_BG}; }}
-    QWidget {{ color: {TEXT_COLOR}; font-family: 'Microsoft YaHei', Arial; }}
+    QMainWindow, QDialog {{ background-color: {MAIN_BG}; }}
+    QWidget {{ color: {TEXT_COLOR}; font-family: 'Microsoft YaHei', Arial; font-size: 13px; }}
 
-    /* 左侧菜单栏 */
-    #LeftPanel {{
-        background-color: {PANEL_BG};
-        border-right: 1px solid #bdc3c7;
+    /* ---------- 自定义标题栏(无边框窗口) ---------- */
+    #TitleBar {{ background-color: #1c2438; border-bottom: 1px solid #3a4a6b; }}
+    QLabel#TitleBarTitle {{ color: {TEXT_COLOR}; font-size: 15px; font-weight: bold; }}
+    QPushButton#TitleBtn {{
+        background-color: transparent; color: #cdd6e4; border: none;
+        font-size: 13px; font-weight: bold;
     }}
-    QLabel#TitleLabel {{
-        color: {ACCENT_COLOR};
-        font-size: 18px;
-        font-weight: bold;
-        padding: 20px;
-        border-bottom: 1px solid #bdc3c7;
+    QPushButton#TitleBtn:hover {{ background-color: rgba(255,255,255,0.12); color: #ffffff; }}
+    QPushButton#TitleBtn:pressed {{ background-color: rgba(255,255,255,0.20); }}
+    QPushButton#TitleBtn[close="true"]:hover {{ background-color: #DA3633; color: #ffffff; }}
+
+    /* ---------- 左侧菜单栏(HomeAplication 侧栏) ---------- */
+    #LeftPanel {{ background-color: {PANEL_BG}; border: none; }}
+    QLabel#SidebarTitle {{
+        color: {TEXT_COLOR}; font-size: 16px; font-weight: bold;
+        padding: 14px 4px; border-bottom: 1px solid #3a4a6b;
     }}
+    QLabel#SidebarVersion {{ color: #6d7a94; font-size: 11px; padding: 6px; }}
+    QPushButton#ToggleBtn {{
+        background-color: transparent; color: #cdd6e4; border: none;
+        font-size: 17px; padding: 10px 14px; text-align: left;
+    }}
+    QPushButton#ToggleBtn:hover {{ background-color: rgba(255,255,255,0.10); color: #ffffff; }}
     QPushButton#MenuBtn {{
-        background-color: transparent;
-        color: #1a5276;
-        text-align: left;
-        padding: 16px 20px;
-        border: none;
-        font-size: 17px;
-        font-weight: bold;
+        background-color: transparent; color: #cdd6e4; text-align: left;
+        padding: 13px 16px; border: none; border-left: 4px solid transparent;
+        font-size: 15px;
     }}
-    QPushButton#MenuBtn:hover {{
-        background-color: #d6eaf8;
-        color: #154360;
-        border-left: 4px solid {ACCENT_COLOR};
-    }}
+    QPushButton#MenuBtn:hover {{ background-color: rgba(255,255,255,0.08); color: #ffffff; }}
     QPushButton#MenuBtn:checked {{
-        background-color: #aed6f1;
-        color: #0e2f44;
-        border-left: 5px solid {ACCENT_COLOR};
-        font-weight: bold;
+        background-color: rgba(63,167,255,0.16); color: #ffffff;
+        border-left: 4px solid {ACCENT_COLOR}; font-weight: bold;
     }}
 
-    /* 右侧功能区 */
+    /* ---------- 右侧内容卡片 ---------- */
     #RightPanel {{ background-color: {MAIN_BG}; }}
-    QGroupBox {{
-        border: 1px solid #bdc3c7;
-        border-radius: 5px;
-        margin-top: 15px;
-        padding: 15px;
-        font-weight: bold;
-        color: {ACCENT_COLOR};
-    }}
-    QGroupBox::title {{
-        subcontrol-origin: margin;
-        left: 10px;
-        padding: 0 5px;
-    }}
+    #ContentCard {{ background-color: {CARD_BG}; border-radius: 10px; }}
 
-    /* 输入控件 */
-    QLineEdit, QSpinBox, QComboBox {{
-        background-color: #ffffff;
-        border: 1px solid #bdc3c7;
-        border-radius: 3px;
-        padding: 5px;
-        color: {TEXT_COLOR};
+    QGroupBox {{
+        border: 1px solid #3a4a6b; border-radius: 8px;
+        margin-top: 16px; padding: 14px 12px 10px 12px;
+        font-weight: bold; color: #8ecaff; background-color: transparent;
+    }}
+    QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 6px; color: #8ecaff; }}
+
+    /* ---------- 输入控件 ---------- */
+    QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTextEdit, QListWidget, QTableWidget {{
+        background-color: #1b2338; border: 1px solid #3a4a6b;
+        border-radius: 4px; padding: 6px; color: {TEXT_COLOR};
+        selection-background-color: rgba(63,167,255,0.45);
     }}
     QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
         border: 1px solid {ACCENT_COLOR};
     }}
+    QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+        color: #6d7a94; background-color: #141b2c;
+    }}
+    QLineEdit:read-only {{ color: #a8b3c5; }}
+    QComboBox::drop-down {{ border: none; width: 22px; }}
+    QComboBox::down-arrow {{
+        image: none; border-left: 5px solid transparent; border-right: 5px solid transparent;
+        border-top: 6px solid #cdd6e4; margin-right: 6px;
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: #1b2338; color: {TEXT_COLOR};
+        border: 1px solid #3a4a6b; selection-background-color: rgba(63,167,255,0.35);
+    }}
 
     /* QSpinBox 上下按钮：显式定义，避免样式表覆盖后按钮消失/失效 */
     QSpinBox::up-button, QSpinBox::down-button {{
-        background-color: #d6eaf8;
+        background-color: #273357;
         border: none;
         width: 18px;
     }}
-    QSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; border-left: 1px solid #bdc3c7; }}
-    QSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; border-left: 1px solid #bdc3c7; border-top: 1px solid #bdc3c7; }}
-    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: #2980b9; }}
-    QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {{ background-color: {ACCENT_COLOR}; }}
+    QSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right; border-left: 1px solid #3a4a6b; }}
+    QSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right; border-left: 1px solid #3a4a6b; border-top: 1px solid #3a4a6b; }}
+    QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background-color: #3a4a6b; }}
     QSpinBox::up-arrow {{
         image: none;
         border-left: 4px solid transparent;
         border-right: 4px solid transparent;
-        border-bottom: 5px solid {TEXT_COLOR};
+        border-bottom: 5px solid #cdd6e4;
         width: 0px; height: 0px;
     }}
     QSpinBox::down-arrow {{
         image: none;
         border-left: 4px solid transparent;
         border-right: 4px solid transparent;
-        border-top: 5px solid {TEXT_COLOR};
+        border-top: 5px solid #cdd6e4;
         width: 0px; height: 0px;
     }}
 
-    /* 动作按钮 */
+    /* ---------- 按钮 ---------- */
+    QPushButton {{
+        background-color: #273357; color: {TEXT_COLOR};
+        border: 1px solid #3a4a6b; border-radius: 4px; padding: 7px 16px;
+    }}
+    QPushButton:hover {{ background-color: #3a4a6b; }}
+    QPushButton:pressed {{ background-color: #2c3c60; }}
+    QPushButton:disabled {{ background-color: #1b2338; color: #6d7a94; border-color: #273357; }}
     QPushButton#ActionBtn {{
         background-color: #238636;
-        color: white;
+        color: #ffffff;
         border: none;
         padding: 8px 16px;
-        border-radius: 3px;
+        border-radius: 4px;
         font-weight: bold;
     }}
     QPushButton#ActionBtn:hover {{
         background-color: #2EA043;
     }}
+    QPushButton#ActionBtn:disabled {{ background-color: #1b2b22; color: #5c7a63; }}
     QPushButton#BrowseBtn {{
         background-color: #2980b9;
-        color: white;
+        color: #ffffff;
         border: none;
-        padding: 5px 10px;
-        border-radius: 3px;
+        padding: 6px 12px;
+        border-radius: 4px;
     }}
     QPushButton#BrowseBtn:hover {{
         background-color: #3498db;
     }}
+    QPushButton#BrowseBtn:disabled {{ background-color: #16324a; color: #6d8aa0; }}
 
-    QTextEdit {{
-        background-color: #ffffff;
-        border: 1px solid #bdc3c7;
-        border-radius: 3px;
-        color: #2c3e50;
-        font-size: 13px;
+    /* ---------- 选项卡 ---------- */
+    /* 页面切换容器与选项卡内容区必须透明, 否则以调色板浅灰(Window色)自绘 */
+    QStackedWidget {{ background-color: transparent; }}
+    QTabWidget::pane {{
+        border: 1px solid #3a4a6b; border-radius: 6px; top: -1px;
+        background-color: transparent;
     }}
-    
-    /* 消息提示框 */
-    QMessageBox {{
-        background-color: #ffffff;
+    QTabBar {{ background: transparent; }}
+    QComboBox QFrame {{ background-color: transparent; }}
+    QTabBar::tab {{
+        background-color: transparent; color: #a8b3c5; padding: 9px 18px;
+        border: none; border-bottom: 2px solid transparent;
     }}
+    QTabBar::tab:hover {{ color: #ffffff; }}
+    QTabBar::tab:selected {{ color: #ffffff; border-bottom: 2px solid {ACCENT_COLOR}; font-weight: bold; }}
+
+    /* ---------- 勾选/单选 ---------- */
+    QCheckBox, QRadioButton {{ color: {TEXT_COLOR}; spacing: 8px; }}
+    QCheckBox:disabled, QRadioButton:disabled {{ color: #6d7a94; }}
+    QCheckBox::indicator, QRadioButton::indicator {{
+        width: 16px; height: 16px; background-color: #1b2338;
+        border: 1px solid #4a5a7d; border-radius: 3px;
+    }}
+    QCheckBox::indicator:hover, QRadioButton::indicator:hover {{ border: 1px solid {ACCENT_COLOR}; }}
+    QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+        background-color: {ACCENT_COLOR}; border: 1px solid {ACCENT_COLOR};
+    }}
+    QRadioButton::indicator {{ border-radius: 8px; }}
+
+    /* ---------- 进度条 ---------- */
+    QProgressBar {{
+        background-color: #1b2338; border: 1px solid #3a4a6b;
+        border-radius: 4px; text-align: center; color: {TEXT_COLOR}; height: 20px;
+    }}
+    QProgressBar::chunk {{ background-color: {ACCENT_COLOR}; border-radius: 3px; }}
+
+    /* ---------- 列表/表格(表头深灰, HomeAplication 同款) ---------- */
+    QListWidget::item {{ padding: 4px; }}
+    QListWidget::item:selected {{ background-color: rgba(63,167,255,0.30); color: #ffffff; }}
+    QHeaderView::section {{
+        background-color: #353535; color: #fffff8; border: none;
+        padding: 6px; font-weight: bold;
+    }}
+    QTableWidget QTableCornerButton::section {{ background-color: #353535; border: none; }}
+    QTableView {{ gridline-color: #273357; }}
+    QTableView::item:selected {{ background-color: rgba(63,167,255,0.30); color: #ffffff; }}
+
+    /* ---------- 图片预览视图 ---------- */
+    QGraphicsView {{ background-color: #10141f; border: 1px solid #3a4a6b; border-radius: 4px; }}
+
+    /* ---------- 滚动条 ---------- */
+    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+    QScrollBar::handle:vertical {{ background: #3a4a6b; border-radius: 5px; min-height: 30px; }}
+    QScrollBar::handle:vertical:hover {{ background: #4a5a7d; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+    QScrollBar::handle:horizontal {{ background: #3a4a6b; border-radius: 5px; min-width: 30px; }}
+    QScrollBar::handle:horizontal:hover {{ background: #4a5a7d; }}
+    QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
+    QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
+    QScrollArea {{ border: none; background: transparent; }}
+
+    /* ---------- 提示与消息框 ---------- */
+    QToolTip {{
+        background-color: {PANEL_BG}; color: {TEXT_COLOR};
+        border: 1px solid #3a4a6b; padding: 5px; border-radius: 3px;
+    }}
+    QMessageBox {{ background-color: #1c2438; }}
     QMessageBox QLabel {{
-        color: #2c3e50;
+        color: {TEXT_COLOR};
         font-weight: bold;
         font-size: 14px;
     }}
@@ -609,13 +690,100 @@ class TechStyle:
     """
 
 
+class _TopAlignedVBox(QVBoxLayout):
+    """顶部对齐布局(v3.33): 末尾固定一个stretch吸收窗口放大后的多余空间,
+    避免QLabel/QGroupBox等Preferred控件被垂直拉伸, 造成控件间距变大、
+    内容松散"偏下"。
+    注意: 不得用removeItem+addItem循环把stretch移回末尾——
+    QLayout.removeItem实际调用takeAt(indexOf), 会在原位留下null空洞
+    (QBoxLayout::takeAt用Dirty魔法标记而非压缩列表), 布局list出现None项
+    后minimumSize计算会段错误。正确做法是insertWidget到stretch之前。"""
+
+    def __init__(self):
+        super().__init__()
+        self.setSpacing(6)
+        # 尾部stretch(始终保持在最后一项, 新控件插入其前)
+        self._tail = super().addStretch(1)
+
+    def _insert_index(self):
+        # 插到尾部stretch之前; count()-1即stretch所在位置
+        return max(0, self.count() - 1)
+
+    def addWidget(self, w, stretch=0, alignment=Qt.Alignment()):
+        super().insertWidget(self._insert_index(), w, stretch, alignment)
+
+    def addLayout(self, lay, stretch=0):
+        super().insertLayout(self._insert_index(), lay, stretch)
+
+    def addItem(self, item):
+        super().insertItem(self._insert_index(), item)
+
+
+class AutoSizeTabWidget(QTabWidget):
+    """选项卡容器(v3.33): 高度随当前选项卡内容自适应, 而非统一为最高选项卡
+    的高度——避免内容较少的选项卡(如「按目录名批量重命名」)下方出现大片空白,
+    导致选项卡内按钮与页面底部的结果框距离过远。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 构建期addTab会触发currentChanged, 此时控件树未完成、布局未挂接,
+        # 激活布局会段错误 → 窗口显示后才启用自适应刷新
+        self._armed = False
+        self.currentChanged.connect(self._on_current_changed)
+
+    def _on_current_changed(self, _i):
+        if not self._armed:
+            return
+        self._refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._armed:
+            self._armed = True
+            self._refresh()
+
+    def _refresh(self):
+        """选项卡切换后尺寸变化, 逐级向上通知布局重新计算。
+        (FunctionPage以实例属性self.layout遮蔽了QWidget.layout()方法,
+        必须用QWidget.layout(w)显式基类调用绕过遮蔽)"""
+        self.updateGeometry()
+        w = self.parentWidget()
+        while w is not None:
+            lay = QWidget.layout(w)
+            if lay is not None:
+                lay.invalidate()
+                lay.activate()
+            w = QWidget.parentWidget(w)
+
+    def _page_height(self, cur, m):
+        h = m(cur).height() + self.tabBar().sizeHint().height()
+        h += self.contentsMargins().top() + self.contentsMargins().bottom()
+        return h
+
+    def sizeHint(self):
+        base = super().sizeHint()
+        cur = self.currentWidget()
+        if cur is not None:
+            return QSize(base.width(),
+                         self._page_height(cur, QWidget.sizeHint))
+        return base
+
+    def minimumSizeHint(self):
+        base = super().minimumSizeHint()
+        cur = self.currentWidget()
+        if cur is not None:
+            return QSize(base.width(),
+                         self._page_height(cur, QWidget.minimumSizeHint))
+        return base
+
+
 class FunctionPage(QWidget):
     """功能页面基类"""
 
     def __init__(self, title, parent=None):
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        self.layout.setAlignment(Qt.AlignTop)
+        self.layout = _TopAlignedVBox()
+        self.setLayout(self.layout)
 
         lbl_title = QLabel(title)
         lbl_title.setStyleSheet(
@@ -625,7 +793,7 @@ class FunctionPage(QWidget):
     def add_log_widget(self):
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setFixedHeight(150)
+        self.log_box.setFixedHeight(120)
         self.layout.addWidget(self.log_box)
 
     def log(self, msg):
@@ -2636,7 +2804,7 @@ class ManualSplitDialog(QDialog):
         v.addWidget(self.table, 1)
 
         self.hint = QLabel("")
-        self.hint.setStyleSheet("color: #B45309; font-size: 12px;")
+        self.hint.setStyleSheet("color: #D29922; font-size: 12px;")
         v.addWidget(self.hint)
 
         h = QHBoxLayout()
@@ -3586,7 +3754,7 @@ class DirStandardizePreviewDialog(QDialog):
         if skipped:
             skip_lbl = QLabel("引用失败目录: " + ", ".join(skipped[:8])
                               + ("..." if len(skipped) > 8 else ""))
-            skip_lbl.setStyleSheet("color: #B45309; font-size: 12px;")
+            skip_lbl.setStyleSheet("color: #D29922; font-size: 12px;")
             skip_lbl.setWordWrap(True)
             v.addWidget(skip_lbl)
 
@@ -3627,8 +3795,9 @@ class FileRenamePage(FunctionPage):
         super().__init__("文件改名")
 
         # v3.20: 三个处理方式改为TAB并列(原纵向堆叠导致页面过长)
-        from PyQt5.QtWidgets import QTabWidget
-        self.tabs = QTabWidget()
+        # v3.33: 选项卡高度随当前页自适应(见AutoSizeTabWidget), 消除内容少
+        # 的选项卡下方大片空白
+        self.tabs = AutoSizeTabWidget()
         self.layout.addWidget(self.tabs)
 
         # ====== TAB1: 按目录名批量重命名 ======
@@ -3700,12 +3869,16 @@ class FileRenamePage(FunctionPage):
             "各字段: 单选「填」=直接填固定值(对所有目录生效); 「引」=引用各子目录现名对应位置"
             "(输入框显示第一个符合格式目录的值, 只读; 目录名不符合格式时该目录跳过):"))
 
-        # v3.21: 6个字段改为每行一条(纵列, 标签列对齐), 输入框限宽缩窄窗口;
+        # v3.21: 6个字段改每行一条(纵列, 标签列对齐), 输入框限宽缩窄窗口;
         # 输入框在「引」状态显示从待处理目录提取的编码值(只读)。
         # v3.22: 字段改为 全宗号/专业/专业类型/年限/保管期限/件号(新命名规则),
         # 「专业类型」默认预填并选中「填」(格式固定段, v3.23缺省值改为SJ)。
+        # v3.33: 6字段改为3行x2列网格, 压缩选项卡高度
+        from PyQt5.QtWidgets import QGridLayout
+        std_grid = QGridLayout()
+        std_grid.setSpacing(4)
         self.std_fields = {}   # key -> (QRadioButton填, QRadioButton引, QLineEdit)
-        for key in DirStandardizeWorker.FIELD_KEYS:
+        for idx, key in enumerate(DirStandardizeWorker.FIELD_KEYS):
             cell = QHBoxLayout()
             cell.setSpacing(4)
             rb_input = QRadioButton("填")
@@ -3732,8 +3905,10 @@ class FileRenamePage(FunctionPage):
             cell.addWidget(rb_ref)
             cell.addWidget(edit)
             cell.addStretch()
-            std_form.addRow(key + ":", cell)
+            std_grid.addWidget(QLabel(key + ":"), idx % 3, (idx // 3) * 2)
+            std_grid.addLayout(cell, idx % 3, (idx // 3) * 2 + 1)
             self.std_fields[key] = (rb_input, rb_ref, edit)
+        std_form.addRow(std_grid)
 
         # 目录标准化后是否批量重命名目录下文件(默认不勾)
         self.std_rename_files_check = QCheckBox(
@@ -7645,7 +7820,7 @@ class ZoomableImageView(QGraphicsView):
         self._pix_item.setVisible(False)
         self._scene.addItem(self._pix_item)
         self._msg_item = self._scene.addText('')
-        self._msg_item.setDefaultTextColor(QColor('#7f8c8d'))
+        self._msg_item.setDefaultTextColor(QColor('#9aa7b8'))
         self._msg_item.setVisible(False)
         self._zoom = 1.0
         self._fit_mode = True
@@ -7656,8 +7831,8 @@ class ZoomableImageView(QGraphicsView):
         self.setAlignment(Qt.AlignCenter)
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setStyleSheet(
-            "QGraphicsView { background: #ffffff; border: 1px solid #bdc3c7;"
-            " border-radius: 3px; }")
+            "QGraphicsView { background: #10141f; border: 1px solid #3a4a6b;"
+            " border-radius: 4px; }")
         self.show_message('未选择文件')
 
     def has_image(self):
@@ -7804,7 +7979,7 @@ class ReplaceRangeDialog(QDialog):
         top = QHBoxLayout()
         self.subdir_label = QLabel("当前子目录: —")
         self.subdir_label.setStyleSheet(
-            "font-size: 16px; font-weight: bold; color: #1a5276;")
+            "font-size: 16px; font-weight: bold; color: #58A6FF;")
         self.subdir_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         top.addWidget(self.subdir_label, 1)
         self.stat_label = QLabel("已设置 0 / 0 个目录")
@@ -7842,14 +8017,14 @@ class ReplaceRangeDialog(QDialog):
 
         zoom_bar = QHBoxLayout()
         zoom_hint = QLabel("预览: 鼠标滚轮缩放，按住左键拖动")
-        zoom_hint.setStyleSheet("font-size: 12px; color: #7f8c8d;")
+        zoom_hint.setStyleSheet("font-size: 12px; color: #9AA7B8;")
         zoom_bar.addWidget(zoom_hint)
         zoom_bar.addStretch()
         self.zoom_label = QLabel("—")
         self.zoom_label.setMinimumWidth(56)
         self.zoom_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.zoom_label.setStyleSheet(
-            "font-size: 12px; font-weight: bold; color: #1a5276;")
+            "font-size: 12px; font-weight: bold; color: #58A6FF;")
         zoom_bar.addWidget(self.zoom_label)
         self.btn_fit_view = QPushButton("适应窗口")
         self.btn_fit_view.setObjectName("BrowseBtn")
@@ -7900,7 +8075,7 @@ class ReplaceRangeDialog(QDialog):
 
         self.source_hint = QLabel("")
         self.source_hint.setWordWrap(True)
-        self.source_hint.setStyleSheet("font-size: 12px; color: #7f8c8d;")
+        self.source_hint.setStyleSheet("font-size: 12px; color: #9AA7B8;")
         rv.addWidget(self.source_hint)
 
         split.addWidget(right)
@@ -7914,7 +8089,7 @@ class ReplaceRangeDialog(QDialog):
             "「基础名-0002.jpg」; 终止文件不得小于起始文件(可相同); "
             "所有子目录设置完成后点击「返回」保存。")
         tip.setWordWrap(True)
-        tip.setStyleSheet("color: #7f8c8d; font-size: 12px;")
+        tip.setStyleSheet("color: #9AA7B8; font-size: 12px;")
         v.addWidget(tip)
 
         btns = QHBoxLayout()
@@ -7942,21 +8117,21 @@ class ReplaceRangeDialog(QDialog):
             if complete:
                 text = "✓ {}\n     {} → {}".format(sub, rng[0], rng[1])
                 item = QListWidgetItem(text)
-                item.setForeground(QColor('#1B5E20'))
-                item.setBackground(QColor('#E8F5E9'))
+                item.setForeground(QColor('#3FB950'))
+                item.setBackground(QColor('#123524'))
             elif rng and rng[0]:
                 text = "⚠ {}\n     起始={}，缺终止文件".format(sub, rng[0])
                 item = QListWidgetItem(text)
-                item.setForeground(QColor('#B71C1C'))
-                item.setBackground(QColor('#FFEBEE'))
+                item.setForeground(QColor('#E5484D'))
+                item.setBackground(QColor('#3B1719'))
                 fnt = item.font()
                 fnt.setBold(True)
                 item.setFont(fnt)
             else:
                 text = "⚠ {}\n     未设置起始/终止文件".format(sub)
                 item = QListWidgetItem(text)
-                item.setForeground(QColor('#B71C1C'))
-                item.setBackground(QColor('#FFEBEE'))
+                item.setForeground(QColor('#E5484D'))
+                item.setBackground(QColor('#3B1719'))
                 fnt = item.font()
                 fnt.setBold(True)
                 item.setFont(fnt)
@@ -7980,21 +8155,21 @@ class ReplaceRangeDialog(QDialog):
         self.stat_label.setText("已设置 {} / {} 个目录".format(done, total))
         self.stat_label.setStyleSheet(
             "font-weight: bold; font-size: 13px; color: {};".format(
-                '#1B5E20' if done == total else '#B45309'))
+                '#3FB950' if done == total else '#D29922'))
         style = ("background-color: {}; border: 1px solid {}; border-radius: 3px;"
                  "padding: 4px 8px; font-weight: bold; color: {};")
         if start:
             self.start_label.setStyleSheet(
-                style.format('#E8F5E9', '#81C784', '#1B5E20'))
+                style.format('#123524', '#2EA043', '#3FB950'))
         else:
             self.start_label.setStyleSheet(
-                style.format('#FFF8E1', '#F0C36D', '#6D4C41'))
+                style.format('#3A2D12', '#8A6D1F', '#D29922'))
         if end:
             self.end_label.setStyleSheet(
-                style.format('#E3F2FD', '#64B5F6', '#0D47A1'))
+                style.format('#12263A', '#1F6FEB', '#58A6FF'))
         else:
             self.end_label.setStyleSheet(
-                style.format('#FFF8E1', '#F0C36D', '#6D4C41'))
+                style.format('#3A2D12', '#8A6D1F', '#D29922'))
 
     def on_subdir_changed(self, row):
         """切换左侧子目录: 右侧刷新文件列表与预览。"""
@@ -8036,11 +8211,11 @@ class ReplaceRangeDialog(QDialog):
             item = QListWidgetItem(fname + mark)
             item.setData(Qt.UserRole, fname)
             if 0 <= s_idx <= i <= e_idx:
-                item.setBackground(QColor('#E8F5E9'))
+                item.setBackground(QColor('#123524'))
             if i == s_idx:
-                item.setForeground(QColor('#1B5E20'))
+                item.setForeground(QColor('#3FB950'))
             elif i == e_idx:
-                item.setForeground(QColor('#0D47A1'))
+                item.setForeground(QColor('#58A6FF'))
             if i == s_idx or i == e_idx:
                 fnt = item.font()
                 fnt.setBold(True)
@@ -8209,24 +8384,24 @@ class ReplaceRangeDialog(QDialog):
         group = self._src_groups.get(self.current.lower(), [])
         start_num = _range_start_num(start)
         if not group:
-            self.source_hint.setStyleSheet("font-size: 12px; color: #B71C1C;")
+            self.source_hint.setStyleSheet("font-size: 12px; color: #E5484D;")
             self.source_hint.setText(
                 "⚠ JPG源目录中未找到基础名为该子目录的文件，替换时将报错跳过")
             return
         if start_num is None or not any(n == start_num for n, _p in group):
-            self.source_hint.setStyleSheet("font-size: 12px; color: #B71C1C;")
+            self.source_hint.setStyleSheet("font-size: 12px; color: #E5484D;")
             self.source_hint.setText(
                 "⚠ JPG源目录缺少编号 {} 的文件(起始编号须严格对应)，替换时将报错跳过"
                 .format('----' if start_num is None else '{:04d}'.format(start_num)))
             return
         avail = sum(1 for n, _p in group if n >= start_num)
         if avail < need:
-            self.source_hint.setStyleSheet("font-size: 12px; color: #B71C1C;")
+            self.source_hint.setStyleSheet("font-size: 12px; color: #E5484D;")
             self.source_hint.setText(
                 "⚠ JPG源文件不足: 范围需 {} 个，源目录仅有 {} 个(编号≥{:04d})，"
                 "替换时将报错跳过".format(need, avail, start_num))
         else:
-            self.source_hint.setStyleSheet("font-size: 12px; color: #1B5E20;")
+            self.source_hint.setStyleSheet("font-size: 12px; color: #3FB950;")
             self.source_hint.setText(
                 "源文件检查: 可替换(范围需 {} 个，源目录可用 {} 个)".format(need, avail))
 
@@ -9077,7 +9252,7 @@ class ArchiveCatalogPage(FunctionPage):
             "编码: 全宗号-类型·年度-期限-项目号-案卷号; 期限Y=永久 D30=30年 D10=10年; "
             "输出文件名=所选目录名+目录类型"
         )
-        biz_info.setStyleSheet("color: #666; font-size: 12px;")
+        biz_info.setStyleSheet("color: #9AA7B8; font-size: 12px;")
         biz_info.setWordWrap(True)
         biz_v.addWidget(biz_info)
         biz_v.addStretch()
@@ -9090,7 +9265,7 @@ class ArchiveCatalogPage(FunctionPage):
             "【文书目录】沿用原有科技类案卷级目录生成逻辑。\n"
             "请切换到「业务目录」TAB使用新功能; 文书目录功能规划中。"
         )
-        doc_info.setStyleSheet("color: #666; font-size: 12px;")
+        doc_info.setStyleSheet("color: #9AA7B8; font-size: 12px;")
         doc_v.addWidget(doc_info)
         doc_v.addStretch()
         self.tabs.addTab(doc_widget, "文书目录")
@@ -9291,7 +9466,7 @@ class FileSplitPage(FunctionPage):
             "• 检查: 按与分件相同的依据(xlsx/OCR)检查各目录，发现应移走却残留的文件并生成报告\n"
             "• 手工分件: 逐个目录手工输入序号/页号拆分(带连续性校验)"
         )
-        info.setStyleSheet("color: #666; font-size: 12px;")
+        info.setStyleSheet("color: #9AA7B8; font-size: 12px;")
         self.layout.addWidget(info)
 
         # 按钮
@@ -9321,11 +9496,11 @@ class FileSplitPage(FunctionPage):
         self.progress.setFormat("待开始")
         self.layout.addWidget(self.progress)
 
-        # 日志
+        # 日志(v3.33: 固定高度, 多余空间统一留给页面底部, 避免控件被拉伸)
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(250)
-        self.layout.addWidget(self.log_box, 1)
+        self.log_box.setFixedHeight(200)
+        self.layout.addWidget(self.log_box)
 
         self.worker = None
 
@@ -10225,7 +10400,7 @@ class XlsxToJpgPage(FunctionPage):
                            "点击开始转换后会先根据第一个待处理文件提醒输出文件名格式。"
                            "处理日志生成在输出目录下。"
                            "多 sheet 的文件仅转换第一个 sheet；旧版 xls (OLE2) 格式请先另存为 xlsx。")
-        info_label.setStyleSheet("color: #666; font-size: 12px; margin: 10px 0;")
+        info_label.setStyleSheet("color: #9AA7B8; font-size: 12px; margin: 10px 0;")
         info_label.setWordWrap(True)
         self.layout.addWidget(info_label)
 
@@ -10375,56 +10550,144 @@ def _app_resource_path(filename):
 
 
 class MainWindow(QMainWindow):
+    """主窗口(HomeAplication1.0 风格改造):
+    无边框窗口 + 自定义标题栏(最小化/最大化/关闭, 拖动移动, 双击最大化),
+    左侧深色菜单栏(可折叠动画, 选中指示条), 右侧功能区置于带阴影的
+    圆角卡片内; 窗口尺寸放大并支持边缘拉伸, 长功能页可滚动, 保证各功能
+    控件与文字完整可见。"""
+
+    SIDEBAR_EXPANDED = 250
+    SIDEBAR_COLLAPSED = 80
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("同美档案工具集合 v" + VERSION)
         icon_path = _app_resource_path('TMToolMan.ico')
         if os.path.isfile(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-        self.resize(1000, 650)
+
+        # 无边框窗口(HomeAplication 风格); 初始尺寸1354x851(实测定位),
+        # 各功能页控件在该尺寸下无需拖动滚动条即可完整可见
+        self.setWindowFlags(Qt.FramelessWindowHint)
+        self.resize(1600, 900)
+        self.setMinimumSize(1000, 640)
         self.setStyleSheet(TechStyle.QSS)
+
+        self._drag_pos = None          # 标题栏拖动起始位置
+        self._sidebar_expanded = True
 
         # 主中心部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        root = QVBoxLayout(central_widget)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # 左侧菜单栏
+        # ---------- 自定义标题栏 ----------
+        self.title_bar = QWidget()
+        self.title_bar.setObjectName("TitleBar")
+        self.title_bar.setFixedHeight(46)
+        tb = QHBoxLayout(self.title_bar)
+        tb.setContentsMargins(12, 0, 0, 0)
+        tb.setSpacing(2)
+
+        if os.path.isfile(icon_path):
+            lbl_icon = QLabel()
+            lbl_icon.setPixmap(QIcon(icon_path).pixmap(24, 24))
+            tb.addWidget(lbl_icon)
+        lbl_title = QLabel("  同美档案工具集合 v" + VERSION)
+        lbl_title.setObjectName("TitleBarTitle")
+        tb.addWidget(lbl_title)
+        tb.addStretch()
+
+        self.btn_min = QPushButton("—")
+        self.btn_min.setObjectName("TitleBtn")
+        self.btn_min.setFixedSize(46, 46)
+        self.btn_min.setToolTip("最小化")
+        self.btn_min.clicked.connect(self.showMinimized)
+        tb.addWidget(self.btn_min)
+
+        self.btn_max = QPushButton("□")
+        self.btn_max.setObjectName("TitleBtn")
+        self.btn_max.setFixedSize(46, 46)
+        self.btn_max.setToolTip("最大化/还原")
+        self.btn_max.clicked.connect(self._toggle_max)
+        tb.addWidget(self.btn_max)
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setObjectName("TitleBtn")
+        self.btn_close.setProperty("close", True)
+        self.btn_close.setFixedSize(46, 46)
+        self.btn_close.setToolTip("关闭")
+        self.btn_close.clicked.connect(self.close)
+        tb.addWidget(self.btn_close)
+        root.addWidget(self.title_bar)
+
+        # ---------- 主体: 左侧菜单栏 + 右侧功能区 ----------
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
         self.left_panel = QWidget()
         self.left_panel.setObjectName("LeftPanel")
-        self.left_panel.setFixedWidth(220)
+        self.left_panel.setMinimumWidth(self.SIDEBAR_EXPANDED)
+        self.left_panel.setMaximumWidth(self.SIDEBAR_EXPANDED)
         left_layout = QVBoxLayout(self.left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
         left_layout.setAlignment(Qt.AlignTop)
 
-        title = QLabel("同美档案工具集合")
-        title.setObjectName("TitleLabel")
-        title.setAlignment(Qt.AlignCenter)
-        left_layout.addWidget(title)
+        # 折叠/展开开关(HomeAplication 侧栏动画)
+        self.toggle_btn = QPushButton("☰  功能菜单")
+        self.toggle_btn.setObjectName("ToggleBtn")
+        self.toggle_btn.setCursor(Qt.PointingHandCursor)
+        self.toggle_btn.clicked.connect(self._toggle_sidebar)
+        left_layout.addWidget(self.toggle_btn)
 
-        # 菜单按钮配置
-        menus = ["文件改名", "自动编页码", "文件移动", "加盖归档章",
-                 "修改DPI", "表格输出为JPG", "JPG转双层PDF", "PDF转OFD", "分件", "文件批量替换",
-                 "档案馆标准目录"]
+        self.sidebar_title = QLabel("同美档案工具集合")
+        self.sidebar_title.setObjectName("SidebarTitle")
+        self.sidebar_title.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(self.sidebar_title)
+
+        # 菜单按钮配置: (图标[Segoe UI Symbol, Win7可用], 功能名)
+        menus = [("✎", "文件改名"), ("▤", "自动编页码"), ("➜", "文件移动"),
+                 ("✉", "加盖归档章"), ("◧", "修改DPI"), ("▦", "表格输出为JPG"),
+                 ("▣", "JPG转双层PDF"), ("⇄", "PDF转OFD"), ("✂", "分件"),
+                 ("⇆", "文件批量替换"), ("☰", "档案馆标准目录")]
 
         self.menu_buttons = []
-        for m in menus:
-            btn = QPushButton(m)
+        self._menu_specs = []
+        for icon, name in menus:
+            btn = QPushButton()
             btn.setObjectName("MenuBtn")
             btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setProperty("page", name)
             btn.clicked.connect(lambda checked, b=btn: self.on_menu_click(b))
             left_layout.addWidget(btn)
             self.menu_buttons.append(btn)
+            self._menu_specs.append((icon, name, btn))
 
         left_layout.addStretch()
+        self.sidebar_version = QLabel("v" + VERSION)
+        self.sidebar_version.setObjectName("SidebarVersion")
+        self.sidebar_version.setAlignment(Qt.AlignCenter)
+        left_layout.addWidget(self.sidebar_version)
+        body.addWidget(self.left_panel)
+        self._apply_sidebar_texts(True)
 
-        # 右侧功能区 (使用QStackedWidget管理多页面)
+        # ---------- 右侧功能区(带阴影的圆角内容卡片) ----------
+        from PyQt5.QtWidgets import (QScrollArea, QFrame,
+                                     QGraphicsDropShadowEffect)
         self.right_panel = QWidget()
         self.right_panel.setObjectName("RightPanel")
         right_layout = QVBoxLayout(self.right_panel)
-        right_layout.setContentsMargins(20, 20, 20, 20)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.content_card = QWidget()
+        self.content_card.setObjectName("ContentCard")
+        card_layout = QVBoxLayout(self.content_card)
+        card_layout.setContentsMargins(18, 14, 18, 14)
 
         self.stack = QStackedWidget()
 
@@ -10442,18 +10705,147 @@ class MainWindow(QMainWindow):
             "文件批量替换": FileBatchReplacePage(),
             "档案馆标准目录": ArchiveCatalogPage()
         }
-
-        for name in menus:
+        for _icon, name in menus:
             self.stack.addWidget(self.pages[name])
 
-        right_layout.addWidget(self.stack)
+        # 长页面放入滚动区, 保证任意窗口尺寸下控件完整可见可操作
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # viewport 默认会以系统浅色填充, 关闭自动填充使其透出深色卡片背景
+        scroll.viewport().setAutoFillBackground(False)
+        scroll.setWidget(self.stack)
+        card_layout.addWidget(scroll)
+
+        # 内容卡片阴影(HomeAplication 图形阴影风格)
+        shadow = QGraphicsDropShadowEffect(self.content_card)
+        shadow.setBlurRadius(30)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 140))
+        self.content_card.setGraphicsEffect(shadow)
+
+        right_layout.addWidget(self.content_card)
 
         # 组装整体布局
-        main_layout.addWidget(self.left_panel)
-        main_layout.addWidget(self.right_panel)
+        body.addWidget(self.right_panel)
+        root.addLayout(body)
 
         # 默认选中第一个菜单
         self.on_menu_click(self.menu_buttons[0])
+
+    # ---------- 标题栏交互(HomeAplication 无边框窗口行为) ----------
+    def mousePressEvent(self, event):
+        if (event.button() == Qt.LeftButton
+                and event.pos().y() <= self.title_bar.height()):
+            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_pos is not None and event.buttons() & Qt.LeftButton
+                and not self.isMaximized()):
+            self.move(event.globalPos() - self._drag_pos)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.pos().y() <= self.title_bar.height():
+            self._toggle_max()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _toggle_max(self):
+        if self.isMaximized():
+            self.showNormal()
+            self.btn_max.setText("□")
+        else:
+            self.showMaximized()
+            self.btn_max.setText("❐")
+
+    def nativeEvent(self, eventType, message):
+        """无边框窗口边缘拉伸(Windows): 处理 WM_NCHITTEST, 让窗口四边/四角
+        可拖动调整大小(HomeAplication 无边框窗口的补全)。"""
+        try:
+            if bytes(eventType) != b"windows_generic_MSG":
+                return False, 0
+            import ctypes
+            from ctypes import wintypes
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message != 0x0084:  # WM_NCHITTEST
+                return False, 0
+            # lParam: 低位=屏幕X, 高位=屏幕Y(均为有符号16位)
+            x = ctypes.c_short(msg.lParam & 0xFFFF).value
+            y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+            g = self.frameGeometry()
+            m = 6
+            left = x < g.left() + m
+            right = x > g.right() - m
+            top = y < g.top() + m
+            bottom = y > g.bottom() - m
+            if top and left:
+                return True, 13    # HTTOPLEFT
+            if top and right:
+                return True, 14    # HTTOPRIGHT
+            if bottom and left:
+                return True, 16    # HTBOTTOMLEFT
+            if bottom and right:
+                return True, 17    # HTBOTTOMRIGHT
+            if left:
+                return True, 10    # HTLEFT
+            if right:
+                return True, 11    # HTRIGHT
+            if top:
+                return True, 12    # HTTOP
+            if bottom:
+                return True, 15    # HTBOTTOM
+        except Exception:
+            pass
+        return False, 0
+
+    # ---------- 侧栏折叠动画(HomeAplication 菜单动画) ----------
+    def _toggle_sidebar(self):
+        self._set_sidebar_expanded(not self._sidebar_expanded)
+
+    def _set_sidebar_expanded(self, expanded):
+        from PyQt5.QtCore import (QPropertyAnimation, QEasingCurve,
+                                  QParallelAnimationGroup)
+        self._sidebar_expanded = expanded
+        panel = self.left_panel
+        start = panel.width()
+        target = self.SIDEBAR_EXPANDED if expanded else self.SIDEBAR_COLLAPSED
+        anim_min = QPropertyAnimation(panel, b"minimumWidth")
+        anim_min.setDuration(400)
+        anim_min.setStartValue(start)
+        anim_min.setEndValue(target)
+        anim_min.setEasingCurve(QEasingCurve.OutExpo)
+        anim_max = QPropertyAnimation(panel, b"maximumWidth")
+        anim_max.setDuration(400)
+        anim_max.setStartValue(start)
+        anim_max.setEndValue(target)
+        anim_max.setEasingCurve(QEasingCurve.OutExpo)
+        self._sidebar_anim = QParallelAnimationGroup(self)
+        self._sidebar_anim.addAnimation(anim_min)
+        self._sidebar_anim.addAnimation(anim_max)
+        self._sidebar_anim.start()
+        self._apply_sidebar_texts(expanded)
+
+    def _apply_sidebar_texts(self, expanded):
+        """折叠时仅显示图标, 展开时显示图标+文字(HomeAplication 侧栏行为)。"""
+        self.sidebar_title.setText("同美档案工具集合" if expanded else "")
+        self.sidebar_version.setText("v" + VERSION if expanded else "")
+        self.toggle_btn.setText("☰  功能菜单" if expanded else "☰")
+        for icon, name, btn in self._menu_specs:
+            # QPushButton不支持HTML富文本(会原样显示<span>标签), 直接拼接纯文本
+            btn.setText(icon + "  " + name if expanded else icon)
+            btn.setToolTip("" if expanded else name)
 
     def on_menu_click(self, clicked_btn):
         """处理菜单点击切换事件"""
@@ -10464,7 +10856,7 @@ class MainWindow(QMainWindow):
         clicked_btn.setChecked(True)
 
         # 切换右侧堆栈页面
-        page_name = clicked_btn.text()
+        page_name = clicked_btn.property("page")
         if page_name in self.pages:
             self.stack.setCurrentWidget(self.pages[page_name])
 
@@ -10504,10 +10896,10 @@ if __name__ == "__main__":
     _icon_path = _app_resource_path('TMToolMan.ico')
     if os.path.isfile(_icon_path):
         app.setWindowIcon(QIcon(_icon_path))
-    # 强制使用深色科技感字体渲染
-    f = QFont("Microsoft YaHei", 9)
+    # 全局字体(HomeAplication 风格界面, 窗口放大后字号相应增大)
+    f = QFont("Microsoft YaHei", 10)
     app.setFont(f)
 
     window = MainWindow()
-    window.show()
+    window.show()  # 以MainWindow内设定的初始尺寸1354x851启动(可手动最大化)
     sys.exit(app.exec_())
