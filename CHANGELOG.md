@@ -4,6 +4,15 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.32（2026-10-20）
+
+新增系统图标并接入程序：
+
+- 设计深蓝圆角图标：档案文件夹、白色文档、青色扫描线、金色齿轮，配色呼应主界面深蓝/蓝色调。
+- 交付 `TMToolMan_icon.png`（1024×1024）、`TMToolMan_icon_256.png` 与多尺寸 `TMToolMan.ico`（16/20/24/32/48/64/128/256）。
+- 主窗口与 `QApplication` 设置窗口/任务栏图标；源码运行与 PyInstaller onefile 均可从 `_MEIPASS` 或程序同目录加载。
+- 打包 spec 使用 `icon=` 嵌入 EXE 图标，并将 ICO 作为数据文件随包分发，使资源管理器、任务栏、Alt+Tab 与窗口图标保持一致。
+
 ## TMToolMan v3.31（2026-10-19）
 
 替换目录设置窗口的预览图支持缩放：

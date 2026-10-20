@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.31"
+VERSION = "3.32"
 
 CHANGELOG = [
+    {
+        "version": "3.32",
+        "date": "2026-10-20",
+        "changes": [
+            "新增系统图标并接入程序：①设计深蓝圆角图标(档案文件夹+白色文档+青色扫描线+金色齿轮)，交付1024/256 PNG与含16/20/24/32/48/64/128/256多尺寸的 TMToolMan.ico；②主窗口与 QApplication 均设置窗口/任务栏图标，源码运行与 PyInstaller onefile 打包(_MEIPASS/程序同目录)均可加载；③打包 spec 通过 icon= 嵌入EXE图标，并把 ICO 作为数据文件随包分发，使文件资源管理器、任务栏与窗口图标一致",
+        ],
+    },
     {
         "version": "3.31",
         "date": "2026-10-19",
@@ -242,7 +249,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal as Signal, QRegularExpression,
                          QSize, QEvent, QTimer)
 from PyQt5.QtGui import (QFont, QRegularExpressionValidator, QImageReader,
-                         QPixmap, QColor, QPainter)
+                         QPixmap, QColor, QPainter, QIcon)
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # 注：cv2 与 numpy 已改为在 AutoPagingWorker.add_number_to_image 中延迟导入，
@@ -10353,10 +10360,27 @@ class XlsxToJpgPage(FunctionPage):
             self.log_box.clear()
 
 
+def _app_resource_path(filename):
+    """返回随程序分发的资源路径(兼容源码运行与PyInstaller onefile)。"""
+    if getattr(sys, 'frozen', False):
+        base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, filename)
+    if os.path.isfile(path):
+        return path
+    # 兼容资源未打入包内、但与exe放在同一目录的情况
+    alt = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), filename)
+    return alt if os.path.isfile(alt) else path
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("同美档案工具集合 v" + VERSION)
+        icon_path = _app_resource_path('TMToolMan.ico')
+        if os.path.isfile(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.resize(1000, 650)
         self.setStyleSheet(TechStyle.QSS)
 
@@ -10477,6 +10501,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     app = QApplication(sys.argv)
+    _icon_path = _app_resource_path('TMToolMan.ico')
+    if os.path.isfile(_icon_path):
+        app.setWindowIcon(QIcon(_icon_path))
     # 强制使用深色科技感字体渲染
     f = QFont("Microsoft YaHei", 9)
     app.setFont(f)
