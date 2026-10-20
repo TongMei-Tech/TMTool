@@ -4313,7 +4313,7 @@ if __name__ == "__main__":
     
     # 主窗口改为TAB: 黑圈去除 / 有效区域展示
     window = QTabWidget()
-    window.addTab(BlackCircleRemoverPage(), "黑圈去除")
+    window.addTab(BlackCircleRemoverPage(), "扫描质量处理")
     window.addTab(ValidRegionPage(), "有效区域展示")
     window.setWindowTitle("同美图像质检工具 v" + VERSION)
     window.setGeometry(100, 100, 1400, 900)
