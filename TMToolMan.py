@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.33"
+VERSION = "3.34"
 
 CHANGELOG = [
+    {
+        "version": "3.34",
+        "date": "2026-10-22",
+        "changes": [
+            "文件批量替换的校验失败提示框改简短统计，避免内容过多撑高弹窗看不见确定按钮：①「设置替换目录」弹窗点击「返回(保存设置)」时，不再用超长文本逐项列出所有未设置完整的子目录(子目录名较长时QMessageBox会被撑得很高、底部的确定按钮被推出屏幕外无法点击)——改为一句「还有N个子目录未设置完整(左侧红色⚠项已高亮)」简短统计提示，问题项仍由左侧红色⚠列表高亮标明并自动选中首个问题子目录引导处理；②主页面点击「开始替换」前的完整性校验提示同步改为简短统计(「N个未设置起止文件、M个设置无效」)，不再顿号串联/逐行列出子目录名，详情交由设置窗口左侧红色⚠列表标明",
+        ],
+    },
     {
         "version": "3.33",
         "date": "2026-10-20",
@@ -8427,11 +8434,15 @@ class ReplaceRangeDialog(QDialog):
         if problems:
             self._update_dir_items()
             self._update_header()
-            msg = "以下子目录未设置完整(红色⚠项)，请逐项设置后再返回:\n\n"
-            msg += "\n".join(problems[:15])
-            if len(problems) > 15:
-                msg += "\n…共 {} 项".format(len(problems))
-            QMessageBox.warning(self, "设置未完成", msg)
+            # v3.34: 校验失败提示不再逐项列出所有问题子目录——子目录名较长时
+            # QMessageBox 会被撑得非常高, 底部的确定按钮被推出屏幕外无法点击。
+            # 改为一句简短统计提示; 问题项仍由左侧红色⚠列表高亮标明, 并自动
+            # 选中首个问题子目录引导用户逐项处理。
+            QMessageBox.warning(
+                self, "设置未完成",
+                "还有 {} 个子目录未设置完整（左侧红色⚠项已高亮）。\n"
+                "请逐项设置起始/终止目录文件后再点击「返回」。".format(
+                    len(problems)))
             for sub in self.subdirs:
                 if any(p.startswith(sub + ':') for p in problems):
                     self.dir_list.setCurrentRow(self.subdirs.index(sub))
@@ -8667,15 +8678,14 @@ class FileBatchReplacePage(FunctionPage):
             elif _range_start_num(start) is None:
                 invalid.append(f"{sub}: 起始文件名不含四位编号")
         if missing or invalid:
-            msg = "替换目录设置不完整，请点击「设置替换目录」逐项设置：\n\n"
-            if missing:
-                msg += "未设置起止文件: " + "、".join(missing[:10])
-                if len(missing) > 10:
-                    msg += " 等"
-                msg += "\n"
-            if invalid:
-                msg += "\n".join(invalid[:10])
-            QMessageBox.warning(self, "提示", msg)
+            # v3.34: 与设置窗口一致, 不再用长文本逐项列出(子目录名较长时
+            # 提示框会高到看不见底部确定按钮), 改为一句简短统计; 问题详情
+            # 由「设置替换目录」窗口左侧红色⚠列表高亮标明。
+            QMessageBox.warning(
+                self, "提示",
+                "替换目录设置不完整：{} 个未设置起止文件、{} 个设置无效。\n"
+                "请点击「设置替换目录」逐项设置（左侧红色⚠项）。".format(
+                    len(missing), len(invalid)))
             return
 
         ranges = {sub: (self.ranges[sub][0], self.ranges[sub][1])
