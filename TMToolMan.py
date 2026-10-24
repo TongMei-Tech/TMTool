@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.36"
+VERSION = "3.37"
 
 CHANGELOG = [
+    {
+        "version": "3.37",
+        "date": "2026-10-24",
+        "changes": [
+            "文件批量替换新增「自动识别目录」选项(默认勾选)：①勾选后点击「设置替换目录」打开弹窗时，自动对目标目录每个子目录的前12个文件(按文件名排序)从第2页起检测「卷内文件目录」表格页(复用FileSplitWorker._detect_table_rows的OpenCV横线检测，只判断是否表格、不识别表格内容、不调用PaddleOCR)，连续表格页即目录页，目录结束后的第一页=正文第一页；②识别结果自动填充每个子目录的起止文件(起始=正文第一页，终止=最后一个文件)，用现有【起】【止】标注展示，用户可再用现有按钮手动调整；③识别过程用模态QProgressDialog提示进度(ApplicationModal+禁取消)，期间用户无法操作；④识别失败的子目录(第2页非表格/目录覆盖到末尾)提示并保留手动设置；⑤新增CatalogDetectWorker(QThread)后台检测线程，方法别名复用_detect_table_rows/_imread_cn",
+        ],
+    },
     {
         "version": "3.36",
         "date": "2026-10-24",
@@ -270,7 +277,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QFileDialog, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox,
                              QFormLayout, QGroupBox, QMessageBox, QStackedWidget, QCheckBox,
-                             QProgressBar, QDialog, QListWidget, QListWidgetItem, QTableWidget,
+                             QProgressBar, QProgressDialog, QDialog, QListWidget, QListWidgetItem, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QRadioButton, QSplitter, QGraphicsView, QGraphicsScene,
                              QGraphicsPixmapItem, QTabWidget)
@@ -7737,6 +7744,76 @@ class FileBatchReplaceWorker(QThread):
             self.finished_signal.emit(False, f"处理出错: {e}")
 
 
+class CatalogDetectWorker(QThread):
+    """自动识别目录后台线程(v3.37) - 检测每个子目录的「卷内文件目录」表格页范围。
+
+    规则: 目标子目录结构为 卷皮(第1页) → 卷内文件目录(第2页起, 表格形式, ≤10页)
+    → 正文(文字页)。本线程对每个子目录的前12个文件(按文件名排序)，从第2个文件起
+    用 OpenCV 表格线检测(_detect_table_rows)判断「是否为表格页」，连续表格页即目录页。
+    目录结束后的第一个文件=正文第一页。结果用于自动设置替换起止文件:
+      起始文件 = 正文第一页, 终止文件 = 最后一个文件。
+    不识别表格内容(不调用 PaddleOCR), 仅判断「是否表格」。
+    """
+    log_signal = Signal(str)
+    progress_signal = Signal(int, int)   # (当前, 总数)
+    finished_signal = Signal(dict)       # {子目录: {'start':文件名,'end':文件名} 或 {'error':原因}}
+
+    # 复用 FileSplitWorker 的表格线检测(纯OpenCV, 无OCR)与中文路径读图
+    _detect_table_rows = FileSplitWorker._detect_table_rows
+    _imread_cn = staticmethod(FileSplitWorker._imread_cn)
+
+    def __init__(self, target_dir, subdirs, parent=None):
+        super().__init__(parent)
+        self.target_dir = target_dir
+        self.subdirs = list(subdirs or [])
+        self.is_stopped = False
+
+    def stop(self):
+        self.is_stopped = True
+
+    def run(self):
+        result = {}
+        total = len(self.subdirs)
+        for i, sub in enumerate(self.subdirs, 1):
+            if self.is_stopped:
+                break
+            sub_path = os.path.join(self.target_dir, sub)
+            try:
+                files = _jpg_range_files(sub_path)
+            except Exception:
+                files = []
+            if len(files) < 2:
+                result[sub] = {'error': '文件不足(少于2个JPG)'}
+                self.log_signal.emit(f"[{i}/{total}] {sub}: 文件不足, 跳过")
+                self.progress_signal.emit(i, total)
+                continue
+            sample = files[:12]  # 只检测前12个文件(目录≤10页, 前12足够)
+            # 从第2页(索引1)起检测连续表格页, 遇第一个非表格页即停
+            last_table_idx = -1
+            for idx in range(1, len(sample)):
+                img_path = os.path.join(sub_path, sample[idx])
+                if self._detect_table_rows(img_path):
+                    last_table_idx = idx
+                else:
+                    break
+            if last_table_idx < 1:
+                result[sub] = {'error': '未识别到目录(第2页非表格)'}
+                self.log_signal.emit(f"[{i}/{total}] {sub}: 第2页非表格, 未识别到目录")
+            else:
+                start_idx = last_table_idx + 1
+                if start_idx >= len(files):
+                    result[sub] = {'error': '目录覆盖到文件末尾, 无正文'}
+                    self.log_signal.emit(
+                        f"[{i}/{total}] {sub}: 目录覆盖到文件末尾, 无法确定正文起点")
+                else:
+                    result[sub] = {'start': files[start_idx], 'end': files[-1]}
+                    self.log_signal.emit(
+                        f"[{i}/{total}] {sub}: 目录页 {files[1]}~{files[last_table_idx]}"
+                        f", 正文起点 {files[start_idx]}, 终止 {files[-1]}")
+            self.progress_signal.emit(i, total)
+        self.finished_signal.emit(result)
+
+
 class ReplaceRangeStore:
     """替换目录范围设置的SQLite持久化(v3.30)。
 
@@ -7947,7 +8024,7 @@ class ReplaceRangeDialog(QDialog):
     校验完整性并保存到本地SQLite数据库。
     """
 
-    def __init__(self, target_dir, ranges=None, jpg_dir='', parent=None):
+    def __init__(self, target_dir, ranges=None, jpg_dir='', auto_detect=False, parent=None):
         super().__init__(parent)
         self.target_dir = target_dir
         self.jpg_dir = jpg_dir or ''
@@ -7958,6 +8035,8 @@ class ReplaceRangeDialog(QDialog):
         self.ranges = {}          # {子目录: [起始文件, 终止文件]}
         self.current = ''
         self.current_file = ''
+        self._detect_worker = None  # v3.37: 自动识别目录后台线程
+        self._progress_dlg = None   # v3.37: 识别进度对话框(模态)
 
         self._load_initial(ranges)
         self._build_ui()
@@ -7966,6 +8045,63 @@ class ReplaceRangeDialog(QDialog):
             self.dir_list.setCurrentRow(0)  # 触发 on_subdir_changed
         else:
             self._update_header()
+
+        # v3.37: 勾选「自动识别目录」时，打开窗口即自动识别目录页范围
+        # (延迟到事件循环启动后执行, 确保对话框已显示、模态进度生效)
+        if auto_detect and self.subdirs:
+            QTimer.singleShot(0, self._start_auto_detect)
+
+    def _start_auto_detect(self):
+        """v3.37: 启动后台线程自动识别目录页范围(模态进度提示, 期间禁止操作)。"""
+        if self._detect_worker is not None:
+            return
+        self._detect_worker = CatalogDetectWorker(
+            self.target_dir, self.subdirs, parent=self)
+        self._progress_dlg = QProgressDialog(
+            "正在自动识别目录(检测卷内文件目录表格页)...",
+            "", 0, len(self.subdirs), self)
+        self._progress_dlg.setWindowTitle("自动识别目录")
+        self._progress_dlg.setWindowModality(Qt.ApplicationModal)
+        self._progress_dlg.setCancelButton(None)  # 禁止取消
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setValue(0)
+        self._detect_worker.progress_signal.connect(self._on_detect_progress)
+        self._detect_worker.log_signal.connect(self._progress_dlg.setLabelText)
+        self._detect_worker.finished_signal.connect(self._on_detect_done)
+        self._detect_worker.start()
+
+    def _on_detect_progress(self, cur, total):
+        if self._progress_dlg is not None:
+            self._progress_dlg.setMaximum(max(total, 1))
+            self._progress_dlg.setValue(cur)
+
+    def _on_detect_done(self, result):
+        """v3.37: 自动识别完成, 关闭进度, 填充起止文件并刷新界面。"""
+        if self._progress_dlg is not None:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        ok_count = 0
+        fail_count = 0
+        for sub, info in (result or {}).items():
+            if 'error' in info or 'start' not in info or 'end' not in info:
+                fail_count += 1
+                continue
+            # 自动设置起止文件: 起始=目录后的正文第一页, 终止=最后一个文件
+            self.ranges[sub] = [info['start'], info['end']]
+            ok_count += 1
+        # 刷新左侧列表 + 顶部进度 + 当前子目录文件列表(展示【起】【止】标注)
+        self._update_dir_items()
+        self._update_header()
+        if self.current:
+            try:
+                self._rebuild_file_list(self._files(self.current))
+            except Exception:
+                pass
+        if fail_count:
+            QMessageBox.information(
+                self, "自动识别目录",
+                f"已识别 {ok_count} 个子目录的目录页范围。\n"
+                f"{fail_count} 个子目录未识别到目录(左侧红色⚠项)，请手动设置。")
 
     def _load_initial(self, ranges):
         """载入已保存设置: 优先用调用方传入的(内存最新)，否则读数据库；
@@ -8516,9 +8652,12 @@ class FileBatchReplacePage(FunctionPage):
         btn_set_ranges = QPushButton("设置替换目录")
         btn_set_ranges.setObjectName("BrowseBtn")
         btn_set_ranges.clicked.connect(self.open_range_dialog)
+        self.auto_detect_catalog = QCheckBox("自动识别目录")
+        self.auto_detect_catalog.setChecked(True)  # v3.37: 默认勾选
         h3 = QHBoxLayout()
         h3.addWidget(self.range_edit)
         h3.addWidget(btn_set_ranges)
+        h3.addWidget(self.auto_detect_catalog)
 
         form.addRow("JPG源目录:", h1)
         form.addRow("目标目录:", h2)
@@ -8528,14 +8667,15 @@ class FileBatchReplacePage(FunctionPage):
 
         info_label = QLabel(
             "功能说明：\n"
+            "• 勾选「自动识别目录」后，打开设置窗口会自动识别每个子目录的目录页(表格页)范围，\n"
+            "  自动设置「起始目录文件」=目录后的正文第一页、「终止目录文件」=最后一个文件\n"
             "• 点击「替换目录列表」为目标目录下的每个子目录设置「起始目录文件」和「终止目录文件」，\n"
             "  设置结果按目标目录保存在本地数据库(file_replace_ranges.db)，下次自动载入\n"
             "• 弹窗左侧为目标目录下包含JPG文件的子目录列表：绿色✓=已设置完整，红色⚠=未设置完整\n"
             "• 起始目录文件必须形如「基础名-四位编号.jpg」，其编号须与JPG源目录中\n"
             "  同名基础名的文件编号严格对应；终止文件不得小于起始文件(可相同)\n"
-            "• 替换范围 = 起始文件到终止文件(含)之间的全部JPG文件；\n"
-            "  JPG源目录中编号≥起始编号的文件数必须≥范围内目标文件数，否则报错跳过该子目录并记录日志\n"
-            "• 源文件按编号升序依次覆盖范围内目标文件(保留目标文件名)，多余源文件忽略\n"
+            "• 替换以源文件为准：源目录中编号≥起始编号的文件依次写入目标目录\n"
+            "  (同编号覆盖、缺编号新增补页)\n"
             "• 处理日志生成在目标目录下\n"
             "• 替换后在每个目标子目录生成/更新 Directory.txt(记录替换后的文件名清单, 不含扩展名)\n"
             "• 注意：此操作会覆盖目标目录文件，建议先备份"
@@ -8641,7 +8781,9 @@ class FileBatchReplacePage(FunctionPage):
         try:
             dlg = ReplaceRangeDialog(
                 target_d, ranges=self.ranges,
-                jpg_dir=self.jpg_dir.text().strip(), parent=self)
+                jpg_dir=self.jpg_dir.text().strip(),
+                auto_detect=self.auto_detect_catalog.isChecked(),
+                parent=self)
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开替换目录设置窗口失败: {e}")
         finally:
