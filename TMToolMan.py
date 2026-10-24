@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.40"
+VERSION = "3.41"
 
 CHANGELOG = [
+    {
+        "version": "3.41",
+        "date": "2026-10-24",
+        "changes": [
+            "修复「自动识别目录」替换终止文件错误标识为最后一个文件的问题(用户反馈「终止目录文件没有被标识出」)：原result['end']=files[-1](最后一个文件)，现改为result['end']=files[end_idx](目录终止文件=连续表格最后一页)——替换范围应为目录文件起止(替换起始=目录起始文件，替换终止=目录终止文件，单张目录两者相同)，使【止】正确标识在目录终止文件上",
+        ],
+    },
     {
         "version": "3.40",
         "date": "2026-10-24",
@@ -7852,12 +7859,12 @@ class CatalogDetectWorker(QThread):
                         end_idx = idx
                     else:
                         break
-                # 替换范围 = 从目录起始到末页: 起始=目录起始文件, 终止=最后一个文件
-                result[sub] = {'start': files[start_idx], 'end': files[-1]}
+                # 替换范围 = 目录文件起止: 起始=目录起始文件, 终止=目录终止文件
+                result[sub] = {'start': files[start_idx], 'end': files[end_idx]}
                 self.log_signal.emit(
                     f"[{i}/{total}] {sub}: 目录 {files[start_idx]}~{files[end_idx]}"
-                    f"({end_idx - start_idx + 1}页), 替换起始 {files[start_idx]}, "
-                    f"终止 {files[-1]}")
+                    f"({end_idx - start_idx + 1}页), 替换范围 {files[start_idx]}"
+                    f" → {files[end_idx]}")
                 self.progress_signal.emit(i, total)
         except Exception as e:
             # 任何未预期异常都不能让线程静默死亡(否则 finished_signal 不发, 进度对话框卡住)
