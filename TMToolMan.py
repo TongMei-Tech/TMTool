@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.34"
+VERSION = "3.35"
 
 CHANGELOG = [
+    {
+        "version": "3.35",
+        "date": "2026-10-23",
+        "changes": [
+            "文件批量替换的「确认操作」弹窗取消逐行列出每个子目录起止范围的图片目录展示(原为「将按以下N个子目录的起止范围…\n{子目录: 起始 → 终止}…」长文本，子目录多时会撑高弹窗)，只保留一句「目标目录中的现有文件将被覆盖，建议先备份。确定开始吗？」提示语；子目录范围详情仍写入处理日志、并可在设置替换目录窗口查看",
+        ],
+    },
     {
         "version": "3.34",
         "date": "2026-10-22",
@@ -8691,13 +8698,11 @@ class FileBatchReplacePage(FunctionPage):
         ranges = {sub: (self.ranges[sub][0], self.ranges[sub][1])
                   for sub in subdirs}
 
-        detail = "\n".join(
-            f"  {sub}: {ranges[sub][0]} → {ranges[sub][1]}"
-            for sub in sorted(ranges, key=str.lower))
+        # v3.35: 确认操作弹窗不再逐行列出每个子目录的起止范围(图片目录展示)，
+        # 只保留一句覆盖警告提示——子目录范围详情已在日志与设置窗口可见，
+        # 弹窗过长会遮挡按钮。
         reply = QMessageBox.question(
             self, "确认操作",
-            f"将按以下 {len(ranges)} 个子目录的起止范围，用JPG源目录的文件替换\n"
-            f"目标目录中的图片：\n\n{detail}\n\n"
             f"目标目录中的现有文件将被覆盖，建议先备份。\n\n确定开始吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
