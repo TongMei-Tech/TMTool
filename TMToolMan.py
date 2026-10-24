@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.41"
+VERSION = "3.42"
 
 CHANGELOG = [
+    {
+        "version": "3.42",
+        "date": "2026-10-25",
+        "changes": [
+            "修复「自动识别目录」目录终止页误判(用户反馈「终止页没有标题，终止页后面页面还是表格则误判后面的页面为终止页」)：目录续页无「卷内文件目录」标题，原用_detect_table_rows(仅检测是否有表格线)判断目录续页，正文中的统计表等表格页也会被误判为目录续页导致终止页后移。改为用_parse_catalog_by_table解析「序号+页号」目录表格结构判断目录续页——能解析出序号/页号行的才是目录页，正文表格(无序号/页号列)解析为空即终止；CatalogDetectWorker补充_parse_catalog_by_table/_imwrite_cn/_CN_NUM复用别名",
+        ],
+    },
     {
         "version": "3.41",
         "date": "2026-10-24",
@@ -7793,9 +7800,12 @@ class CatalogDetectWorker(QThread):
     _preload_img_arr = FileSplitWorker._preload_img_arr
     _is_catalog_title = staticmethod(FileSplitWorker._is_catalog_title)
     _detect_table_rows = FileSplitWorker._detect_table_rows
+    _parse_catalog_by_table = FileSplitWorker._parse_catalog_by_table
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
+    _imwrite_cn = staticmethod(FileSplitWorker._imwrite_cn)
     _run_monitor_line = FileSplitWorker._run_monitor_line
     _OCR_RECYCLE_PAGES = FileSplitWorker._OCR_RECYCLE_PAGES
+    _CN_NUM = FileSplitWorker._CN_NUM
 
     def __init__(self, target_dir, subdirs, parent=None):
         super().__init__(parent)
@@ -7851,11 +7861,22 @@ class CatalogDetectWorker(QThread):
                     self.log_signal.emit(f"[{i}/{total}] {sub}: 未识别到目录(无标题)")
                     self.progress_signal.emit(i, total)
                     continue
-                # 2. 找目录终止页: 从起始页起连续表格页, 遇文字页即停
+                # 2. 找目录终止页: 从起始页起连续「目录表格页」, 遇正文(文字/正文表格)即停。
+                #    目录续页无「卷内文件目录」标题, 故不能靠标题判断; 正文中也可能有统计表,
+                #    故不能仅靠「是否有表格线」判断(会误判正文表格为目录续页)。改用
+                #    _parse_catalog_by_table 解析「序号+页号」目录表格结构: 能解析出
+                #    序号/页号行的才是目录页, 正文表格(无序号/页号列)解析为空即终止。
                 end_idx = start_idx
                 for idx in range(start_idx + 1, len(sample)):
                     img_path = os.path.join(sub_path, sample[idx])
-                    if self._detect_table_rows(img_path):
+                    self.log_signal.emit(
+                        f"[{i}/{total}] {sub}: 判断第{idx}页是否目录续页...")
+                    try:
+                        entries = self._parse_catalog_by_table(img_path,
+                                                               lambda s: None)
+                    except Exception:
+                        entries = []
+                    if entries:
                         end_idx = idx
                     else:
                         break
