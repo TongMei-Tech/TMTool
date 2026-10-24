@@ -4,6 +4,13 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.40（2026-10-24）
+
+修复「自动识别目录」运行时 TypeError 导致线程静默死亡、进度对话框永久卡住：
+
+- 根因：`_is_catalog_title` 是 `@staticmethod`，方法别名 `_is_catalog_title = FileSplitWorker._is_catalog_title` 直接赋值丢失 staticmethod 包装，`self._is_catalog_title(frags)` 调用时把 `self` 多传一参触发 `TypeError`；且 `run()` 无异常保护，线程死亡后 `finished_signal` 不发出，进度对话框永久卡住。
+- 修复：① `_is_catalog_title` 改为 `staticmethod(FileSplitWorker._is_catalog_title)` 包装（与 `_imread_cn` 同款）；② `CatalogDetectWorker.run()` 整体加 try/except，任何未预期异常记录日志并仍发 `finished_signal`。
+
 ## TMToolMan v3.39（2026-10-24）
 
 修复「自动识别目录」OCR 初始化成功后进度卡住无反馈（用户反馈）：

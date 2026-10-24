@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.39"
+VERSION = "3.40"
 
 CHANGELOG = [
+    {
+        "version": "3.40",
+        "date": "2026-10-24",
+        "changes": [
+            "修复「自动识别目录」运行时报「_is_catalog_title() takes 1 positional argument but 2 were given」导致线程静默死亡、进度对话框永久卡住的问题(用户反馈)：根因是_is_catalog_title为@staticmethod，方法别名_is_catalog_title=FileSplitWorker._is_catalog_title直接赋值丢失staticmethod包装，self._is_catalog_title(frags)调用时把self多传一参触发TypeError，run()无异常保护使线程死亡后finished_signal不发出；修复：①_is_catalog_title改为staticmethod(FileSplitWorker._is_catalog_title)包装(与_imread_cn同款)；②CatalogDetectWorker.run()整体加try/except，任何未预期异常记录日志并仍发finished_signal，避免进度对话框永久卡住",
+        ],
+    },
     {
         "version": "3.39",
         "date": "2026-10-24",
@@ -7777,7 +7784,7 @@ class CatalogDetectWorker(QThread):
     _get_ocr = FileSplitWorker._get_ocr
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _preload_img_arr = FileSplitWorker._preload_img_arr
-    _is_catalog_title = FileSplitWorker._is_catalog_title
+    _is_catalog_title = staticmethod(FileSplitWorker._is_catalog_title)
     _detect_table_rows = FileSplitWorker._detect_table_rows
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
     _run_monitor_line = FileSplitWorker._run_monitor_line
@@ -7800,57 +7807,63 @@ class CatalogDetectWorker(QThread):
     def run(self):
         result = {}
         total = len(self.subdirs)
-        for i, sub in enumerate(self.subdirs, 1):
-            if self.is_stopped:
-                break
-            sub_path = os.path.join(self.target_dir, sub)
-            try:
-                files = _jpg_range_files(sub_path)
-            except Exception:
-                files = []
-            if len(files) < 2:
-                result[sub] = {'error': '文件不足(少于2个JPG)'}
-                self.log_signal.emit(f"[{i}/{total}] {sub}: 文件不足, 跳过")
-                self.progress_signal.emit(i, total)
-                continue
-            sample = files[:12]  # 只检测前12个文件(目录≤10页, 前12足够)
-            # 1. 找目录起始页: 从第2页起 OCR 识别含「卷内文件目录」标题的页
-            start_idx = -1
-            for idx in range(1, len(sample)):
-                img_path = os.path.join(sub_path, sample[idx])
-                # v3.39: 逐页日志, 让用户看到识别在持续推进(OCR大图CPU推理较慢)
-                self.log_signal.emit(
-                    f"[{i}/{total}] {sub}: OCR识别第{idx}页 {sample[idx]}...")
+        try:
+            for i, sub in enumerate(self.subdirs, 1):
+                if self.is_stopped:
+                    break
+                sub_path = os.path.join(self.target_dir, sub)
                 try:
-                    # v3.39: 预解码为ndarray传OCR, 避免中文路径走cv2.imread
-                    _arr = self._preload_img_arr(img_path)
-                    frags = self._ocr_page(img_path, None, lambda s: None,
-                                           img_arr=_arr)
+                    files = _jpg_range_files(sub_path)
                 except Exception:
-                    frags = []
-                if frags and self._is_catalog_title(frags):
-                    start_idx = idx
-                    break
-            if start_idx < 0:
-                result[sub] = {'error': '未识别到目录(前12页无「卷内文件目录」标题)'}
-                self.log_signal.emit(f"[{i}/{total}] {sub}: 未识别到目录(无标题)")
+                    files = []
+                if len(files) < 2:
+                    result[sub] = {'error': '文件不足(少于2个JPG)'}
+                    self.log_signal.emit(f"[{i}/{total}] {sub}: 文件不足, 跳过")
+                    self.progress_signal.emit(i, total)
+                    continue
+                sample = files[:12]  # 只检测前12个文件(目录≤10页, 前12足够)
+                # 1. 找目录起始页: 从第2页起 OCR 识别含「卷内文件目录」标题的页
+                start_idx = -1
+                for idx in range(1, len(sample)):
+                    img_path = os.path.join(sub_path, sample[idx])
+                    # v3.39: 逐页日志, 让用户看到识别在持续推进
+                    self.log_signal.emit(
+                        f"[{i}/{total}] {sub}: OCR识别第{idx}页 {sample[idx]}...")
+                    try:
+                        # 预解码为ndarray传OCR, 避免中文路径走cv2.imread
+                        _arr = self._preload_img_arr(img_path)
+                        frags = self._ocr_page(img_path, None, lambda s: None,
+                                               img_arr=_arr)
+                    except Exception:
+                        frags = []
+                    if frags and self._is_catalog_title(frags):
+                        start_idx = idx
+                        break
+                if start_idx < 0:
+                    result[sub] = {'error': '未识别到目录(前12页无「卷内文件目录」标题)'}
+                    self.log_signal.emit(f"[{i}/{total}] {sub}: 未识别到目录(无标题)")
+                    self.progress_signal.emit(i, total)
+                    continue
+                # 2. 找目录终止页: 从起始页起连续表格页, 遇文字页即停
+                end_idx = start_idx
+                for idx in range(start_idx + 1, len(sample)):
+                    img_path = os.path.join(sub_path, sample[idx])
+                    if self._detect_table_rows(img_path):
+                        end_idx = idx
+                    else:
+                        break
+                # 替换范围 = 从目录起始到末页: 起始=目录起始文件, 终止=最后一个文件
+                result[sub] = {'start': files[start_idx], 'end': files[-1]}
+                self.log_signal.emit(
+                    f"[{i}/{total}] {sub}: 目录 {files[start_idx]}~{files[end_idx]}"
+                    f"({end_idx - start_idx + 1}页), 替换起始 {files[start_idx]}, "
+                    f"终止 {files[-1]}")
                 self.progress_signal.emit(i, total)
-                continue
-            # 2. 找目录终止页: 从起始页起连续表格页, 遇文字页即停
-            end_idx = start_idx
-            for idx in range(start_idx + 1, len(sample)):
-                img_path = os.path.join(sub_path, sample[idx])
-                if self._detect_table_rows(img_path):
-                    end_idx = idx
-                else:
-                    break
-            # 替换范围 = 从目录起始到末页: 起始=目录起始文件, 终止=最后一个文件
-            result[sub] = {'start': files[start_idx], 'end': files[-1]}
-            self.log_signal.emit(
-                f"[{i}/{total}] {sub}: 目录 {files[start_idx]}~{files[end_idx]}"
-                f"({end_idx - start_idx + 1}页), 替换起始 {files[start_idx]}, "
-                f"终止 {files[-1]}")
-            self.progress_signal.emit(i, total)
+        except Exception as e:
+            # 任何未预期异常都不能让线程静默死亡(否则 finished_signal 不发, 进度对话框卡住)
+            import traceback
+            self.log_signal.emit(f"自动识别目录异常: {e}")
+            self.log_signal.emit(traceback.format_exc())
         self.finished_signal.emit(result)
 
 
