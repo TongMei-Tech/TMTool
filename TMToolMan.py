@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.35"
+VERSION = "3.36"
 
 CHANGELOG = [
+    {
+        "version": "3.36",
+        "date": "2026-10-24",
+        "changes": [
+            "文件批量替换改为「以源文件为准」(修复源文件多时被丢弃的问题, 用户反馈20261024)：原逻辑替换数量由目标起止范围决定(need=起始→终止范围内文件数)，源目录文件多出范围时被截断忽略——如目标范围仅0002一个文件而源目录有0002/0003两个，结果只替换0002、0003被丢弃。现改为：从起始编号开始，源目录中编号≥起始编号的所有文件依次写入目标目录——目标目录已有同编号文件则覆盖(保留目标文件名)，无则按源编号新增补页；终止文件字段保留(UI/数据库/存在性与顺序校验不变)但不再限制替换范围；日志逐文件标明「起始编号严格对应/覆盖/新增」",
+        ],
+    },
     {
         "version": "3.35",
         "date": "2026-10-23",
@@ -7471,18 +7478,17 @@ def _jpg_subdirs(target_dir):
 
 
 class FileBatchReplaceWorker(QThread):
-    """文件批量替换后台处理线程(v3.30) - 按目标子目录的起始/终止文件范围替换。
+    """文件批量替换后台处理线程(v3.36) - 按起始文件、以源文件为准替换。
 
     规则:
     1. 扫描JPG目录(含子目录)，按文件名基础名(去掉"-四位编号")分组；
        基础名与目标目录下的子目录名同名(不区分大小写)即匹配。
-    2. 用户为每个目标子目录设置起始/终止目录文件；替换范围 = 该子目录中
-       从起始文件到终止文件(含)之间的文件。
-    3. 起始文件的编号必须与JPG源目录中同名基础名的文件编号严格对应；
-       源目录中编号 >= 起始编号的可用文件数必须 >= 范围内目标文件数，
-       否则该子目录报错、不替换并记录日志。
-    4. 源文件按编号升序依次覆盖范围内目标文件(保留目标文件名)，
-       多余源文件忽略；每个子目录替换后更新 Directory.txt。
+    2. 用户为每个目标子目录设置起始/终止目录文件；起始文件标记替换起点，
+       终止文件仅作设置合法性校验，不再限制替换范围。
+    3. 起始文件的编号必须与JPG源目录中同名基础名的文件编号严格对应。
+    4. 源目录中编号 >= 起始编号的所有文件依次写入目标目录：目标目录已有
+       同编号文件则覆盖(保留目标文件名)，无则按源编号新增(补页)；
+       源文件不再因超出目标范围而被忽略；每个子目录替换后更新 Directory.txt。
     """
     log_signal = Signal(str)
     progress_signal = Signal(int, int)
@@ -7540,11 +7546,16 @@ class FileBatchReplaceWorker(QThread):
         return groups, skipped
 
     def _replace_range(self, subdir, start_file, end_file, source_group):
-        """按起始/终止文件替换一个目标子目录。
+        """按起始文件替换一个目标子目录(以源文件为准, v3.36)。
 
         source_group: [(源编号, 源路径), ...] 已按编号升序。
-        返回 (成功覆盖数, 错误信息)；错误信息为空表示全部成功。
-        源文件不足/起始编号不对应时在复制前返回，不修改目标文件。
+        返回 (成功替换数, 错误信息)；错误信息为空表示全部成功。
+
+        v3.36 语义变更: 替换数量由【源文件】决定——从起始编号开始，源目录中
+        编号≥起始编号的所有文件依次写入目标目录: 目标目录已有同编号文件则
+        覆盖(保留目标文件名)，无则按源编号新增(补页)。终止文件(end_file)仅
+        保留作起始/终止文件存在性与顺序校验，不再限制替换范围(旧逻辑按目标
+        起止范围截断、多余源文件忽略，导致源文件多时被丢弃)。
         """
         sub_path = os.path.join(self.target_dir, subdir)
         if not os.path.isdir(sub_path):
@@ -7555,49 +7566,49 @@ class FileBatchReplaceWorker(QThread):
             return 0, f"读取目标子目录失败: {e}"
         if start_file not in target_files or end_file not in target_files:
             return 0, (f"起始/终止文件不存在: {start_file} / {end_file}")
-        s_idx = target_files.index(start_file)
-        e_idx = target_files.index(end_file)
-        if s_idx > e_idx:
+        # 起始/终止顺序仍校验(设置合法性)，但不再用于截断替换范围
+        if target_files.index(start_file) > target_files.index(end_file):
             return 0, "终止文件小于起始文件"
         start_num = _range_start_num(start_file)
         if start_num is None:
             return 0, f"起始文件名不含四位编号: {start_file}"
-
-        range_files = target_files[s_idx:e_idx + 1]
-        need = len(range_files)
         if not source_group:
             return 0, f"JPG源目录中未找到基础名为「{subdir}」的文件"
         # 起始编号严格对应: 源目录必须存在与起始文件同编号的文件
         if not any(num == start_num for num, _p in source_group):
             return 0, (f"JPG源目录缺少编号 {start_num:04d} 的文件，"
                        f"起始编号须严格对应")
+
         candidates = [(num, p) for num, p in source_group if num >= start_num]
-        if len(candidates) < need:
-            return 0, (f"JPG源文件不足: 范围需 {need} 个，源目录仅有 "
-                       f"{len(candidates)} 个(编号≥{start_num:04d})")
-        use = candidates[:need]
-        extra = len(candidates) - need
-        if extra > 0:
-            self._wlog(f"  源目录另有多余 {extra} 个文件(编号≥{start_num:04d})，已忽略")
+
+        # 目标目录现有文件按编号索引(用于找同编号文件覆盖，含不同扩展名)
+        target_by_num = {}
+        for fname in target_files:
+            n = _range_start_num(fname)
+            if n is not None:
+                target_by_num.setdefault(n, fname)
 
         ok = 0
         stems = []
-        for target_name, (src_num, src_path) in zip(range_files, use):
+        for src_num, src_path in candidates:
+            if src_num in target_by_num:
+                target_name = target_by_num[src_num]
+                action = "起始编号严格对应" if src_num == start_num else "覆盖"
+            else:
+                # 目标目录缺该编号 → 按源编号新增(补页)
+                target_name = f"{subdir}-{src_num:04d}.jpg"
+                action = "新增"
             try:
-                # 保留目标文件名(含扩展名)覆盖，确保目标目录编号不变
                 shutil.copy2(src_path, os.path.join(sub_path, target_name))
                 stems.append(os.path.splitext(target_name)[0])
                 ok += 1
-                if src_num == start_num and ok == 1:
-                    self._wlog(f"  起始编号严格对应: {src_num:04d} → {target_name}")
-                else:
-                    self._wlog(f"  覆盖: {target_name} ← {os.path.basename(src_path)}")
+                self._wlog(f"  {action}: {target_name} ← {os.path.basename(src_path)}")
             except Exception as e:
-                self._wlog(f"  × 覆盖失败: {target_name}: {e}")
+                self._wlog(f"  × 写入失败: {target_name}: {e}")
         if ok:
             self._write_directory_txt(sub_path, stems)
-        if ok < need:
-            return ok, f"仅成功替换 {ok}/{need} 个文件"
+        if ok < len(candidates):
+            return ok, f"仅成功替换 {ok}/{len(candidates)} 个文件"
         return ok, ''
 
     def _write_directory_txt(self, target_sub, new_stems):
