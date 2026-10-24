@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.38"
+VERSION = "3.39"
 
 CHANGELOG = [
+    {
+        "version": "3.39",
+        "date": "2026-10-24",
+        "changes": [
+            "修复「自动识别目录」OCR初始化成功后进度卡住无反馈(用户反馈)：①CatalogDetectWorker逐页OCR前emit日志(「OCR识别第X页...」)，让进度对话框标签文字持续更新——原实现只在子目录处理完才更新进度条、OCR大图CPU推理每页数秒，首个子目录连OCRW12页期间标签文字停在「OCR初始化成功」不再变化，用户误以为卡死；②OCR调用改用_preload_img_arr预解码为BGR ndarray传入(复用FileSplitWorker)，避免中文路径走cv2.imread(v3.26同款对策)；③进度对话框初始标签明确提示「首次识别需加载OCR模型约1-2分钟」",
+        ],
+    },
     {
         "version": "3.38",
         "date": "2026-10-24",
@@ -7769,6 +7776,7 @@ class CatalogDetectWorker(QThread):
     _ocr_page = FileSplitWorker._ocr_page
     _get_ocr = FileSplitWorker._get_ocr
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
+    _preload_img_arr = FileSplitWorker._preload_img_arr
     _is_catalog_title = FileSplitWorker._is_catalog_title
     _detect_table_rows = FileSplitWorker._detect_table_rows
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
@@ -7810,8 +7818,14 @@ class CatalogDetectWorker(QThread):
             start_idx = -1
             for idx in range(1, len(sample)):
                 img_path = os.path.join(sub_path, sample[idx])
+                # v3.39: 逐页日志, 让用户看到识别在持续推进(OCR大图CPU推理较慢)
+                self.log_signal.emit(
+                    f"[{i}/{total}] {sub}: OCR识别第{idx}页 {sample[idx]}...")
                 try:
-                    frags = self._ocr_page(img_path, None, lambda s: None)
+                    # v3.39: 预解码为ndarray传OCR, 避免中文路径走cv2.imread
+                    _arr = self._preload_img_arr(img_path)
+                    frags = self._ocr_page(img_path, None, lambda s: None,
+                                           img_arr=_arr)
                 except Exception:
                     frags = []
                 if frags and self._is_catalog_title(frags):
@@ -8084,7 +8098,7 @@ class ReplaceRangeDialog(QDialog):
         self._detect_worker = CatalogDetectWorker(
             self.target_dir, self.subdirs, parent=self)
         self._progress_dlg = QProgressDialog(
-            "正在自动识别目录(检测卷内文件目录表格页)...",
+            "正在自动识别目录(首次识别需加载OCR模型, 约1-2分钟, 请稍候)...",
             "", 0, len(self.subdirs), self)
         self._progress_dlg.setWindowTitle("自动识别目录")
         self._progress_dlg.setWindowModality(Qt.ApplicationModal)

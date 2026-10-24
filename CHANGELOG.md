@@ -4,6 +4,14 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.39（2026-10-24）
+
+修复「自动识别目录」OCR 初始化成功后进度卡住无反馈（用户反馈）：
+
+- `CatalogDetectWorker` 逐页 OCR 前 emit 日志（「OCR识别第X页...」），让进度对话框标签文字持续更新——原实现只在子目录处理完才更新进度条、OCR 大图 CPU 推理每页数秒，首个子目录连续 OCR 前 12 页期间标签文字停在「OCR初始化成功」不再变化，用户误以为卡死。
+- OCR 调用改用 `_preload_img_arr` 预解码为 BGR ndarray 传入（复用 FileSplitWorker），避免中文路径走 `cv2.imread`（v3.26 同款对策）。
+- 进度对话框初始标签明确提示「首次识别需加载 OCR 模型约 1-2 分钟」。
+
 ## TMToolMan v3.38（2026-10-24）
 
 修复「自动识别目录」识别错误（用户反馈）：
