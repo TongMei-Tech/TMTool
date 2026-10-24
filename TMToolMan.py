@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.37"
+VERSION = "3.38"
 
 CHANGELOG = [
+    {
+        "version": "3.38",
+        "date": "2026-10-24",
+        "changes": [
+            "修复「自动识别目录」识别错误(用户反馈)：①目录页判定由纯表格线检测改为先用OCR识别「卷内文件目录」标题(复用FileSplitWorker._ocr_page/_is_catalog_title)定位目录起始文件——原纯表格线检测对扫描质量不稳定的目录页易漏判，导致起始文件偏移到目录的下一页(如目录0002被漏判、起始误识别为0003)；②识别范围改为「目录文件起止」：目录起始文件=含标题的页，目录终止文件=从起始页起连续表格页的最后一页(单张目录=起始本身)，遇文字页即止；③自动设置替换范围改为「从目录到末页」：替换起始=目录起始文件，替换终止=最后一个文件(原为目录后正文第一页)；④CatalogDetectWorker补充完整OCR复用别名(_ocr_page/_get_ocr/_init_ocr_locked/_is_catalog_title/_run_monitor_line等)与_ocr/_ocr_init_lock/_ocr_pages_since_init最小实例属性",
+        ],
+    },
     {
         "version": "3.37",
         "date": "2026-10-24",
@@ -7745,28 +7752,39 @@ class FileBatchReplaceWorker(QThread):
 
 
 class CatalogDetectWorker(QThread):
-    """自动识别目录后台线程(v3.37) - 检测每个子目录的「卷内文件目录」表格页范围。
+    """自动识别目录后台线程(v3.37) - 检测每个子目录的「卷内文件目录」起止范围。
 
     规则: 目标子目录结构为 卷皮(第1页) → 卷内文件目录(第2页起, 表格形式, ≤10页)
-    → 正文(文字页)。本线程对每个子目录的前12个文件(按文件名排序)，从第2个文件起
-    用 OpenCV 表格线检测(_detect_table_rows)判断「是否为表格页」，连续表格页即目录页。
-    目录结束后的第一个文件=正文第一页。结果用于自动设置替换起止文件:
-      起始文件 = 正文第一页, 终止文件 = 最后一个文件。
-    不识别表格内容(不调用 PaddleOCR), 仅判断「是否表格」。
+    → 正文(文字页)。本线程对每个子目录的前12个文件(按文件名排序)：
+      1. 从第2页起 OCR 识别含「卷内文件目录」标题的页 = 目录起始文件；
+      2. 从目录起始页起连续检测表格页(_detect_table_rows)直到文字页 = 目录终止文件；
+    结果用于自动设置替换起止文件(从目录到末页):
+      替换起始文件 = 目录起始文件, 替换终止文件 = 最后一个文件。
     """
     log_signal = Signal(str)
     progress_signal = Signal(int, int)   # (当前, 总数)
     finished_signal = Signal(dict)       # {子目录: {'start':文件名,'end':文件名} 或 {'error':原因}}
 
-    # 复用 FileSplitWorker 的表格线检测(纯OpenCV, 无OCR)与中文路径读图
+    # 复用 FileSplitWorker 的 OCR 标题识别 + 表格线检测 + 中文路径读图
+    _ocr_page = FileSplitWorker._ocr_page
+    _get_ocr = FileSplitWorker._get_ocr
+    _init_ocr_locked = FileSplitWorker._init_ocr_locked
+    _is_catalog_title = FileSplitWorker._is_catalog_title
     _detect_table_rows = FileSplitWorker._detect_table_rows
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
+    _run_monitor_line = FileSplitWorker._run_monitor_line
+    _OCR_RECYCLE_PAGES = FileSplitWorker._OCR_RECYCLE_PAGES
 
     def __init__(self, target_dir, subdirs, parent=None):
         super().__init__(parent)
         self.target_dir = target_dir
         self.subdirs = list(subdirs or [])
         self.is_stopped = False
+        # OCR 引擎延迟初始化所需的最小实例属性(纯CPU复用, 同 FileSplitWorker)
+        self._ocr = None
+        import threading as _th
+        self._ocr_init_lock = _th.Lock()
+        self._ocr_pages_since_init = 0
 
     def stop(self):
         self.is_stopped = True
@@ -7788,28 +7806,36 @@ class CatalogDetectWorker(QThread):
                 self.progress_signal.emit(i, total)
                 continue
             sample = files[:12]  # 只检测前12个文件(目录≤10页, 前12足够)
-            # 从第2页(索引1)起检测连续表格页, 遇第一个非表格页即停
-            last_table_idx = -1
+            # 1. 找目录起始页: 从第2页起 OCR 识别含「卷内文件目录」标题的页
+            start_idx = -1
             for idx in range(1, len(sample)):
                 img_path = os.path.join(sub_path, sample[idx])
+                try:
+                    frags = self._ocr_page(img_path, None, lambda s: None)
+                except Exception:
+                    frags = []
+                if frags and self._is_catalog_title(frags):
+                    start_idx = idx
+                    break
+            if start_idx < 0:
+                result[sub] = {'error': '未识别到目录(前12页无「卷内文件目录」标题)'}
+                self.log_signal.emit(f"[{i}/{total}] {sub}: 未识别到目录(无标题)")
+                self.progress_signal.emit(i, total)
+                continue
+            # 2. 找目录终止页: 从起始页起连续表格页, 遇文字页即停
+            end_idx = start_idx
+            for idx in range(start_idx + 1, len(sample)):
+                img_path = os.path.join(sub_path, sample[idx])
                 if self._detect_table_rows(img_path):
-                    last_table_idx = idx
+                    end_idx = idx
                 else:
                     break
-            if last_table_idx < 1:
-                result[sub] = {'error': '未识别到目录(第2页非表格)'}
-                self.log_signal.emit(f"[{i}/{total}] {sub}: 第2页非表格, 未识别到目录")
-            else:
-                start_idx = last_table_idx + 1
-                if start_idx >= len(files):
-                    result[sub] = {'error': '目录覆盖到文件末尾, 无正文'}
-                    self.log_signal.emit(
-                        f"[{i}/{total}] {sub}: 目录覆盖到文件末尾, 无法确定正文起点")
-                else:
-                    result[sub] = {'start': files[start_idx], 'end': files[-1]}
-                    self.log_signal.emit(
-                        f"[{i}/{total}] {sub}: 目录页 {files[1]}~{files[last_table_idx]}"
-                        f", 正文起点 {files[start_idx]}, 终止 {files[-1]}")
+            # 替换范围 = 从目录起始到末页: 起始=目录起始文件, 终止=最后一个文件
+            result[sub] = {'start': files[start_idx], 'end': files[-1]}
+            self.log_signal.emit(
+                f"[{i}/{total}] {sub}: 目录 {files[start_idx]}~{files[end_idx]}"
+                f"({end_idx - start_idx + 1}页), 替换起始 {files[start_idx]}, "
+                f"终止 {files[-1]}")
             self.progress_signal.emit(i, total)
         self.finished_signal.emit(result)
 

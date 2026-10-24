@@ -4,6 +4,15 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.38（2026-10-24）
+
+修复「自动识别目录」识别错误（用户反馈）：
+
+- 目录页判定由纯表格线检测改为先用 OCR 识别「卷内文件目录」标题（复用 `FileSplitWorker._ocr_page` / `_is_catalog_title`）定位目录起始文件——原纯表格线检测对扫描质量不稳定的目录页易漏判，导致起始文件偏移到目录的下一页（如目录 0002 被漏判、起始误识别为 0003）。
+- 识别范围改为「目录文件起止」：目录起始文件 = 含标题的页；目录终止文件 = 从起始页起连续表格页的最后一页（单张目录 = 起始本身），遇文字页即止。
+- 自动设置替换范围改为「从目录到末页」：替换起始 = 目录起始文件，替换终止 = 最后一个文件（原为目录后正文第一页）。
+- `CatalogDetectWorker` 补充完整 OCR 复用别名（`_ocr_page` / `_get_ocr` / `_init_ocr_locked` / `_is_catalog_title` / `_run_monitor_line` 等）与 `_ocr` / `_ocr_init_lock` / `_ocr_pages_since_init` 最小实例属性。
+
 ## TMToolMan v3.37（2026-10-24）
 
 文件批量替换新增「自动识别目录」选项（默认勾选）：
