@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.44"
+VERSION = "3.45"
 
 CHANGELOG = [
+    {
+        "version": "3.45",
+        "date": "2026-10-27",
+        "changes": [
+            "修复GPU模式JPG转双层PDF 4线程运行一段时间后系统崩溃且无任何提示的问题(20261027, 崩溃日志仅有启动记录、零崩溃痕迹=进程被系统静默终止)：根因是多工作线程同时进入写PDF分段阶段各持数百MB doc内存叠加paddle驻留, 内存峰值在两次看门狗检查之间瞬间冲破系统余量被OOM终止——原看门狗只在「每10页」边界检查(page_idx%10==0), 4线程时两次检查间隔可达数十秒。修复：①新增内存看门狗后台daemon线程(仅GPU模式, 与运行监控同时启停, 每3秒持续监测工作集)：预警线=min(2600MB,物理内存×40%)→服务线程内empty_cache+GC(轻量, 12秒冷却), 回收线=min(3200MB,物理内存×52%)→整实例重建引擎(45秒冷却防频繁重建拖慢吞吐)；②新增_total_phys_mem_mb()(GlobalMemoryStatusEx查物理内存总量), 主循环「每10页」检查的固定阈值同步改为按物理内存自适应(固定值在小内存机器如8GB上介入太晚)；③GPU多线程界面提示补充无提示退出指引(减线程或改CPU模式)",
+        ],
+    },
     {
         "version": "3.44",
         "date": "2026-10-25",
@@ -455,6 +462,36 @@ _setup_paddle_gpu_env()
 
 
 # ============================ 进程内存监测工具(v3.11) ============================
+def _total_phys_mem_mb():
+    """物理内存总量(MB); 获取失败返回0。v3.45: 内存看门狗阈值按机器自适应。
+
+    固定阈值(2.6/3.2GB)在小内存机器(8GB)上太晚介入——系统还要给其他进程留
+    余量, 进程冲到3GB+时系统已开始压缩/换页, GPU 4线程峰值可瞬间冲过阈值
+    被系统直接终止(崩溃日志无任何记录, 20261027实测)。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _MSE(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        _mse = _MSE()
+        _mse.dwLength = ctypes.sizeof(_MSE)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(_mse)):
+            return _mse.ullTotalPhys / 1048576.0
+    except Exception:
+        pass
+    return 0.0
+
+
 def _proc_mem_mb():
     """当前进程工作集内存(MB); 获取失败返回0。用于长时间运行的内存看门狗。"""
     try:
@@ -1148,6 +1185,60 @@ class FileSplitWorker(QThread):
         while not self._run_mon_stop.wait(interval):
             self._run_monitor_line()
 
+    # ---------- v3.45: 后台内存看门狗线程 ----------
+    # 背景(20261027): GPU模式4线程运行一段时间后进程被系统静默终止(崩溃日志
+    # 零记录)——多工作线程同时进入写PDF分段阶段, 各持数百MB doc内存叠加paddle
+    # 驻留, 峰值瞬间冲顶。原看门狗只在「每10页」边界检查(page_idx % 10 == 0),
+    # 4线程时两次检查之间(可能数十秒)峰值即可冲破系统余量被OOM终止。
+    # 对策: 独立daemon线程每3秒持续监测工作集, 阈值按物理内存自适应:
+    #   预警线 = min(2600, 总内存×40%) → 服务线程内 empty_cache + GC(轻量)
+    #   回收线 = min(3200, 总内存×52%) → 整实例重建引擎(_svc_recycle_engine)
+    # 与「每10页」检查双保险并存; 仅GPU模式启动, 随 _run_mon_stop 一并停止。
+    _MEM_WD_INTERVAL = 3          # 采样周期(秒)
+    _MEM_WD_COOLDOWN_RECYCLE = 45  # 引擎重建最小间隔(秒), 防止频繁重建拖慢吞吐
+    _MEM_WD_COOLDOWN_CACHE = 12    # empty_cache最小间隔(秒)
+
+    def _mem_watchdog_loop(self):
+        """内存看门狗线程主循环(daemon), 由 _start_run_monitor 启动(仅GPU模式)。"""
+        import time as _t
+        last_recycle = 0.0
+        last_cache = 0.0
+        while not self._run_mon_stop.wait(self._MEM_WD_INTERVAL):
+            try:
+                wm = _proc_mem_mb()
+                if wm <= 0:
+                    continue
+                _phys = _total_phys_mem_mb()
+                warn_mb = min(2600, _phys * 0.40) if _phys > 0 else 2600
+                rebuild_mb = min(3200, _phys * 0.52) if _phys > 0 else 3200
+                now = _t.time()
+                if wm >= rebuild_mb and (now - last_recycle) >= self._MEM_WD_COOLDOWN_RECYCLE:
+                    last_recycle = now
+                    last_cache = now
+                    self.log_signal.emit(
+                        f"  ! 内存看门狗: 工作集{wm:.0f}MB≥回收线{rebuild_mb:.0f}MB"
+                        f"(物理内存{_phys:.0f}MB), 重建OCR引擎阻断增长")
+                    self._run_monitor_line(
+                        f'内存看门狗(后台): {wm:.0f}MB>=回收线{rebuild_mb:.0f}MB, '
+                        f'重建引擎')
+                    self._svc_recycle_engine()
+                elif wm >= warn_mb and (now - last_cache) >= self._MEM_WD_COOLDOWN_CACHE:
+                    last_cache = now
+                    self.log_signal.emit(
+                        f"  ! 内存看门狗: 工作集{wm:.0f}MB≥预警线{warn_mb:.0f}MB"
+                        f"(物理内存{_phys:.0f}MB), 释放GPU缓存+GC")
+                    self._run_monitor_line(
+                        f'内存看门狗(后台): {wm:.0f}MB>=预警线{warn_mb:.0f}MB, '
+                        f'释放缓存')
+                    self._svc_empty_cache()
+                    try:
+                        import gc as _gcw
+                        _gcw.collect()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
     def _start_run_monitor(self, output_dir, note=''):
         """启动运行监控(仅GPU模式)。输出 run_monitor_时间戳.txt 于输出目录。"""
         try:
@@ -1171,6 +1262,10 @@ class FileSplitWorker(QThread):
             _t = _th_s.Thread(target=self._run_monitor_loop, daemon=True,
                               name='RunMonitor')
             _t.start()
+            # v3.45: 同步启动内存看门狗后台线程(与监控共用停止事件)
+            _w = _th_s.Thread(target=self._mem_watchdog_loop, daemon=True,
+                              name='MemWatchdog')
+            _w.start()
             self.log_signal.emit(f"  GPU运行监控已启动: run_monitor_{ts}.txt")
         except Exception as e:
             self.log_signal.emit(f"  (运行监控启动失败, 不影响处理: {e})")
@@ -5979,9 +6074,13 @@ class JpgToPdfWorker(QThread):
             if self.use_gpu_ocr and self.max_workers > 1:
                 # v3.17: GPU模式多线程提示(不再强制单线程): OCR本身由服务线程
                 # 串行执行, 多线程用于解码/写PDF等阶段与OCR流水线并行。
-                self.log_signal.emit("  GPU OCR模式多线程: OCR推理仍串行执行, "
-                                     "多线程用于图像解码/PDF写入流水线(有内存峰值与"
-                                     "GPU挂死风险, 已由运行监控与自动降级CPU兜底)")
+                # v3.45: 补充无提示退出(系统OOM终止)的指引——4线程并发写doc阶段
+                # 内存峰值叠加, 若机器内存偏小或仍出现无提示退出, 建议减少线程。
+                self.log_signal.emit(
+                    f"  GPU OCR模式{self.max_workers}线程: OCR推理仍串行执行, "
+                    f"多线程用于图像解码/PDF写入流水线。已启用内存看门狗"
+                    f"(每3秒监测, 阈值按物理内存自适应); 若仍出现程序无提示退出,"
+                    f"请减少线程数(如改2线程)或改用CPU模式")
             if self.use_gpu_ocr:
                 # v3.27/v3.28: 分级说明(修正v3.27"并非崩溃"的绝对化表述——
                 # 20260928实测成串出现时可伴随程序access violation崩溃退出)。
@@ -6190,6 +6289,7 @@ class JpgToPdfWorker(QThread):
     # v3.14: GPU运行监控(同定义于 FileSplitWorker, 依赖 __init__ 中 _run_mon_* 属性)
     _run_monitor_line = FileSplitWorker._run_monitor_line
     _run_monitor_loop = FileSplitWorker._run_monitor_loop
+    _mem_watchdog_loop = FileSplitWorker._mem_watchdog_loop  # v3.45: 内存看门狗
     _start_run_monitor = FileSplitWorker._start_run_monitor
     _stop_run_monitor = FileSplitWorker._stop_run_monitor
     # 类属性别名: 例行重建阈值(方法别名不携带类属性, 须显式同步)
@@ -6392,6 +6492,17 @@ class JpgToPdfWorker(QThread):
                 CHUNK = 50
             _MEM_WARN_MB = 2600   # 工作集超过此值 → 记日志提醒(留痕供崩溃排查)
             _MEM_REBUILD_MB = 3200  # 工作集超过此值 → 强制重建引擎+GC(阻断继续增长)
+            # v3.45: 阈值按物理内存自适应——固定值在小内存机器(如8GB)上介入太晚,
+            # 系统需给其他进程留余量, GPU多线程峰值瞬间冲过固定线即被系统终止
+            # (20261027: 4线程运行一段时间后无提示退出, 崩溃日志零记录)。
+            # 自适应: 预警=min(2600, 总内存×40%), 回收=min(3200, 总内存×52%)。
+            try:
+                _phys_mb = _total_phys_mem_mb()
+                if _phys_mb > 0:
+                    _MEM_WARN_MB = min(_MEM_WARN_MB, _phys_mb * 0.40)
+                    _MEM_REBUILD_MB = min(_MEM_REBUILD_MB, _phys_mb * 0.52)
+            except Exception:
+                pass
             # v3.12: 32位进程地址空间上限约2GB, 上述阈值永不可达——进程会先因地址空间
             # 耗尽崩溃(崩溃日志20260901: cv2连1.9MB都分配失败)。32位时大幅下调阈值,
             # 让看门狗在真正耗尽前提前介入回收。
