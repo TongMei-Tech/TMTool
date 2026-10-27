@@ -4,6 +4,12 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.44（2026-10-25）
+
+补充「删多余 + 向前重编号」的 Directory.txt 同步（v3.43 补充）：
+
+- 向前重编号时收集 `{旧编号: 新编号}` 映射 `num_map`，`_write_directory_txt` 新增 `num_map` 参数，写回 Directory.txt 前把已有记录中的旧编号映射为新编号（如 0009/0010 重命名为 0007/0008 时，Directory.txt 里的旧记录同步改为 0007/0008），避免记录指向已改名的文件。
+
 ## TMToolMan v3.43（2026-10-25）
 
 文件批量替换新增「删多余 + 向前重编号」（用户需求）：

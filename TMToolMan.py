@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.43"
+VERSION = "3.44"
 
 CHANGELOG = [
+    {
+        "version": "3.44",
+        "date": "2026-10-25",
+        "changes": [
+            "补充文件批量替换「删多余+向前重编号」的Directory.txt同步(v3.43补充)：向前重编号时收集{旧编号:新编号}映射num_map，_write_directory_txt新增num_map参数，写回Directory.txt前把已有记录中旧编号映射为新编号(如0009/0010重命名为0007/0008时，Directory.txt里的旧记录同步改为0007/0008)，避免记录指向已改名的文件",
+        ],
+    },
     {
         "version": "3.43",
         "date": "2026-10-25",
@@ -7675,6 +7682,7 @@ class FileBatchReplaceWorker(QThread):
                         self._wlog(f"  × 删除失败: {target_by_num[num]}: {e}")
                     del target_by_num[num]
             # 2b. 范围之后(编号 > 终止编号)的文件向前重编号(从大到小避免覆盖)
+            num_map = {}  # {旧编号: 新编号}, 用于同步 Directory.txt 旧记录
             for num in sorted((n for n in target_by_num if n > end_num), reverse=True):
                 old_name = target_by_num[num]
                 new_num = num - shift
@@ -7687,21 +7695,27 @@ class FileBatchReplaceWorker(QThread):
                     os.rename(os.path.join(sub_path, old_name),
                               os.path.join(sub_path, new_name))
                     self._wlog(f"  向前编号: {old_name} → {new_name}")
+                    num_map[num] = new_num
                     del target_by_num[num]
                     target_by_num[new_num] = new_name
                 except Exception as e:
                     self._wlog(f"  × 重命名失败: {old_name}: {e}")
+        else:
+            num_map = None
 
         if ok:
-            self._write_directory_txt(sub_path, stems)
+            self._write_directory_txt(sub_path, stems, num_map)
         if ok < len(candidates):
             return ok, f"仅成功替换 {ok}/{len(candidates)} 个文件"
         return ok, ''
 
-    def _write_directory_txt(self, target_sub, new_stems):
+    def _write_directory_txt(self, target_sub, new_stems, num_map=None):
         """在目标子目录下生成/更新 Directory.txt: 记录替换后的文件名清单
         (不含扩展名, 每行一个)。已有记录合并(多次替换时累积),
-        按文件名末尾编号排序去重。"""
+        按文件名末尾编号排序去重。
+
+        num_map: {旧编号: 新编号}，v3.43 向前重编号后用于同步 Directory.txt
+        中的旧记录(把旧编号记录映射为新编号)，避免记录指向已改名的文件。"""
         dpath = os.path.join(target_sub, 'Directory.txt')
         existing = []
         if os.path.isfile(dpath):
@@ -7710,6 +7724,17 @@ class FileBatchReplaceWorker(QThread):
                     existing = [l.strip() for l in fh if l.strip()]
             except Exception:
                 existing = []
+        # v3.43: 应用重命名映射(旧编号→新编号)到已有记录
+        if num_map:
+            mapped = []
+            for stem in existing:
+                m = _RANGE_NUM_RE.match(stem)
+                old_num = int(m.group(2)) if m else None
+                if old_num in num_map:
+                    mapped.append(f"{m.group(1)}-{num_map[old_num]:04d}")
+                else:
+                    mapped.append(stem)
+            existing = mapped
         merged = list(dict.fromkeys(existing + list(new_stems)))
 
         def _key(stem):
