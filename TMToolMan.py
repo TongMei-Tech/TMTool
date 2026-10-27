@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.42"
+VERSION = "3.43"
 
 CHANGELOG = [
+    {
+        "version": "3.43",
+        "date": "2026-10-25",
+        "changes": [
+            "文件批量替换新增「删多余+向前重编号」(用户需求)：当目标目录标注的替换范围(起始文件~终止文件)文件数大于JPG源文件数时，①删除范围内源文件未覆盖的多余文件(编号大于源最大编号且在范围内的)；②范围之后(编号大于终止编号)的文件向前重编号消除空档(如范围0005~0008、源仅0005/0006时，删除0007/0008，0009/0010重命名为0007/0008)。_replace_range增加终止编号解析(end_num)，替换完成后按range_count>src_count触发删除与向前重编号",
+        ],
+    },
     {
         "version": "3.42",
         "date": "2026-10-25",
@@ -7614,6 +7621,9 @@ class FileBatchReplaceWorker(QThread):
         start_num = _range_start_num(start_file)
         if start_num is None:
             return 0, f"起始文件名不含四位编号: {start_file}"
+        end_num = _range_start_num(end_file)
+        if end_num is None:
+            return 0, f"终止文件名不含四位编号: {end_file}"
         if not source_group:
             return 0, f"JPG源目录中未找到基础名为「{subdir}」的文件"
         # 起始编号严格对应: 源目录必须存在与起始文件同编号的文件
@@ -7647,6 +7657,41 @@ class FileBatchReplaceWorker(QThread):
                 self._wlog(f"  {action}: {target_name} ← {os.path.basename(src_path)}")
             except Exception as e:
                 self._wlog(f"  × 写入失败: {target_name}: {e}")
+
+        # v3.43: 标注范围数量 > 源文件数量 → 删除范围内源文件未覆盖的多余文件,
+        # 并将范围之后(编号>终止编号)的文件向前重编号, 消除空档。
+        range_count = end_num - start_num + 1
+        src_count = len(candidates)
+        if range_count > src_count:
+            src_max_num = candidates[-1][0] if candidates else (start_num - 1)
+            shift = range_count - src_count  # 删除数量 = 向前偏移量
+            # 2a. 删除范围内编号 > 源最大编号 的多余文件
+            for num in range(src_max_num + 1, end_num + 1):
+                if num in target_by_num:
+                    try:
+                        os.remove(os.path.join(sub_path, target_by_num[num]))
+                        self._wlog(f"  删除多余: {target_by_num[num]}")
+                    except Exception as e:
+                        self._wlog(f"  × 删除失败: {target_by_num[num]}: {e}")
+                    del target_by_num[num]
+            # 2b. 范围之后(编号 > 终止编号)的文件向前重编号(从大到小避免覆盖)
+            for num in sorted((n for n in target_by_num if n > end_num), reverse=True):
+                old_name = target_by_num[num]
+                new_num = num - shift
+                m = _RANGE_NUM_RE.match(os.path.splitext(old_name)[0])
+                if not m:
+                    self._wlog(f"  × 重命名跳过(无法解析编号): {old_name}")
+                    continue
+                new_name = f"{m.group(1)}-{new_num:04d}{os.path.splitext(old_name)[1]}"
+                try:
+                    os.rename(os.path.join(sub_path, old_name),
+                              os.path.join(sub_path, new_name))
+                    self._wlog(f"  向前编号: {old_name} → {new_name}")
+                    del target_by_num[num]
+                    target_by_num[new_num] = new_name
+                except Exception as e:
+                    self._wlog(f"  × 重命名失败: {old_name}: {e}")
+
         if ok:
             self._write_directory_txt(sub_path, stems)
         if ok < len(candidates):
