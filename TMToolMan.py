@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.49"
+VERSION = "3.50"
 
 CHANGELOG = [
+    {
+        "version": "3.50",
+        "date": "2026-10-28",
+        "changes": [
+            "RapidOCR引擎下隐藏JPG转双层PDF的两个GPU勾选框(「使用GPU渲染」「OCR使用GPU处理」)——v3.49只是把GPU预检弹窗文案改友好, 用户勾选后仍会弹「GPU选项不适用」提示造成困惑(用户反馈)；现检测rapidocr_onnxruntime可用时直接hide两个GPU勾选框, 用户无从勾选, 从根上消除弹窗。老paddle回退环境仍显示GPU选项(那里真正可用)",
+        ],
+    },
     {
         "version": "3.49",
         "date": "2026-10-28",
@@ -7024,6 +7031,16 @@ class JpgToPdfPage(FunctionPage):
         form.addRow("选项:", self.generate_ofd_check)
         form.addRow("渲染:", self.gpu_render_check)
         form.addRow("OCR:", self.gpu_ocr_check)
+        # v3.50: RapidOCR引擎(优先)下GPU选项无意义(纯CPU推理且速度已很快),
+        # 直接隐藏两个GPU勾选框——用户不会再勾到, 也就不会再触发GPU预检弹窗
+        # (v3.49只是把弹窗文案改友好, 本次从根上消除困惑)。老paddle回退环境
+        # 仍显示(那里GPU选项真正可用)。
+        try:
+            import rapidocr_onnxruntime  # noqa: F401
+            self.gpu_render_check.hide()
+            self.gpu_ocr_check.hide()
+        except ImportError:
+            pass
         group.setLayout(form)
         self.layout.addWidget(group)
         

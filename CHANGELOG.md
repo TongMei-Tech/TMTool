@@ -4,6 +4,14 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.50（2026-10-28）
+
+RapidOCR 引擎下隐藏 JPG 转双层 PDF 的两个 GPU 勾选框（「使用GPU渲染」「OCR使用GPU处理」）：
+
+- v3.49 只是把 GPU 预检弹窗文案改友好，用户勾选后仍会弹「GPU 选项不适用」提示造成困惑（用户反馈）。
+- 现检测 `rapidocr_onnxruntime` 可用时直接 hide 两个 GPU 勾选框——用户无从勾选，从根上消除弹窗。
+- 老 paddle 回退环境仍显示 GPU 选项（那里真正可用）。
+
 ## TMToolMan v3.49（2026-10-28）
 
 修复 RapidOCR 版 exe 在有 GPU 设备上勾选 GPU 选项时弹出误导性提示「paddle检测异常: No module named 'paddle'」（用户反馈）：
