@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.50"
+VERSION = "3.51"
 
 CHANGELOG = [
+    {
+        "version": "3.51",
+        "date": "2026-10-28",
+        "changes": [
+            "RapidOCR推理线程调优(实测提速约32%)：onnxruntime缺省单线程，密集文本页(100+条)逐条rec推理是性能瓶颈；_init_ocr_locked构造RapidOCR时按CPU核数显式指定线程(≥4核: intra=4/inter=2, 2-3核: intra=2/inter=1)。实测同组真实档案扫描件平均6.61s/页→4.49s/页。附基准测试结论(20261028, 本机无N卡无法实测GPU)：旧PaddleOCR CPU平均1.45s/页仍快于RapidOCR调优后(4.49s)约3倍, 瓶颈为onnxruntime 1.19对rec模型的逐条推理慢于paddle的oneDNN(密集页0088-1: 12.35s vs 3.87s)；onnxruntime 1.22/1.31与PyQt5存在DLL冲突(1.19.2为安全上界)且升版不提速；喂图前缩小(det限边)收益仅约20%且损失小字识别, 未采用",
+        ],
+    },
     {
         "version": "3.50",
         "date": "2026-10-28",
@@ -1369,9 +1376,18 @@ class FileSplitWorker(QThread):
         try:
             from rapidocr_onnxruntime import RapidOCR
             self.log_signal.emit("  初始化 RapidOCR 引擎(ONNXRuntime)...")
-            self._ocr = RapidOCR()
+            # v3.51: 指定推理线程数——onnxruntime缺省单线程, 实测密集文本页
+            # (100+条)逐条rec推理慢4倍于paddle; intra=4/inter=2 实测提速约30%
+            _ncpu = os.cpu_count() or 4
+            _kw = {}
+            if _ncpu >= 4:
+                _kw = dict(intra_op_num_threads=4, inter_op_num_threads=2)
+            elif _ncpu >= 2:
+                _kw = dict(intra_op_num_threads=2, inter_op_num_threads=1)
+            self._ocr = RapidOCR(**_kw)
             self._ocr_engine = 'rapidocr'
-            self.log_signal.emit("  (OCR初始化成功: RapidOCR/ONNXRuntime)")
+            self.log_signal.emit(f"  (OCR初始化成功: RapidOCR/ONNXRuntime"
+                                 f"{', 线程' + str(_kw) if _kw else ''})")
             return self._ocr
         except ImportError:
             self._ocr_engine = 'paddle'
