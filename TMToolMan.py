@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.47"
+VERSION = "3.48"
 
 CHANGELOG = [
+    {
+        "version": "3.48",
+        "date": "2026-10-28",
+        "changes": [
+            "消除运行时FutureWarning「The fitz API is deprecated...Use import pymupdf instead」：PyMuPDF 1.24+/2.x弃用fitz别名(venv312装的是PyMuPDF 2.0)。①TMToolMan.py模块头部统一兼容导入：pymupdf优先、旧版(<=1.23)回退import fitz、缺库时fitz=None各功能按原逻辑回退；②全文6处函数内import fitz清理(JPG转PDF可用性检测/jpgs_to_pdf/双层PDF缺库回退/PdfToOfd两处/_pdf_has_text)，统一改用模块级fitz；③ofd_writer.py同步改双段式兼容导入。验证：-W error::FutureWarning模式下导入与fitz.open/new_page均无警告，新旧环境(.venv PyMuPDF与.venv312 PyMuPDF 2.0)双通过",
+        ],
+    },
     {
         "version": "3.47",
         "date": "2026-10-28",
@@ -349,6 +356,16 @@ try:
     import onnxruntime as _ort_early  # noqa: F401
 except Exception:
     _ort_early = None
+# v3.48: PyMuPDF 1.24+/2.x 弃用 fitz 别名(import fitz 触发 FutureWarning, 未来将移除),
+# 统一 pymupdf 优先导入; 旧版(<=1.23, 如Python3.8老环境)回退 fitz。缺库时 fitz=None,
+# 各功能按原逻辑回退(仅图像PDF/无OFD)。
+try:
+    import pymupdf as fitz  # noqa: F401
+except ImportError:
+    try:
+        import fitz  # noqa: F401
+    except ImportError:
+        fitz = None
 # 使用 PyQt5（Qt5）替代 PySide6（Qt6），以兼容 Python 3.8。
 # PyQt5 中信号为 pyqtSignal，通过别名统一为 Signal，保持下游写法不变。
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -6120,9 +6137,8 @@ class JpgToPdfWorker(QThread):
         # 检查 OFD 转换库是否可用（用于生成双层OFD）
         # 使用自建 ofd_writer（基于 PyMuPDF，生成图像层+文本层的双层OFD，
         # 无页数限制）。旧的 Spire.PDF 免费版只能转前 3 页，已弃用。
-        if self.generate_ofd:
+        if self.generate_ofd and fitz is not None:
             try:
-                import fitz  # noqa: F401  PyMuPDF
                 from ofd_writer import make_layered_ofd  # noqa: F401
                 self.ofd_available = True
             except ImportError:
@@ -6281,10 +6297,7 @@ class JpgToPdfWorker(QThread):
         时进程会被操作系统直接终止且无任何错误记录。仅在缺 fitz 时回退 PIL 合并。"""
         pdf_path = os.path.join(output_dir, pdf_filename + ".pdf")
         Image.MAX_IMAGE_PIXELS = None
-        try:
-            import fitz
-        except ImportError:
-            fitz = None
+        # v3.48: fitz 为模块级统一导入(pymupdf优先, 见文件头), 缺库时为 None
         if fitz is not None:
             doc = fitz.open()
             # 分段写盘: 与双层路径同款策略, 超大目录分段保存后合并, doc峰值恒定。
@@ -6540,9 +6553,7 @@ class JpgToPdfWorker(QThread):
             temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
             return temp_pdf_path, "仅图像PDF（OCR探测失败已降级, 周期复探中）"
 
-        try:
-            import fitz  # PyMuPDF
-        except ImportError:
+        if fitz is None:  # v3.48: 模块级统一导入, 缺库回退仅图像
             temp_pdf_path = self.jpgs_to_pdf(jpg_paths, output_dir, pdf_filename)
             return temp_pdf_path, "仅图像PDF（缺PyMuPDF）"
 
@@ -7282,11 +7293,13 @@ class PdfToOfdWorker(QThread):
         self._ofd_lock = threading.Lock()
 
         # 检查 OFD 转换库是否可用（ofd_writer，基于 PyMuPDF，生成双层OFD）
-        try:
-            import fitz  # noqa: F401
-            from ofd_writer import make_layered_ofd  # noqa: F401
-            self.ofd_available = True
-        except ImportError:
+        if fitz is not None:
+            try:
+                from ofd_writer import make_layered_ofd  # noqa: F401
+                self.ofd_available = True
+            except ImportError:
+                self.ofd_available = False
+        else:
             self.ofd_available = False
 
         # 复用「JPG转双层PDF」功能的处理流程：
@@ -7405,7 +7418,6 @@ class PdfToOfdWorker(QThread):
     def _pdf_has_text(self, pdf_path):
         """检测 PDF 是否已带可提取文本层（多数页含文本即视为带文本层）"""
         try:
-            import fitz
             doc = fitz.open(pdf_path)
             try:
                 pages_with_text = 0
@@ -7437,7 +7449,6 @@ class PdfToOfdWorker(QThread):
         tmp_dir = None
 
         try:
-            import fitz
             import tempfile
             import uuid
             from ofd_writer import make_layered_ofd

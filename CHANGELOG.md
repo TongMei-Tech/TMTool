@@ -4,6 +4,16 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.48（2026-10-28）
+
+消除运行时 FutureWarning「The fitz API is deprecated... Use import pymupdf instead」：
+
+- PyMuPDF 1.24+/2.x 弃用 fitz 别名（venv312 装的是 PyMuPDF 2.0）。
+- `TMToolMan.py` 模块头部统一兼容导入：`pymupdf` 优先、旧版（<=1.23）回退 `import fitz`、缺库时 `fitz=None` 各功能按原逻辑回退（仅图像 PDF/无 OFD）。
+- 全文 6 处函数内 `import fitz` 清理，统一改用模块级 `fitz`。
+- `ofd_writer.py` 同步改双段式兼容导入。
+- 验证：`-W error::FutureWarning` 模式下导入与 `fitz.open/new_page` 均无警告，新旧环境双通过。
+
 ## TMToolMan v3.47（2026-10-28）
 
 修复 RapidOCR 切换后 JPG 转双层 PDF 提示「OCR 仍处降级状态, 本目录仅生成图像PDF(无文本层)」无法生成双层 PDF：

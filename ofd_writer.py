@@ -23,7 +23,10 @@ PT_TO_MM = 0.3528  # PDF点(pt)转毫米(mm)
 def make_layered_ofd(pdf_path, ofd_path, dpi=150, jpeg_quality=80):
     """将双层 PDF 转换为双层 OFD。返回 (成功?, 页数, 错误信息)。"""
     try:
-        import fitz
+        try:
+            import pymupdf as fitz  # PyMuPDF >=1.24 (fitz别名已弃用)
+        except ImportError:
+            import fitz  # 旧版 PyMuPDF
         from PIL import Image
         from fontTools.ttLib import TTFont
     except ImportError as e:
