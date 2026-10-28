@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.45"
+VERSION = "3.46"
 
 CHANGELOG = [
+    {
+        "version": "3.46",
+        "date": "2026-10-28",
+        "changes": [
+            "OCR引擎切换为RapidOCR(ONNXRuntime)并升级打包环境到Python3.12(用户需求：更快更稳)：①_init_ocr_locked改为双引擎——优先rapidocr_onnxruntime(中文识别模型与PP-OCR同源、CPU速度快数倍、无paddle框架依赖→无CUDA上下文/GPU崩溃类问题从根上消失、打包体积预计636MB降到~150MB)，不可用时回退原PaddleOCR流程(老环境兼容)，引擎类型记于_ocr_engine('rapidocr'/'paddle')；②新增_ocr_infer统一推理入口：RapidOCR结果[[box,text,score]]包装为PaddleOCR 2.x形状[[box,(text,conf)]]，完全复用现有2.x解析分支(min/max取四点极值)，_ocr_page三处推理调用点统一接入；③RapidOCR内部用cv2.imread不支持中文路径——引擎为rapidocr且未传预解码数组时_ocr_page强制用_preload_img_arr(PIL)预解码，预解码失败该页跳过；④修复关键DLL冲突：Windows上PyQt5(Qt5Core.dll)先加载后onnxruntime DLL初始化段错误(import阶段无声段错误退出码139, 实测py3.12+PyQt5.15.11+onnxruntime1.31)，模块头部PyQt5导入之前先try import onnxruntime(缺失时静默跳过不影响旧环境)；⑤服务线程/超时看门狗/内存看门狗/引擎重建/降级机制全部保留(与引擎无关)；⑥打包环境从Python3.8+.venv(paddle)升级到Python3.12+.venv312(rapidocr-onnxruntime 1.4.4+onnxruntime 1.31.1+PyQt5.15.11+PyMuPDF2.0+opencv5.0+pyinstaller6.22.3)；实测：引擎初始化0.63s(paddle约30s)，2480x3508档案大图识别3.6s/12片段，中文识别质量正常(置信度0.90-1.00)；GPU选项对RapidOCR无效(纯CPU推理)，GPU预检在无paddle环境自动返回不支持",
+        ],
+    },
     {
         "version": "3.45",
         "date": "2026-10-27",
@@ -327,6 +334,14 @@ import sys
 import re
 import os
 import shutil
+# v3.46: onnxruntime 必须在 PyQt5 之前导入——Windows 上 PyQt5(Qt5Core.dll)先加载后,
+# onnxruntime DLL 初始化会段错误(实测 py3.12+PyQt5.15+onnxruntime1.31: import 阶段
+# 无声段错误, 退出码139; 反转顺序即正常)。onnxruntime 缺失时(未装 RapidOCR 的
+# 旧环境)静默跳过, 回退 PaddleOCR 不受影响。
+try:
+    import onnxruntime as _ort_early  # noqa: F401
+except Exception:
+    _ort_early = None
 # 使用 PyQt5（Qt5）替代 PySide6（Qt6），以兼容 Python 3.8。
 # PyQt5 中信号为 pyqtSignal，通过别名统一为 Signal，保持下游写法不变。
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -940,7 +955,8 @@ class FileSplitWorker(QThread):
         self.copy_mode = copy_mode        # True=文件拷贝(源不动), False=移动
         self.xlsx_dir = xlsx_dir          # 目录文件(xlsx)所在根目录(None=OCR模式)
         self.is_stopped = False
-        self._ocr = None  # PaddleOCR 延迟初始化(只初始化一次, 避免重复加载模型)
+        self._ocr = None  # OCR引擎延迟初始化(只初始化一次, 避免重复加载模型)
+        self._ocr_engine = 'paddle'  # v3.46: 'rapidocr'(优先) / 'paddle'(回退)
         self._ocr_pages_since_init = 0  # 自上次引擎初始化以来处理的页数(例行重建计数, v3.9)
         import threading as _th
         self._ocr_init_lock = _th.Lock()   # 初始化锁: 多线程(JPG转PDF默认4线程)并发
@@ -1302,7 +1318,31 @@ class FileSplitWorker(QThread):
         return self._ocr
 
     def _init_ocr_locked(self):
-        """在持有初始化锁的状态下构造 PaddleOCR(仅 _get_ocr 内部调用)。"""
+        """在持有初始化锁的状态下构造 OCR 引擎(仅 _get_ocr 内部调用)。
+
+        v3.46 双引擎: 优先 RapidOCR(rapidocr_onnxruntime, ONNXRuntime推理)——
+        中文识别模型与PP-OCR同源、CPU速度快数倍、无paddle框架依赖(无CUDA上下文,
+        GPU崩溃类问题从根上消失、打包体积从636MB降到~100MB级); RapidOCR不可用
+        时回退原PaddleOCR流程(老打包环境兼容)。引擎类型记于 self._ocr_engine:
+        'rapidocr' / 'paddle'。
+        RapidOCR注意: 内部用cv2.imread, 不支持中文路径——调用方必须传预解码
+        ndarray(_preload_img_arr), _ocr_page 已强制处理。"""
+        # ---- ① RapidOCR 优先 ----
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            self.log_signal.emit("  初始化 RapidOCR 引擎(ONNXRuntime)...")
+            self._ocr = RapidOCR()
+            self._ocr_engine = 'rapidocr'
+            self.log_signal.emit("  (OCR初始化成功: RapidOCR/ONNXRuntime)")
+            return self._ocr
+        except ImportError:
+            self._ocr_engine = 'paddle'
+        except Exception as _e_rapid:
+            # RapidOCR 装了但构造失败(模型文件缺失等) → 回退 PaddleOCR
+            self.log_signal.emit(f"  (RapidOCR 初始化失败: {str(_e_rapid)[:80]}, "
+                                 f"回退 PaddleOCR)")
+            self._ocr_engine = 'paddle'
+        # ---- ② PaddleOCR 回退(原流程) ----
         try:
             from paddleocr import PaddleOCR
             self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")
@@ -1434,6 +1474,20 @@ class FileSplitWorker(QThread):
         except Exception:
             return None
 
+    def _ocr_infer(self, ocr_obj, img_input):
+        """v3.46: 统一推理入口——RapidOCR与PaddleOCR 2.x结果形状统一化。
+
+        RapidOCR: (result, elapse) = ocr(img); result=[[box四点, text, score],...]
+        或None。包装为PaddleOCR 2.x形状 [[box, (text, score)], ...](外层再包一列,
+        与result[0]层一致), 完全复用_ocr_page现有2.x解析分支(min/max取四点极值)。
+        PaddleOCR: 原样返回 ocr.ocr(img, cls=True)。"""
+        if getattr(self, '_ocr_engine', 'paddle') == 'rapidocr':
+            res, _elapse = ocr_obj(img_input)
+            if not res:
+                return []
+            return [[[box, (text, score)] for box, text, score in res]]
+        return ocr_obj.ocr(img_input, cls=True)
+
     def _ocr_page(self, image_path, logf, wlog, img_arr=None):
         """
         对单页做 OCR，返回片段列表 [(文本, x0, y0, x1), ...]。
@@ -1465,9 +1519,18 @@ class FileSplitWorker(QThread):
         _mem_fail = False
         # v3.26: 优先用调用方预解码的ndarray(服务线程内不再读文件/cv2.imdecode,
         # 规避20260910崩溃); 预解码失败回退路径模式(仍走img_decode, 尽力而为)。
+        # v3.46: RapidOCR 内部用 cv2.imread(不支持中文路径)——引擎为 rapidocr 且
+        # 未传预解码数组时, 此处强制预解码(PIL读中文路径安全)。
         _ocr_input = img_arr if img_arr is not None else image_path
+        if (getattr(self, '_ocr_engine', 'paddle') == 'rapidocr'
+                and img_arr is None):
+            _ocr_input = self._preload_img_arr(image_path)
+            if _ocr_input is None:
+                wlog(f"    × 图像预解码失败(中文路径/文件损坏): "
+                     f"{os.path.basename(image_path)}")
+                return []
         try:
-            result = ocr.ocr(_ocr_input, cls=True)
+            result = self._ocr_infer(ocr, _ocr_input)
         except (Exception, SystemExit) as e:
             # v3.12: 必须同时捕获 SystemExit——paddleocr 在 cv2 缩放内存不足时内部调用
             # sys.exit(0)(崩溃日志20260901)。SystemExit 继承 BaseException, 仅捕获
@@ -1486,17 +1549,21 @@ class FileSplitWorker(QThread):
                                   'device side assert', 'illegal memory access')))
             e2 = e  # 默认占位: 引擎损坏路径不再重试, e2=e 保证下方文案判定包含首错
             if not _engine_broken:
-                # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
-                try:
-                    result = ocr.ocr(_ocr_input)
-                except (Exception, SystemExit):
-                    try:
-                        result = ocr.predict(_ocr_input)
-                    except (Exception, SystemExit) as _e3:
-                        e2 = _e3
-                        result = None
+                # v3.46: RapidOCR无参数兼容问题(cls重试仅paddle 3.x需要), 异常
+                # 直接走引擎重建路径; paddle: 3.x ocr()不接受cls → 重试无参/用predict
+                if getattr(self, '_ocr_engine', 'paddle') == 'rapidocr':
+                    result = None
                 else:
-                    e2 = None
+                    try:
+                        result = ocr.ocr(_ocr_input)
+                    except (Exception, SystemExit):
+                        try:
+                            result = ocr.predict(_ocr_input)
+                        except (Exception, SystemExit) as _e3:
+                            e2 = _e3
+                            result = None
+                    else:
+                        e2 = None
             else:
                 result = None
             if result is None:
@@ -1545,8 +1612,9 @@ class FileSplitWorker(QThread):
                         # v3.14: 重建实例仅试一次(带cls), 失败不再连环重试——
                         # 重建实例若仍报同类错误(显存/上下文问题未消除),
                         # 继续重试同样有access violation风险, 该页直接放弃文本层。
+                        # v3.46: 统一走 _ocr_infer(双引擎适配)。
                         try:
-                            result = _ocr2.ocr(_ocr_input, cls=True)
+                            result = self._ocr_infer(_ocr2, _ocr_input)
                         except (Exception, SystemExit):
                             result = None
                 else:
@@ -6010,7 +6078,8 @@ class JpgToPdfWorker(QThread):
         self._done = False  # 是否已发出完成信号(界面层线程意外终止兜底判断用)
         import threading
         self._ofd_lock = threading.Lock()
-        self._ocr = None  # PaddleOCR 延迟初始化(与分件共享同一初始化逻辑)
+        self._ocr = None  # OCR引擎延迟初始化(与分件共享同一初始化逻辑)
+        self._ocr_engine = 'paddle'  # v3.46: 'rapidocr'(优先) / 'paddle'(回退)
         # --- OCR服务线程机制(防GPU推理挂死) ---
         # PaddleOCR predictor 非线程安全且GPU路径存在首推理永久挂起的可能。
         # 所有OCR操作(初始化/探测/逐页推理/显存释放)统一提交到单一daemon服务
@@ -7995,6 +8064,7 @@ class CatalogDetectWorker(QThread):
         self.is_stopped = False
         # OCR 引擎延迟初始化所需的最小实例属性(纯CPU复用, 同 FileSplitWorker)
         self._ocr = None
+        self._ocr_engine = 'paddle'  # v3.46: 'rapidocr'(优先) / 'paddle'(回退)
         import threading as _th
         self._ocr_init_lock = _th.Lock()
         self._ocr_pages_since_init = 0

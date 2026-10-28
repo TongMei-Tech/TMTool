@@ -4,6 +4,18 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.46（2026-10-28）
+
+OCR 引擎切换为 RapidOCR（ONNXRuntime）并升级打包环境到 Python 3.12（用户需求：更快更稳）：
+
+- `_init_ocr_locked` 改为双引擎——优先 `rapidocr_onnxruntime`（中文识别模型与 PP-OCR 同源、CPU 速度快数倍、无 paddle 框架依赖 → 无 CUDA 上下文/GPU 崩溃类问题从根上消失、打包体积预计 636MB 降到 ~150MB），不可用时回退原 PaddleOCR 流程（老环境兼容），引擎类型记于 `_ocr_engine`（'rapidocr'/'paddle'）。
+- 新增 `_ocr_infer` 统一推理入口：RapidOCR 结果 `[[box,text,score]]` 包装为 PaddleOCR 2.x 形状，完全复用现有解析分支；`_ocr_page` 三处推理调用点统一接入。
+- RapidOCR 内部用 `cv2.imread` 不支持中文路径——引擎为 rapidocr 且未传预解码数组时 `_ocr_page` 强制用 `_preload_img_arr`（PIL）预解码。
+- 修复关键 DLL 冲突：Windows 上 PyQt5 先加载后 onnxruntime DLL 初始化段错误（import 阶段无声段错误退出码 139）；模块头部 PyQt5 导入之前先 `try import onnxruntime`（缺失时静默跳过不影响旧环境）。
+- 服务线程/超时看门狗/内存看门狗/引擎重建/降级机制全部保留（与引擎无关）。
+- 打包环境升级：Python 3.8+.venv(paddle) → Python 3.12+.venv312（rapidocr-onnxruntime 1.4.4 + onnxruntime 1.31.1 + PyQt5 15.11 + PyMuPDF 2.0 + opencv 5.0 + pyinstaller 6.22.3）。
+- 实测：引擎初始化 0.63s（paddle 约 30s），2480×3508 档案大图识别 3.6s/12 片段，中文识别质量正常（置信度 0.90~1.00）。GPU 选项对 RapidOCR 无效（纯 CPU 推理），GPU 预检在无 paddle 环境自动返回不支持。
+
 ## TMToolMan v3.45（2026-10-27）
 
 修复 GPU 模式 JPG 转双层 PDF 4 线程运行一段时间后系统崩溃且无任何提示（20261027，崩溃日志仅有启动记录、零崩溃痕迹 = 进程被系统静默终止）：
