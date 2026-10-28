@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.46"
+VERSION = "3.47"
 
 CHANGELOG = [
+    {
+        "version": "3.47",
+        "date": "2026-10-28",
+        "changes": [
+            "修复RapidOCR切换后JPG转双层PDF提示「OCR仍处降级状态, 本目录仅生成图像PDF(无文本层)」无法生成双层PDF的问题：根因是JpgToPdfWorker与CatalogDetectWorker缺少_ocr_infer方法别名——_ocr_page(v3.46起内部经self._ocr_infer调用双引擎统一推理入口)在两个Worker上执行时抛AttributeError, 被except(Exception)捕获后该页按无结果处理→首次推理探测识别0片段→_rebuild_ocr_cpu重探仍AttributeError→_ocr_broken=True降级仅图像PDF(分件FileSplitWorker自身不受影响, 其_ocr_infer天然存在)。修复：JpgToPdfWorker/CatalogDetectWorker别名区补_ocr_infer=FileSplitWorker._ocr_infer；验证：服务线程完整探测链路识别出1片段、探测通过",
+        ],
+    },
     {
         "version": "3.46",
         "date": "2026-10-28",
@@ -6345,6 +6352,7 @@ class JpgToPdfWorker(QThread):
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _preload_img_arr = FileSplitWorker._preload_img_arr   # v3.26: 预解码(崩溃修复)
     _ocr_page = FileSplitWorker._ocr_page
+    _ocr_infer = FileSplitWorker._ocr_infer  # v3.47: 双引擎统一推理入口(缺失致探测AttributeError降级单层)
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
     # OCR服务线程机制(定义在 FileSplitWorker 内, 两处共享同一实现):
     # 串行化推理+超时看门狗+GPU挂死后CPU重建, 依赖 __init__ 中的 _svc_* 属性
@@ -8045,6 +8053,7 @@ class CatalogDetectWorker(QThread):
 
     # 复用 FileSplitWorker 的 OCR 标题识别 + 表格线检测 + 中文路径读图
     _ocr_page = FileSplitWorker._ocr_page
+    _ocr_infer = FileSplitWorker._ocr_infer  # v3.47: 双引擎统一推理入口(缺失致AttributeError)
     _get_ocr = FileSplitWorker._get_ocr
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _preload_img_arr = FileSplitWorker._preload_img_arr

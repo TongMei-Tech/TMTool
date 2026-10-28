@@ -4,6 +4,14 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.47（2026-10-28）
+
+修复 RapidOCR 切换后 JPG 转双层 PDF 提示「OCR 仍处降级状态, 本目录仅生成图像PDF(无文本层)」无法生成双层 PDF：
+
+- 根因：`JpgToPdfWorker` 与 `CatalogDetectWorker` 缺少 `_ocr_infer` 方法别名——`_ocr_page`（v3.46 起内部经 `self._ocr_infer` 调用双引擎统一推理入口）在两个 Worker 上执行时抛 `AttributeError`，被 `except(Exception)` 捕获后该页按无结果处理 → 首次推理探测识别 0 片段 → CPU 重建重探仍 AttributeError → `_ocr_broken=True` 降级仅图像 PDF（分件 `FileSplitWorker` 自身不受影响）。
+- 修复：两个 Worker 的别名区补 `_ocr_infer = FileSplitWorker._ocr_infer`。
+- 验证：服务线程完整探测链路识别出 1 片段、探测通过。
+
 ## TMToolMan v3.46（2026-10-28）
 
 OCR 引擎切换为 RapidOCR（ONNXRuntime）并升级打包环境到 Python 3.12（用户需求：更快更稳）：
