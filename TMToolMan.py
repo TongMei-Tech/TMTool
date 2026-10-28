@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.53"
+VERSION = "3.54"
 
 CHANGELOG = [
+    {
+        "version": "3.54",
+        "date": "2026-10-28",
+        "changes": [
+            "JPG转双层PDF新增多子目录选择(用户需求)：①选择图片目录后弹出子目录勾选对话框(SubdirPickDialog)——列出该目录下含JPG的直接子目录(递归探测含图), 支持全选/全不选；勾选部分子目录则只处理所选(全选/不勾/取消=处理整个目录, 与旧版一致)；②JpgToPdfWorker新增selected_subdirs参数, collect_jpg_files在os.walk第一层剪枝到所选子目录(深层照常递归, 父目录根下散放JPG多选模式下不处理)；③输出目录缺省不变=所选子目录的上级目录(父目录)下PDF(与既有_auto_out_dir联动一致)；④execute日志显示已选子目录数, 功能说明文字补充",
+        ],
+    },
     {
         "version": "3.53",
         "date": "2026-10-28",
@@ -6075,12 +6082,14 @@ class JpgToPdfWorker(QThread):
     finished_signal = Signal(bool, str)
     
     def __init__(self, directory_path, output_dir=None, max_workers=4, resolution=100.0,
-                 generate_ofd=False, gpu_render=False, use_gpu_ocr=False, parent=None):
+                 generate_ofd=False, gpu_render=False, use_gpu_ocr=False,
+                 selected_subdirs=None, parent=None):
         super().__init__(parent)
         self.directory_path = directory_path
         self.output_dir = output_dir if output_dir else directory_path
         self.max_workers = max_workers
         self.resolution = resolution
+        self.selected_subdirs = selected_subdirs  # v3.54: 勾选的子目录名(None=全部)
         self.generate_ofd = generate_ofd  # 是否同时生成OFD文件
         self.gpu_render = gpu_render      # GPU渲染: 图像加速路径(MKL-DNN+无损直传)
         self.use_gpu_ocr = use_gpu_ocr    # OCR用GPU推理(不可用自动回退CPU)
@@ -6265,20 +6274,29 @@ class JpgToPdfWorker(QThread):
         self.finished_signal.emit(ok, msg)
     
     def collect_jpg_files(self):
-        """收集目录及子目录下所有JPG文件（按目录分组）"""
+        """收集目录及子目录下所有JPG文件（按目录分组）。
+        v3.54: selected_subdirs 非空时只收集这些直接子目录(深层目录照常递归),
+        父目录根下散放的JPG在多选模式下不处理。"""
         dir_jpgs_map = {}
-        
+        _sel = set(self.selected_subdirs) if self.selected_subdirs else None
+
         for root, dirs, files in os.walk(self.directory_path):
+            # v3.54: 多选子目录模式——只在第一层剪枝到所选子目录,
+            # 且父目录根下散放的JPG不处理(用户选择的是"这些子目录")
+            if _sel is not None and os.path.abspath(root) == \
+                    os.path.abspath(self.directory_path):
+                dirs[:] = [d for d in dirs if d in _sel]
+                continue  # 跳过父目录根自身的散放文件
             jpg_files = []
             for filename in files:
                 if filename.lower().endswith(('.jpg', '.jpeg')):
                     jpg_path = os.path.join(root, filename)
                     jpg_files.append(jpg_path)
-            
+
             if jpg_files:
                 jpg_files.sort()
                 dir_jpgs_map[root] = jpg_files
-        
+
         return dir_jpgs_map
     
     def jpgs_to_pdf(self, jpg_paths, output_dir, pdf_filename):
@@ -6951,6 +6969,95 @@ class JpgToPdfWorker(QThread):
             print(f"完成日志文件失败: {str(e)}")
 
 
+class SubdirPickDialog(QDialog):
+    """JPG转双层PDF-子目录勾选对话框(v3.54)。
+
+    选择图片目录后弹出: 列出该目录下含JPG文件的直接子目录(勾选框),
+    支持全选/全不选。确定后返回勾选的子目录名列表(相对父目录);
+    全部勾选或直接关闭返回 None(=全部处理, 与旧版行为一致)。
+    """
+
+    def __init__(self, parent_dir, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择要处理的子目录")
+        self.resize(520, 480)
+        self.parent_dir = parent_dir
+        self.result_dirs = None  # None=全部 / [子目录名, ...]
+
+        import os as _os
+        subdirs = []
+        try:
+            for name in sorted(_os.listdir(parent_dir), key=str.lower):
+                p = _os.path.join(parent_dir, name)
+                if not _os.path.isdir(p):
+                    continue
+                # 只列出含JPG的子目录(直接或深层), 无图的子目录无处理意义
+                has_jpg = False
+                for _r, _d, fs in _os.walk(p):
+                    if any(f.lower().endswith(('.jpg', '.jpeg')) for f in fs):
+                        has_jpg = True
+                        break
+                if has_jpg:
+                    subdirs.append(name)
+        except Exception:
+            subdirs = []
+
+        v = QVBoxLayout(self)
+        tip = QLabel(f"目录: {parent_dir}\n勾选要处理的子目录(不勾或全选=处理全部):")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #9AA7B8; font-size: 12px;")
+        v.addWidget(tip)
+
+        from PyQt5.QtWidgets import QScrollArea, QFrame
+        self._checks = []
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        iv = QVBoxLayout(inner)
+        iv.setContentsMargins(6, 6, 6, 6)
+        if subdirs:
+            for name in subdirs:
+                cb = QCheckBox(name)
+                cb.setChecked(True)
+                self._checks.append(cb)
+                iv.addWidget(cb)
+        else:
+            iv.addWidget(QLabel("(该目录下没有包含JPG文件的子目录,\n按确定将处理整个目录)"))
+        iv.addStretch()
+        scroll.setWidget(inner)
+        v.addWidget(scroll, 1)
+
+        row = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_all.setObjectName("BrowseBtn")
+        btn_all.clicked.connect(lambda: [c.setChecked(True) for c in self._checks])
+        btn_none = QPushButton("全不选")
+        btn_none.setObjectName("BrowseBtn")
+        btn_none.clicked.connect(lambda: [c.setChecked(False) for c in self._checks])
+        row.addWidget(btn_all)
+        row.addWidget(btn_none)
+        row.addStretch()
+        btn_ok = QPushButton("确定")
+        btn_ok.setObjectName("ActionBtn")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self._on_ok)
+        cancel = QPushButton("取消")
+        cancel.setObjectName("BrowseBtn")
+        cancel.clicked.connect(self.reject)
+        row.addWidget(btn_ok)
+        row.addWidget(cancel)
+        v.addLayout(row)
+
+    def _on_ok(self):
+        if not self._checks or all(c.isChecked() for c in self._checks):
+            self.result_dirs = None  # 全部(或无子目录)
+        elif not any(c.isChecked() for c in self._checks):
+            self.result_dirs = None  # 一个没勾 = 全部(与提示一致)
+        else:
+            self.result_dirs = [c.text() for c in self._checks if c.isChecked()]
+        self.accept()
+
+
 class JpgToPdfPage(FunctionPage):
     def __init__(self):
         super().__init__("JPG转双层PDF")
@@ -6967,6 +7074,7 @@ class JpgToPdfPage(FunctionPage):
         
         self.out_dir = QLineEdit()
         self._out_manual = False  # 用户是否手动改过输出目录(改过则不随源联动)
+        self._selected_subdirs = None  # v3.54: 勾选的子目录名(None=全部)
         btn_browse_out = QPushButton("选择文件夹")
         btn_browse_out.setObjectName("BrowseBtn")
         btn_browse_out.clicked.connect(self.browse_out_dir)
@@ -7014,6 +7122,8 @@ class JpgToPdfPage(FunctionPage):
         info_label = QLabel(
             "功能说明：\n"
             "• 扫描目录及子目录下所有JPG文件\n"
+            "• 选择图片目录时可勾选多个子目录, 只处理所选子目录\n"
+            "  (全选或不勾=处理整个目录; 输出仍为该目录下的PDF)\n"
             "• 每个目录的JPG合并为一个PDF\n"
             "• 使用内置本地OCR(与分件功能同款)生成双层PDF(可搜索/可选中)\n"
             "• PDF文件名与目录名相同\n"
@@ -7051,7 +7161,19 @@ class JpgToPdfPage(FunctionPage):
         d = QFileDialog.getExistingDirectory(self, "选择图片目录")
         if d:
             self.img_dir.setText(d)
+            # v3.54: 选择目录后弹出子目录勾选——可只处理其中若干子目录;
+            # 全选/不勾/取消 = 处理整个目录(与旧版一致)
+            self._selected_subdirs = None
+            try:
+                dlg = SubdirPickDialog(d, parent=self)
+                if dlg.exec_() == QDialog.Accepted and dlg.result_dirs:
+                    self._selected_subdirs = dlg.result_dirs
+                    self.log(f"已选择 {len(self._selected_subdirs)} 个子目录处理"
+                             f"(输出仍为该目录下的PDF)")
+            except Exception as e:
+                self.log(f"(子目录选择失败, 按整个目录处理: {e})")
             # 输出目录未手动改过时, 自动跟随源目录 → 源目录\PDF
+            # (多选子目录时"上级目录下的PDF"即 父目录\PDF, 联动逻辑一致)
             self._auto_out_dir()
 
     def _auto_out_dir(self):
@@ -7146,6 +7268,10 @@ class JpgToPdfPage(FunctionPage):
         self.log("="*50)
         self.log("开始处理...")
         self.log(f"图片目录: {d}")
+        _sel = getattr(self, '_selected_subdirs', None)
+        if _sel:
+            self.log(f"处理范围: 已选 {len(_sel)} 个子目录"
+                     f"(仅处理所选子目录)")
         self.log(f"输出目录: {out}")
         self.log(f"线程数: {self.thread_spin.value()}")
         self.log(f"PDF DPI: {self.dpi_spin.value()}")
@@ -7203,7 +7329,8 @@ class JpgToPdfPage(FunctionPage):
             resolution=resolution,
             generate_ofd=generate_ofd,
             gpu_render=self.gpu_render_check.isChecked(),
-            use_gpu_ocr=self.gpu_ocr_check.isChecked()
+            use_gpu_ocr=self.gpu_ocr_check.isChecked(),
+            selected_subdirs=getattr(self, '_selected_subdirs', None)
         )
         
         self.worker.log_signal.connect(self.log)

@@ -4,6 +4,15 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.54（2026-10-28）
+
+JPG 转双层 PDF 新增多子目录选择（用户需求）：
+
+- 选择图片目录后弹出子目录勾选对话框（`SubdirPickDialog`）——列出该目录下含 JPG 的直接子目录，支持全选/全不选；勾选部分子目录则只处理所选（全选/不勾/取消 = 处理整个目录，与旧版一致）。
+- `JpgToPdfWorker` 新增 `selected_subdirs` 参数，`collect_jpg_files` 在 walk 第一层剪枝到所选子目录（深层照常递归）。
+- 输出目录缺省不变 = 所选子目录的上级目录（父目录）下的 PDF。
+- execute 日志显示已选子目录数。
+
 ## TMToolMan v3.53（2026-10-28）
 
 项目环境整体升级到 Python 3.12（用户需求），OCR 引擎保持 PaddleOCR（v3.52 决策）：
