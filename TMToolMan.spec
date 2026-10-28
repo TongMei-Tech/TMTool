@@ -6,6 +6,11 @@ from PyInstaller.utils.hooks import collect_all
 datas = [('ofd_writer.py', '.'), ('ocr_models', 'ocr_models'), ('TMToolMan.ico', '.')]
 binaries = [('.venv312/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
 hiddenimports = ['cv2', 'fitz', 'fontTools', 'ofd_writer', 'paddleocr', 'paddle', 'imghdr', 'requests']
+# PyMuPDF 2.0: pymupdf.layout 子包 import 时自动加载布局模型资源
+# (pymupdf/layout/resources/onnx/*.yaml+onnx), 缺失则exe启动即FileNotFoundError
+# (v3.48发现v3.52回退时丢失, v3.53补回)
+tmp_ret = collect_all('pymupdf')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('cv2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('paddleocr')
