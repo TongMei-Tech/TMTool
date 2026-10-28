@@ -4,6 +4,14 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.49（2026-10-28）
+
+修复 RapidOCR 版 exe 在有 GPU 设备上勾选 GPU 选项时弹出误导性提示「paddle检测异常: No module named 'paddle'」（用户反馈）：
+
+- v3.46 切换 RapidOCR 后，GPU 预检 `_check_gpu_capability` 仍按 paddle 流程检测（新环境无 paddle 必然报 No module named）。
+- 修复：预检入口先检测 `rapidocr_onnxruntime` 可用性——可用则直接返回"当前 OCR 引擎为 RapidOCR(ONNXRuntime CPU 推理)，GPU 选项不适用——其 CPU 推理速度已很快"，不再检测 paddle（仅老 paddle 环境回退时走原流程）。
+- 预检弹窗文案区分两种情况：RapidOCR 引擎显示 information「GPU 选项不适用（CPU 为该引擎正常模式，无需操作）」；老环境才显示 warning「不支持 → 降级 CPU + 安装 paddlepaddle-gpu 指引」。
+
 ## TMToolMan v3.48（2026-10-28）
 
 消除运行时 FutureWarning「The fitz API is deprecated... Use import pymupdf instead」：

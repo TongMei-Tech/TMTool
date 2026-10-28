@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.48"
+VERSION = "3.49"
 
 CHANGELOG = [
+    {
+        "version": "3.49",
+        "date": "2026-10-28",
+        "changes": [
+            "修复RapidOCR版exe在有GPU设备上勾选GPU选项时弹出误导性提示「paddle检测异常: No module named paddle」(用户反馈)：v3.46切换RapidOCR后GPU预检_check_gpu_capability仍按paddle流程检测(新环境无paddle必然报No module named)。修复：①_check_gpu_capability入口先检测rapidocr_onnxruntime可用性——可用则直接返回「当前OCR引擎为RapidOCR(ONNXRuntime CPU推理), GPU选项不适用——其CPU推理速度已很快」，不再往下检测paddle(仅老paddle环境回退时走原检测流程)；②预检弹窗文案区分两种情况：RapidOCR引擎显示information「GPU选项不适用(CPU为该引擎正常模式, 无需操作)」，老环境才显示warning「不支持→降级CPU+安装paddlepaddle-gpu指引」",
+        ],
+    },
     {
         "version": "3.48",
         "date": "2026-10-28",
@@ -7082,11 +7089,23 @@ class JpgToPdfPage(FunctionPage):
     def _check_gpu_capability(self):
         """
         检测设备GPU加速能力。返回 (支持?, 原因说明)。
-        检测项(不影响paddle导入状态):
+        v3.49: RapidOCR引擎(优先)为纯CPU推理(onnxruntime), GPU选项不适用——
+        先检测RapidOCR可用性, 可用则直接返回不适用说明(不再往下检测paddle,
+        避免新环境弹出误导性的「No module named paddle」提示)。
+        RapidOCR不可用(回退PaddleOCR的老环境)时走原检测流程:
           1. NVIDIA驱动: nvcuda.dll 可加载(ctypes);
           2. GPU版paddle: paddle编译了CUDA(is_compiled_with_cuda);
           3. 可见GPU设备数 > 0。
         """
+        # 0. RapidOCR引擎优先: CPU推理, GPU选项不适用(其CPU速度已显著优于
+        #    旧版paddle GPU模式的实际吞吐——GPU快但崩溃重启损失大)
+        try:
+            import rapidocr_onnxruntime  # noqa: F401
+            return False, ("当前OCR引擎为RapidOCR(ONNXRuntime CPU推理), "
+                           "GPU选项不适用——其CPU推理速度已很快")
+        except ImportError:
+            pass
+
         # 1. NVIDIA驱动
         try:
             import ctypes
@@ -7160,21 +7179,32 @@ class JpgToPdfPage(FunctionPage):
         self.log(f"线程数: {self.thread_spin.value()}")
         self.log(f"PDF DPI: {self.dpi_spin.value()}")
 
-        # ---- GPU选项预检: 勾选GPU但设备不支持时, 开始前弹窗提示(将降级CPU) ----
+        # ---- GPU选项预检: 勾选GPU但不适用/不支持时, 开始前弹窗提示 ----
         want_gpu = (self.gpu_render_check.isChecked()
                     or self.gpu_ocr_check.isChecked())
         if want_gpu:
             gpu_ok, gpu_reason = self._check_gpu_capability()
             if not gpu_ok:
-                QMessageBox.warning(
-                    self, "GPU不可用提示",
-                    "您勾选了GPU选项, 但当前设备不支持GPU加速:\n"
-                    f"  {gpu_reason}\n\n"
-                    "系统将自动降级为CPU处理(处理结果完全相同, 仅速度较慢)。\n"
-                    "如需GPU加速, 请确认:\n"
-                    "  1. 机器配有NVIDIA显卡且已安装驱动;\n"
-                    "  2. 已安装GPU版paddlepaddle(paddlepaddle-gpu)。")
-                self.log(f"GPU预检: 不支持({gpu_reason}) → 降级CPU处理")
+                # v3.49: RapidOCR引擎下GPU选项"不适用"(纯CPU推理), 文案区别于
+                # 老paddle环境的"设备不支持"——避免误导用户去装paddlepaddle-gpu
+                _is_rapid = 'RapidOCR' in gpu_reason
+                if _is_rapid:
+                    QMessageBox.information(
+                        self, "GPU选项不适用",
+                        f"{gpu_reason}\n\n"
+                        "OCR将直接以CPU模式处理(此为该引擎的正常模式, "
+                        "无需任何操作; 处理结果完全相同)。")
+                else:
+                    QMessageBox.warning(
+                        self, "GPU不可用提示",
+                        "您勾选了GPU选项, 但当前设备不支持GPU加速:\n"
+                        f"  {gpu_reason}\n\n"
+                        "系统将自动降级为CPU处理(处理结果完全相同, 仅速度较慢)。\n"
+                        "如需GPU加速, 请确认:\n"
+                        "  1. 机器配有NVIDIA显卡且已安装驱动;\n"
+                        "  2. 已安装GPU版paddlepaddle(paddlepaddle-gpu)。")
+                self.log(f"GPU预检: {'不适用' if _is_rapid else '不支持'}"
+                         f"({gpu_reason}) → 按CPU处理")
 
         self.log("="*50)
         
