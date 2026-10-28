@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.56"
+VERSION = "3.57"
 
 CHANGELOG = [
+    {
+        "version": "3.57",
+        "date": "2026-10-29",
+        "changes": [
+            "修复多选子目录模式下PDF全部平铺到PDF根、未按子目录层级生成的问题(用户反馈)：多选时输出子目录改为镜像所选子目录的完整层级——所选子目录直接含图也归入该子目录名下(源 父\\A\\*.jpg→PDF\\A\\A.pdf; 源 父\\A\\B\\*.jpg→PDF\\A\\B.pdf; 深层 父\\A\\B\\C→PDF\\A\\B\\C.pdf)；全量处理(未多选)行为不变(rel去掉最后一级, 一层子目录平铺到PDF根)。五场景路径逻辑验证全部通过",
+        ],
+    },
     {
         "version": "3.56",
         "date": "2026-10-28",
@@ -6869,6 +6876,11 @@ class JpgToPdfWorker(QThread):
             # 例: 源 D:\扫描\J380-ZY·2021-Y-FGC-0001\J380-0001\*.jpg
             #     → 输出 PDF目录\J380-ZY·2021-Y-FGC-0001\J380-0001.pdf
             # (rel的父目录 = 源子目录相对源根路径去掉最后一级)
+            # v3.57: 多选子目录模式下, PDF按所选子目录的层级生成——
+            # 所选子目录直接含图时也归入该子目录名下(而非平铺到PDF根):
+            #   源 父\A\*.jpg           → PDF\A\A.pdf
+            #   源 父\A\B\*.jpg         → PDF\A\B.pdf
+            # 全量处理(未多选)行为不变: rel去掉最后一级(一层子目录平铺到PDF根)。
             out_subdir = self.output_dir
             src_root = getattr(self, 'directory_path', None)
             if src_root and jpg_files:
@@ -6876,7 +6888,11 @@ class JpgToPdfWorker(QThread):
                     src_dir = os.path.dirname(jpg_files[0])
                     rel = os.path.relpath(src_dir, src_root)
                     if rel and rel != '.':
-                        parent_rel = os.path.dirname(rel)
+                        if getattr(self, 'selected_subdirs', None):
+                            # 多选: 用rel的全部上级; 一层(rel无上级)则用rel自身
+                            parent_rel = os.path.dirname(rel) or rel
+                        else:
+                            parent_rel = os.path.dirname(rel)
                         if parent_rel:
                             out_subdir = os.path.join(self.output_dir, parent_rel)
                 except Exception:
