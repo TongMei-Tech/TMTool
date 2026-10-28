@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.55"
+VERSION = "3.56"
 
 CHANGELOG = [
+    {
+        "version": "3.56",
+        "date": "2026-10-28",
+        "changes": [
+            "修正「选择要处理的子目录」窗口文字颜色：v3.55误设为白色——该对话框为浅色背景(未套深色主题QSS的QDialog默认浅底), 白字反而看不清；改用深色文字#1F2328(悬停纯黑), 与浅色界面匹配",
+        ],
+    },
     {
         "version": "3.55",
         "date": "2026-10-28",
@@ -7026,15 +7033,15 @@ class SubdirPickDialog(QDialog):
             for name in subdirs:
                 cb = QCheckBox(name)
                 cb.setChecked(True)
-                # v3.55: 显式设置文字颜色——继承的全局样式下勾选框文字色与
-                # 滚动区背景接近, 目录名看不清
-                cb.setStyleSheet("QCheckBox { color: #E6EDF3; font-size: 13px; }"
-                                 "QCheckBox::hover { color: #FFFFFF; }")
+                # v3.55/v3.56: 显式设置文字颜色——对话框为浅色背景(未套深色主题
+                # QSS的QDialog默认浅底), 深色文字确保清楚显示
+                cb.setStyleSheet("QCheckBox { color: #1F2328; font-size: 13px; }"
+                                 "QCheckBox::hover { color: #000000; }")
                 self._checks.append(cb)
                 iv.addWidget(cb)
         else:
             _empty = QLabel("(该目录下没有包含JPG文件的子目录,\n按确定将处理整个目录)")
-            _empty.setStyleSheet("color: #E6EDF3; font-size: 13px;")
+            _empty.setStyleSheet("color: #1F2328; font-size: 13px;")
             iv.addWidget(_empty)
         iv.addStretch()
         scroll.setWidget(inner)
