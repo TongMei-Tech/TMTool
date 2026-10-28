@@ -5,6 +5,10 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('ofd_writer.py', '.'), ('ocr_models', 'ocr_models'), ('TMToolMan.ico', '.')]
 binaries = [('.venv312/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
+# v3.53b方案B: 内置全套CUDA运行库(cudnn8.9+cudart/cublas/cufft/curand/cusolver/cusparse cu12)
+# ——exe自带CUDA, GPU机器无需安装CUDA/cuDNN(仅需N卡+驱动)。DLL放exe顶层(_MEI根)
+# 供paddle运行时加载(修复用户机器cudnn64_8.dll未配置错误)。
+binaries += [('.venv312/Lib/site-packages/nvidia/*/bin/*.dll', '.')]
 hiddenimports = ['cv2', 'fitz', 'fontTools', 'ofd_writer', 'paddleocr', 'paddle', 'imghdr', 'requests']
 # PyMuPDF 2.0: pymupdf.layout 子包 import 时自动加载布局模型资源
 # (pymupdf/layout/resources/onnx/*.yaml+onnx), 缺失则exe启动即FileNotFoundError
@@ -48,24 +52,32 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# v3.57b: onedir模式——内置CUDA后依赖达3GB+, onefile单文件(3.6GB)bootloader
+# 解压不稳定且启动需数分钟; onedir输出为TMToolMan文件夹(整夹分发), 启动即用。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='TMToolMan',
     icon='TMToolMan.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='TMToolMan',
 )
