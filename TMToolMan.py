@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.52"
+VERSION = "3.53"
 
 CHANGELOG = [
+    {
+        "version": "3.53",
+        "date": "2026-10-28",
+        "changes": [
+            "项目环境整体升级到Python3.12(用户需求)，OCR引擎保持PaddleOCR(v3.52决策)：①打包/开发环境从Python3.8+.venv升级到Python3.12+.venv312(paddlepaddle-gpu 2.6.2官方支持3.8~3.12, paddleocr 2.7.0.3+numpy 1.26.4<2+opencv 4.11+PyQt5 15.11+PyMuPDF 2.0+pyinstaller 6.22.3)；②_init_ocr_locked注入imgaug空包stub——paddleocr的import链经ppocr/data/imaug/iaa_augment.py顶层from imgaug import augmenters as iaa(仅训练数据增强用, 推理不调用), 而imgaug 0.4.0与Python3.12/numpy不兼容无法安装, stub以__path__包结构+imgaug.augmenters子模块满足import链, 老环境(3.8装了真imgaug)不受影响；③补装six/rapidfuzz等paddleocr运行依赖(原--no-deps安装跳过imgaug时一并跳过)；④spec路径改指.venv312。验证：paddle 2.6.2 cuda编译True, PaddleOCR配置#1初始化成功, 真实档案图识别0.74s/11片段(略快于3.8环境), 中文识别正常；PyMuPDF 2.0与paddleocr声明的<1.21不兼容警告由v3.48的pymupdf优先导入兼容层覆盖",
+        ],
+    },
     {
         "version": "3.52",
         "date": "2026-10-28",
@@ -1364,7 +1371,22 @@ class FileSplitWorker(QThread):
         """在持有初始化锁的状态下构造 PaddleOCR(仅 _get_ocr 内部调用)。
         v3.52 回退: 撤销v3.46~v3.51的RapidOCR引擎切换, 恢复纯PaddleOCR流程
         (用户决策回退——实际档案大图场景RapidOCR CPU推理慢于paddle约3倍,
-        密集文本页rec逐条推理是瓶颈, 调优后仍慢2.5倍)。"""
+        密集文本页rec逐条推理是瓶颈, 调优后仍慢2.5倍)。
+        v3.53: Python3.12环境下paddleocr的import链依赖imgaug(ppocr/data/imaug/
+        iaa_augment.py顶层import, 仅训练数据增强用, 推理不调用), 而imgaug 0.4.0
+        与Python3.12/numpy不兼容无法安装——此处注入空模块stub满足import链。"""
+        try:
+            import imgaug  # noqa: F401  老环境(3.8)已装真imgaug, 直接用
+        except Exception:
+            # 空包stub: __path__声明为包 + augmenters子模块(iaa_augment.py顶层
+            # from imgaug import augmenters as iaa; 推理不调用其任何属性)
+            import types as _types
+            _m = _types.ModuleType('imgaug')
+            _m.__path__ = []
+            _aug = _types.ModuleType('imgaug.augmenters')
+            _m.augmenters = _aug
+            sys.modules.setdefault('imgaug', _m)
+            sys.modules.setdefault('imgaug.augmenters', _aug)
         try:
             from paddleocr import PaddleOCR
             self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")

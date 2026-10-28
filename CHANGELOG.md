@@ -4,6 +4,16 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.53（2026-10-28）
+
+项目环境整体升级到 Python 3.12（用户需求），OCR 引擎保持 PaddleOCR（v3.52 决策）：
+
+- 打包/开发环境从 Python 3.8+.venv 升级到 **Python 3.12+.venv312**（paddlepaddle-gpu 2.6.2 官方支持 3.8~3.12；paddleocr 2.7.0.3 + numpy 1.26.4(<2) + opencv 4.11 + PyQt5 15.11 + PyMuPDF 2.0 + pyinstaller 6.22.3）。
+- `_init_ocr_locked` 注入 imgaug 空包 stub——paddleocr 的 import 链引用 imgaug（仅训练数据增强用，推理不调用），而 imgaug 0.4.0 与 Python 3.12/numpy 不兼容无法安装；老环境（3.8 装了真 imgaug）不受影响。
+- 补装 six/rapidfuzz 等 paddleocr 运行依赖。
+- spec 路径改指 `.venv312`。
+- 验证：paddle 2.6.2 cuda 编译 True；PaddleOCR 配置#1 初始化成功；真实档案图识别 0.74s/11 片段（略快于 3.8 环境）；PyMuPDF 2.0 版本警告由 v3.48 兼容层覆盖。
+
 ## TMToolMan v3.52（2026-10-28）
 
 **回退 OCR 引擎到 PaddleOCR，撤销 v3.46~v3.51 的 RapidOCR 切换（用户决策）**：

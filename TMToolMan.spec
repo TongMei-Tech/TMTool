@@ -1,10 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-# v3.52 回退paddle版spec——Python 3.8 + .venv (paddlepaddle-gpu 2.6.2)
+# v3.53 Python3.12 + .venv312 (paddlepaddle-gpu 2.6.2, 项目环境统一3.12)
 # (v3.46~v3.51曾切换RapidOCR/Python3.12, 因档案大图CPU推理慢于paddle约3倍回退)
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('ofd_writer.py', '.'), ('ocr_models', 'ocr_models'), ('TMToolMan.ico', '.')]
-binaries = [('.venv/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
+binaries = [('.venv312/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
 hiddenimports = ['cv2', 'fitz', 'fontTools', 'ofd_writer', 'paddleocr', 'paddle', 'imghdr', 'requests']
 tmp_ret = collect_all('cv2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
