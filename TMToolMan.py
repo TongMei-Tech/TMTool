@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.51"
+VERSION = "3.52"
 
 CHANGELOG = [
+    {
+        "version": "3.52",
+        "date": "2026-10-28",
+        "changes": [
+            "回退OCR引擎到PaddleOCR，撤销v3.46~v3.51的RapidOCR切换(用户决策)：基准测试证实实际档案大图(2480x3508)场景RapidOCR CPU推理慢于PaddleOCR约2.8~3倍(密集文本页rec逐条推理是瓶颈: 27s vs 9.6s；同时段交替测试排除机器状态干扰)，完整链路小样本两者持平仅因paddle引擎初始化30s(RapidOCR 2s)摊不平，大批次(100+页/卷)时paddle吞吐优势2~2.5倍——生产速度优先故回退。撤销内容：①_init_ocr_locked的RapidOCR优先分支与线程调优, 恢复纯PaddleOCR流程；②删除_ocr_infer方法及JpgToPdfWorker/CatalogDetectWorker别名, _ocr_page三处调用恢复ocr.ocr(cls=True)原逻辑；③删除三处_ocr_engine属性与头部onnxruntime预导入；④_check_gpu_capability恢复纯paddle检测, 预检弹窗恢复原warning文案, GPU勾选框恢复显示。保留：v3.48 fitz弃用兼容修复(与引擎无关, pymupdf优先导入对新老PyMuPDF均兼容)；v3.45内存看门狗等全部稳定机制。打包环境回退: Python3.8+.venv(paddlepaddle-gpu 2.6.2), spec恢复paddle版(ocr_models+paddle libs)",
+        ],
+    },
     {
         "version": "3.51",
         "date": "2026-10-28",
@@ -369,14 +376,6 @@ import sys
 import re
 import os
 import shutil
-# v3.46: onnxruntime 必须在 PyQt5 之前导入——Windows 上 PyQt5(Qt5Core.dll)先加载后,
-# onnxruntime DLL 初始化会段错误(实测 py3.12+PyQt5.15+onnxruntime1.31: import 阶段
-# 无声段错误, 退出码139; 反转顺序即正常)。onnxruntime 缺失时(未装 RapidOCR 的
-# 旧环境)静默跳过, 回退 PaddleOCR 不受影响。
-try:
-    import onnxruntime as _ort_early  # noqa: F401
-except Exception:
-    _ort_early = None
 # v3.48: PyMuPDF 1.24+/2.x 弃用 fitz 别名(import fitz 触发 FutureWarning, 未来将移除),
 # 统一 pymupdf 优先导入; 旧版(<=1.23, 如Python3.8老环境)回退 fitz。缺库时 fitz=None,
 # 各功能按原逻辑回退(仅图像PDF/无OFD)。
@@ -1001,7 +1000,6 @@ class FileSplitWorker(QThread):
         self.xlsx_dir = xlsx_dir          # 目录文件(xlsx)所在根目录(None=OCR模式)
         self.is_stopped = False
         self._ocr = None  # OCR引擎延迟初始化(只初始化一次, 避免重复加载模型)
-        self._ocr_engine = 'paddle'  # v3.46: 'rapidocr'(优先) / 'paddle'(回退)
         self._ocr_pages_since_init = 0  # 自上次引擎初始化以来处理的页数(例行重建计数, v3.9)
         import threading as _th
         self._ocr_init_lock = _th.Lock()   # 初始化锁: 多线程(JPG转PDF默认4线程)并发
@@ -1363,40 +1361,10 @@ class FileSplitWorker(QThread):
         return self._ocr
 
     def _init_ocr_locked(self):
-        """在持有初始化锁的状态下构造 OCR 引擎(仅 _get_ocr 内部调用)。
-
-        v3.46 双引擎: 优先 RapidOCR(rapidocr_onnxruntime, ONNXRuntime推理)——
-        中文识别模型与PP-OCR同源、CPU速度快数倍、无paddle框架依赖(无CUDA上下文,
-        GPU崩溃类问题从根上消失、打包体积从636MB降到~100MB级); RapidOCR不可用
-        时回退原PaddleOCR流程(老打包环境兼容)。引擎类型记于 self._ocr_engine:
-        'rapidocr' / 'paddle'。
-        RapidOCR注意: 内部用cv2.imread, 不支持中文路径——调用方必须传预解码
-        ndarray(_preload_img_arr), _ocr_page 已强制处理。"""
-        # ---- ① RapidOCR 优先 ----
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            self.log_signal.emit("  初始化 RapidOCR 引擎(ONNXRuntime)...")
-            # v3.51: 指定推理线程数——onnxruntime缺省单线程, 实测密集文本页
-            # (100+条)逐条rec推理慢4倍于paddle; intra=4/inter=2 实测提速约30%
-            _ncpu = os.cpu_count() or 4
-            _kw = {}
-            if _ncpu >= 4:
-                _kw = dict(intra_op_num_threads=4, inter_op_num_threads=2)
-            elif _ncpu >= 2:
-                _kw = dict(intra_op_num_threads=2, inter_op_num_threads=1)
-            self._ocr = RapidOCR(**_kw)
-            self._ocr_engine = 'rapidocr'
-            self.log_signal.emit(f"  (OCR初始化成功: RapidOCR/ONNXRuntime"
-                                 f"{', 线程' + str(_kw) if _kw else ''})")
-            return self._ocr
-        except ImportError:
-            self._ocr_engine = 'paddle'
-        except Exception as _e_rapid:
-            # RapidOCR 装了但构造失败(模型文件缺失等) → 回退 PaddleOCR
-            self.log_signal.emit(f"  (RapidOCR 初始化失败: {str(_e_rapid)[:80]}, "
-                                 f"回退 PaddleOCR)")
-            self._ocr_engine = 'paddle'
-        # ---- ② PaddleOCR 回退(原流程) ----
+        """在持有初始化锁的状态下构造 PaddleOCR(仅 _get_ocr 内部调用)。
+        v3.52 回退: 撤销v3.46~v3.51的RapidOCR引擎切换, 恢复纯PaddleOCR流程
+        (用户决策回退——实际档案大图场景RapidOCR CPU推理慢于paddle约3倍,
+        密集文本页rec逐条推理是瓶颈, 调优后仍慢2.5倍)。"""
         try:
             from paddleocr import PaddleOCR
             self.log_signal.emit("  初始化 PaddleOCR 引擎(首次较慢)...")
@@ -1528,20 +1496,6 @@ class FileSplitWorker(QThread):
         except Exception:
             return None
 
-    def _ocr_infer(self, ocr_obj, img_input):
-        """v3.46: 统一推理入口——RapidOCR与PaddleOCR 2.x结果形状统一化。
-
-        RapidOCR: (result, elapse) = ocr(img); result=[[box四点, text, score],...]
-        或None。包装为PaddleOCR 2.x形状 [[box, (text, score)], ...](外层再包一列,
-        与result[0]层一致), 完全复用_ocr_page现有2.x解析分支(min/max取四点极值)。
-        PaddleOCR: 原样返回 ocr.ocr(img, cls=True)。"""
-        if getattr(self, '_ocr_engine', 'paddle') == 'rapidocr':
-            res, _elapse = ocr_obj(img_input)
-            if not res:
-                return []
-            return [[[box, (text, score)] for box, text, score in res]]
-        return ocr_obj.ocr(img_input, cls=True)
-
     def _ocr_page(self, image_path, logf, wlog, img_arr=None):
         """
         对单页做 OCR，返回片段列表 [(文本, x0, y0, x1), ...]。
@@ -1573,18 +1527,9 @@ class FileSplitWorker(QThread):
         _mem_fail = False
         # v3.26: 优先用调用方预解码的ndarray(服务线程内不再读文件/cv2.imdecode,
         # 规避20260910崩溃); 预解码失败回退路径模式(仍走img_decode, 尽力而为)。
-        # v3.46: RapidOCR 内部用 cv2.imread(不支持中文路径)——引擎为 rapidocr 且
-        # 未传预解码数组时, 此处强制预解码(PIL读中文路径安全)。
         _ocr_input = img_arr if img_arr is not None else image_path
-        if (getattr(self, '_ocr_engine', 'paddle') == 'rapidocr'
-                and img_arr is None):
-            _ocr_input = self._preload_img_arr(image_path)
-            if _ocr_input is None:
-                wlog(f"    × 图像预解码失败(中文路径/文件损坏): "
-                     f"{os.path.basename(image_path)}")
-                return []
         try:
-            result = self._ocr_infer(ocr, _ocr_input)
+            result = ocr.ocr(_ocr_input, cls=True)
         except (Exception, SystemExit) as e:
             # v3.12: 必须同时捕获 SystemExit——paddleocr 在 cv2 缩放内存不足时内部调用
             # sys.exit(0)(崩溃日志20260901)。SystemExit 继承 BaseException, 仅捕获
@@ -1603,21 +1548,17 @@ class FileSplitWorker(QThread):
                                   'device side assert', 'illegal memory access')))
             e2 = e  # 默认占位: 引擎损坏路径不再重试, e2=e 保证下方文案判定包含首错
             if not _engine_broken:
-                # v3.46: RapidOCR无参数兼容问题(cls重试仅paddle 3.x需要), 异常
-                # 直接走引擎重建路径; paddle: 3.x ocr()不接受cls → 重试无参/用predict
-                if getattr(self, '_ocr_engine', 'paddle') == 'rapidocr':
-                    result = None
-                else:
+                # 3.x: ocr() 不接受 cls 参数 → 重试无参/用 predict
+                try:
+                    result = ocr.ocr(_ocr_input)
+                except (Exception, SystemExit):
                     try:
-                        result = ocr.ocr(_ocr_input)
-                    except (Exception, SystemExit):
-                        try:
-                            result = ocr.predict(_ocr_input)
-                        except (Exception, SystemExit) as _e3:
-                            e2 = _e3
-                            result = None
-                    else:
-                        e2 = None
+                        result = ocr.predict(_ocr_input)
+                    except (Exception, SystemExit) as _e3:
+                        e2 = _e3
+                        result = None
+                else:
+                    e2 = None
             else:
                 result = None
             if result is None:
@@ -1666,9 +1607,8 @@ class FileSplitWorker(QThread):
                         # v3.14: 重建实例仅试一次(带cls), 失败不再连环重试——
                         # 重建实例若仍报同类错误(显存/上下文问题未消除),
                         # 继续重试同样有access violation风险, 该页直接放弃文本层。
-                        # v3.46: 统一走 _ocr_infer(双引擎适配)。
                         try:
-                            result = self._ocr_infer(_ocr2, _ocr_input)
+                            result = _ocr2.ocr(_ocr_input, cls=True)
                         except (Exception, SystemExit):
                             result = None
                 else:
@@ -6133,7 +6073,6 @@ class JpgToPdfWorker(QThread):
         import threading
         self._ofd_lock = threading.Lock()
         self._ocr = None  # OCR引擎延迟初始化(与分件共享同一初始化逻辑)
-        self._ocr_engine = 'paddle'  # v3.46: 'rapidocr'(优先) / 'paddle'(回退)
         # --- OCR服务线程机制(防GPU推理挂死) ---
         # PaddleOCR predictor 非线程安全且GPU路径存在首推理永久挂起的可能。
         # 所有OCR操作(初始化/探测/逐页推理/显存释放)统一提交到单一daemon服务
@@ -6395,7 +6334,6 @@ class JpgToPdfWorker(QThread):
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _preload_img_arr = FileSplitWorker._preload_img_arr   # v3.26: 预解码(崩溃修复)
     _ocr_page = FileSplitWorker._ocr_page
-    _ocr_infer = FileSplitWorker._ocr_infer  # v3.47: 双引擎统一推理入口(缺失致探测AttributeError降级单层)
     _imread_cn = staticmethod(FileSplitWorker._imread_cn)
     # OCR服务线程机制(定义在 FileSplitWorker 内, 两处共享同一实现):
     # 串行化推理+超时看门狗+GPU挂死后CPU重建, 依赖 __init__ 中的 _svc_* 属性
@@ -7047,16 +6985,6 @@ class JpgToPdfPage(FunctionPage):
         form.addRow("选项:", self.generate_ofd_check)
         form.addRow("渲染:", self.gpu_render_check)
         form.addRow("OCR:", self.gpu_ocr_check)
-        # v3.50: RapidOCR引擎(优先)下GPU选项无意义(纯CPU推理且速度已很快),
-        # 直接隐藏两个GPU勾选框——用户不会再勾到, 也就不会再触发GPU预检弹窗
-        # (v3.49只是把弹窗文案改友好, 本次从根上消除困惑)。老paddle回退环境
-        # 仍显示(那里GPU选项真正可用)。
-        try:
-            import rapidocr_onnxruntime  # noqa: F401
-            self.gpu_render_check.hide()
-            self.gpu_ocr_check.hide()
-        except ImportError:
-            pass
         group.setLayout(form)
         self.layout.addWidget(group)
         
@@ -7122,23 +7050,11 @@ class JpgToPdfPage(FunctionPage):
     def _check_gpu_capability(self):
         """
         检测设备GPU加速能力。返回 (支持?, 原因说明)。
-        v3.49: RapidOCR引擎(优先)为纯CPU推理(onnxruntime), GPU选项不适用——
-        先检测RapidOCR可用性, 可用则直接返回不适用说明(不再往下检测paddle,
-        避免新环境弹出误导性的「No module named paddle」提示)。
-        RapidOCR不可用(回退PaddleOCR的老环境)时走原检测流程:
+        检测项(不影响paddle导入状态):
           1. NVIDIA驱动: nvcuda.dll 可加载(ctypes);
           2. GPU版paddle: paddle编译了CUDA(is_compiled_with_cuda);
           3. 可见GPU设备数 > 0。
         """
-        # 0. RapidOCR引擎优先: CPU推理, GPU选项不适用(其CPU速度已显著优于
-        #    旧版paddle GPU模式的实际吞吐——GPU快但崩溃重启损失大)
-        try:
-            import rapidocr_onnxruntime  # noqa: F401
-            return False, ("当前OCR引擎为RapidOCR(ONNXRuntime CPU推理), "
-                           "GPU选项不适用——其CPU推理速度已很快")
-        except ImportError:
-            pass
-
         # 1. NVIDIA驱动
         try:
             import ctypes
@@ -7212,32 +7128,21 @@ class JpgToPdfPage(FunctionPage):
         self.log(f"线程数: {self.thread_spin.value()}")
         self.log(f"PDF DPI: {self.dpi_spin.value()}")
 
-        # ---- GPU选项预检: 勾选GPU但不适用/不支持时, 开始前弹窗提示 ----
+        # ---- GPU选项预检: 勾选GPU但设备不支持时, 开始前弹窗提示(将降级CPU) ----
         want_gpu = (self.gpu_render_check.isChecked()
                     or self.gpu_ocr_check.isChecked())
         if want_gpu:
             gpu_ok, gpu_reason = self._check_gpu_capability()
             if not gpu_ok:
-                # v3.49: RapidOCR引擎下GPU选项"不适用"(纯CPU推理), 文案区别于
-                # 老paddle环境的"设备不支持"——避免误导用户去装paddlepaddle-gpu
-                _is_rapid = 'RapidOCR' in gpu_reason
-                if _is_rapid:
-                    QMessageBox.information(
-                        self, "GPU选项不适用",
-                        f"{gpu_reason}\n\n"
-                        "OCR将直接以CPU模式处理(此为该引擎的正常模式, "
-                        "无需任何操作; 处理结果完全相同)。")
-                else:
-                    QMessageBox.warning(
-                        self, "GPU不可用提示",
-                        "您勾选了GPU选项, 但当前设备不支持GPU加速:\n"
-                        f"  {gpu_reason}\n\n"
-                        "系统将自动降级为CPU处理(处理结果完全相同, 仅速度较慢)。\n"
-                        "如需GPU加速, 请确认:\n"
-                        "  1. 机器配有NVIDIA显卡且已安装驱动;\n"
-                        "  2. 已安装GPU版paddlepaddle(paddlepaddle-gpu)。")
-                self.log(f"GPU预检: {'不适用' if _is_rapid else '不支持'}"
-                         f"({gpu_reason}) → 按CPU处理")
+                QMessageBox.warning(
+                    self, "GPU不可用提示",
+                    "您勾选了GPU选项, 但当前设备不支持GPU加速:\n"
+                    f"  {gpu_reason}\n\n"
+                    "系统将自动降级为CPU处理(处理结果完全相同, 仅速度较慢)。\n"
+                    "如需GPU加速, 请确认:\n"
+                    "  1. 机器配有NVIDIA显卡且已安装驱动;\n"
+                    "  2. 已安装GPU版paddlepaddle(paddlepaddle-gpu)。")
+                self.log(f"GPU预检: 不支持({gpu_reason}) → 降级CPU处理")
 
         self.log("="*50)
         
@@ -8127,7 +8032,6 @@ class CatalogDetectWorker(QThread):
 
     # 复用 FileSplitWorker 的 OCR 标题识别 + 表格线检测 + 中文路径读图
     _ocr_page = FileSplitWorker._ocr_page
-    _ocr_infer = FileSplitWorker._ocr_infer  # v3.47: 双引擎统一推理入口(缺失致AttributeError)
     _get_ocr = FileSplitWorker._get_ocr
     _init_ocr_locked = FileSplitWorker._init_ocr_locked
     _preload_img_arr = FileSplitWorker._preload_img_arr
@@ -8147,7 +8051,6 @@ class CatalogDetectWorker(QThread):
         self.is_stopped = False
         # OCR 引擎延迟初始化所需的最小实例属性(纯CPU复用, 同 FileSplitWorker)
         self._ocr = None
-        self._ocr_engine = 'paddle'  # v3.46: 'rapidocr'(优先) / 'paddle'(回退)
         import threading as _th
         self._ocr_init_lock = _th.Lock()
         self._ocr_pages_since_init = 0

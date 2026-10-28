@@ -4,6 +4,19 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.52（2026-10-28）
+
+**回退 OCR 引擎到 PaddleOCR，撤销 v3.46~v3.51 的 RapidOCR 切换（用户决策）**：
+
+- 基准测试证实实际档案大图（2480×3508）场景 RapidOCR CPU 推理慢于 PaddleOCR 约 2.8~3 倍（密集文本页 rec 逐条推理是瓶颈：27s vs 9.6s；同时段交替测试排除机器状态干扰）；完整链路小样本两者持平仅因 paddle 引擎初始化 30s（RapidOCR 2s）摊不平，大批次（100+ 页/卷）时 paddle 吞吐优势 2~2.5 倍——生产速度优先故回退。
+- 撤销：`_init_ocr_locked` 的 RapidOCR 分支与线程调优；`_ocr_infer` 方法及两 Worker 别名；`_ocr_engine` 属性与头部 onnxruntime 预导入；`_check_gpu_capability` 的 RapidOCR 检测与弹窗分支；GPU 勾选框隐藏。
+- 保留：v3.48 fitz 弃用兼容修复（与引擎无关）；v3.45 内存看门狗等全部稳定机制。
+- 打包环境回退：Python 3.8 + `.venv`（paddlepaddle-gpu 2.6.2），spec 恢复 paddle 版（ocr_models + paddle libs）。
+
+## TMToolMan v3.51（2026-10-28）
+
+RapidOCR 推理线程调优（实测提速约 32%，6.61s→4.49s/页）：onnxruntime 缺省单线程，按 CPU 核数显式指定 intra/inter 线程数。附完整基准测试结论（后被 v3.52 回退，数据保留于程序内 CHANGELOG）。
+
 ## TMToolMan v3.50（2026-10-28）
 
 RapidOCR 引擎下隐藏 JPG 转双层 PDF 的两个 GPU 勾选框（「使用GPU渲染」「OCR使用GPU处理」）：

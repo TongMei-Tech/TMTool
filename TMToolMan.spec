@@ -1,20 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
-# v3.48: 新打包spec——Python 3.12 + .venv312 (RapidOCR/ONNXRuntime, 无paddle)
-# 相比旧版(.venv/paddle, 636MB): 无paddle框架依赖, 产物预计~150MB级。
+# v3.52 回退paddle版spec——Python 3.8 + .venv (paddlepaddle-gpu 2.6.2)
+# (v3.46~v3.51曾切换RapidOCR/Python3.12, 因档案大图CPU推理慢于paddle约3倍回退)
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('ofd_writer.py', '.'), ('TMToolMan.ico', '.')]
-binaries = []
-hiddenimports = ['cv2', 'ofd_writer', 'rapidocr_onnxruntime',
-                 'onnxruntime', 'fontTools']
-# RapidOCR: 模型(onnx)与config.yaml都在包内, collect_all 确保完整带入
-# (已知坑: 只按依赖分析会漏 config.yaml → 运行时找不到配置)
-tmp_ret = collect_all('rapidocr_onnxruntime')
+datas = [('ofd_writer.py', '.'), ('ocr_models', 'ocr_models'), ('TMToolMan.ico', '.')]
+binaries = [('.venv/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
+hiddenimports = ['cv2', 'fitz', 'fontTools', 'ofd_writer', 'paddleocr', 'paddle', 'imghdr', 'requests']
+tmp_ret = collect_all('cv2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-# PyMuPDF 2.0: pymupdf.layout 子包 import 时自动加载布局模型资源
-# (pymupdf/layout/resources/onnx/*.yaml+onnx), 不带会在目标机报
-# FileNotFoundError: ..._MEIxxxx\pymupdf\layout/resources/onnx/layout_rf....yaml
-tmp_ret = collect_all('pymupdf')
+tmp_ret = collect_all('paddleocr')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('Cython')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('pyclipper')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('skimage')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('scipy')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('imgaug')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('shapely')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('lmdb')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('astor')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
@@ -27,9 +37,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tkinter', 'test', 'easyofd',
-              # 未随 venv312 安装的包, 显式排除加速分析
-              'paddle', 'paddleocr'],
+    excludes=['tkinter', 'test', 'easyofd'],
     noarchive=False,
     optimize=0,
 )
