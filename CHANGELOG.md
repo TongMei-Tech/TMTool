@@ -4,6 +4,15 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.58（2026-10-29）
+
+修复有 N 卡的生产机 GPU 模式 OCR 报「the third-party dynamic library (cublas64_11.dll) that paddle depends on is not configured correctly」→ 降级 CPU 的问题（用户反馈）：
+
+- 根因：v3.53b 方案 B 打包内置的 CUDA 运行库取自 nvidia-*-cu12 系（cublas64_12.dll 等），而 paddlepaddle-gpu 2.6.2 为 **CUDA 11.8 构建**，运行时按 cu118 命名找 cublas64_11.dll / cudart64_110.dll / nvrtc64_112_0.dll / cufft64_10.dll / cusparse64_11.dll——cu12 的 DLL 文件名不同，放 exe 目录再多也加载不到；cuDNN 恰因 cu11/cu12 两代同名（cudnn64_8.dll）而"看似已修复"，cublas/cusparse 等命名规则随 CUDA 大版本变化随即暴露。
+- 修复：`.venv312` 补装 cu11 系运行库 pip 包（nvidia-cublas-cu11 11.11.3.6 / cuda-runtime-cu11 11.8.89 / cuda-nvrtc-cu11 / cufft-cu11 / curand-cu11 / cusolver-cu11 / cusparse-cu11，与 cu12 包同名目录共存于 `nvidia/*/bin`），spec 的 `binaries` 通配 `nvidia/*/bin/*.dll` 自动把 cu11 DLL 一并打进 exe——**exe 同时携带 cu11（paddle cu118 实际所需）与 cu12（cuDNN 8.9 来源）两套运行库**，GPU 机器免装 CUDA/cuDNN 的部署方式不变，打包体积 +约 1GB。
+- 验证：开发机（无 N 卡）以 `os.add_dll_directory` 模拟 paddle 加载方式，cu11 命名的 11 个关键 DLL 全部加载成功；GPU 端到端推理需在 N 卡生产机部署后确认（预期日志"OCR使用GPU推理"且不再出现 cublas 报错）。
+- 同步：主窗口初始尺寸调整为 1900×1220。
+
 ## TMToolMan v3.57（2026-10-29）
 
 修复多选子目录模式下 PDF 全部平铺到 PDF 根、未按子目录层级生成的问题（用户反馈）：

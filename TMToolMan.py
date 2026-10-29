@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.57"
+VERSION = "3.58"
 
 CHANGELOG = [
+    {
+        "version": "3.58",
+        "date": "2026-10-29",
+        "changes": [
+            "修复有N卡的生产机GPU模式OCR报「the third-party dynamic library (cublas64_118.dll;cublas64_11.dll) that paddle depends on is not configured correct→OCR引擎异常并重建→GPU→CPU重建(后续全部CPU推理)」的问题(用户反馈)：根因——v3.53b方案B打包内置的CUDA运行库取自nvidia-*-cu12系(cublas64_12.dll等)，而paddlepaddle-gpu 2.6.2为CUDA 11.8构建，运行时按cu118命名找cublas64_11.dll/cudart64_110.dll/nvrtc64_112_0.dll/cufft64_10.dll/cusparse64_11.dll——cu12的DLL文件名不同(cublas64_12.dll)，放exe目录再多也加载不到；cudnn恰因cu11/cu12两代同名(cudnn64_8.dll)而'看似已修复'(v3.53b注释)，cublas/cusparse等命名规则随CUDA大版本变化随即暴露。修复：.venv312补装cu11系运行库pip包(nvidia-cublas-cu11 11.11.3.6/cuda-runtime-cu11 11.8.89/cuda-nvrtc-cu11 11.8.89/cufft-cu11/curand-cu11/cusolver-cu11/cusparse-cu11，与cu12包同名目录共存于nvidia/*/bin，curand64_10.dll与cusolver64_11.dll被pip覆盖为cu11版——仅paddle消费这些DLL无影响)，spec的binaries通配nvidia/*/bin/*.dll无需改动即自动把cu11 DLL一并打进exe顶层，重新打包后exe同时携带cu11(paddle cu118实际所需)与cu12(cudnn 8.9来源)两套运行库，GPU机器免装CUDA/cuDNN的统一部署方式不变。验证：开发机(无N卡)模拟paddle加载方式——os.add_dll_directory(nvidia/*/bin)后ctypes.WinDLL逐个加载cublas64_11/cublasLt64_11/cudart64_110/nvrtc64_112_0/cufft64_10/curand64_10/cusolver64_11/cusparse64_11/cudnn64_8/cudnn_cnn_infer64_8/cudnn_ops_infer64_8共11个DLL全部成功(名称解析即生产机失败环节)；paddle 2.6.2导入正常is_compiled_with_cuda()=True；GPU端到端推理需在N卡生产机重新打包部署后确认(预期日志'OCR使用GPU推理'且不再出现cublas报错)",
+        ],
+    },
     {
         "version": "3.57",
         "date": "2026-10-29",
@@ -11240,7 +11247,7 @@ class MainWindow(QMainWindow):
         # 无边框窗口(HomeAplication 风格); 初始尺寸1354x851(实测定位),
         # 各功能页控件在该尺寸下无需拖动滚动条即可完整可见
         self.setWindowFlags(Qt.FramelessWindowHint)
-        self.resize(1600, 900)
+        self.resize(1900, 1220)
         self.setMinimumSize(1000, 640)
         self.setStyleSheet(TechStyle.QSS)
 

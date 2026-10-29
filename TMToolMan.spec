@@ -8,6 +8,10 @@ binaries = [('.venv312/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
 # v3.53b方案B: 内置全套CUDA运行库(cudnn8.9+cudart/cublas/cufft/curand/cusolver/cusparse cu12)
 # ——exe自带CUDA, GPU机器无需安装CUDA/cuDNN(仅需N卡+驱动)。DLL放exe顶层(_MEI根)
 # 供paddle运行时加载(修复用户机器cudnn64_8.dll未配置错误)。
+# v3.58: nvidia/*/bin 现同时含 cu11 与 cu12 两套(nvidia-*-cu11 系 pip 包已补装)——
+# paddle 2.6.2 为 cu118 构建, 实际加载 cublas64_11/cudart64_110/nvrtc64_112_0/
+# cufft64_10/cusparse64_11 等 cu11 命名; cuDNN 8.9 来自 cu12 包(cudnn64_8.dll 两代同名)。
+# 通配一把抓, 无需区分, 打包体积相应 +约1GB。
 binaries += [('.venv312/Lib/site-packages/nvidia/*/bin/*.dll', '.')]
 hiddenimports = ['cv2', 'fitz', 'fontTools', 'ofd_writer', 'paddleocr', 'paddle', 'imghdr', 'requests']
 # PyMuPDF 2.0: pymupdf.layout 子包 import 时自动加载布局模型资源
