@@ -4,6 +4,13 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.59（2026-10-30）
+
+修复客户机（未装 VC++ Redistributable）运行报「Failed to execute script 'pyi_rth_multiprocessing'...No module named '_socket'」无法启动（用户反馈）：
+
+- 根因：Python 3.12 的标准库 C 扩展（`_socket.pyd` 等）与 `python312.dll` 依赖 `vcruntime140.dll`/`msvcp140.dll`，PyInstaller onedir 默认未把这些 VC 运行库收集到 `_internal` 顶层；开发机因系统已装 VC 运行库而正常，客户机则加载 `_socket.pyd` 失败（被包装成 No module named _socket）。
+- 修复：spec 显式把 PyQt5 自带的 `vcruntime140*`/`msvcp140*`（含 `_1`/`_2` 变体）5 个 DLL 打入 `_internal` 顶层——打包产物脱离 VC 运行库依赖。
+
 ## TMToolMan v3.58（2026-10-29）
 
 修复有 N 卡的生产机 GPU 模式 OCR 报「the third-party dynamic library (cublas64_11.dll) that paddle depends on is not configured correctly」→ 降级 CPU 的问题（用户反馈）：

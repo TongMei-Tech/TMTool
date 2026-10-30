@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.58"
+VERSION = "3.59"
 
 CHANGELOG = [
+    {
+        "version": "3.59",
+        "date": "2026-10-30",
+        "changes": [
+            "修复客户机(未装VC++ Redistributable)运行报「Failed to execute script pyi_rth_multiprocessing...No module named _socket」无法启动的问题(用户反馈)：根因——Python3.12的标准库C扩展(_socket.pyd等)与python312.dll依赖vcruntime140.dll/msvcp140.dll, PyInstaller onedir默认未把这些VC运行库收集到_internal顶层, 开发机因系统已装VC运行库而正常、客户机则加载_socket.pyd失败(被包装成No module named _socket)。修复：spec显式把PyQt5自带的vcruntime140*/msvcp140*(含_1/_2变体)5个DLL打入_internal顶层, 打包产物即脱离VC运行库依赖",
+        ],
+    },
     {
         "version": "3.58",
         "date": "2026-10-29",
@@ -11247,7 +11254,7 @@ class MainWindow(QMainWindow):
         # 无边框窗口(HomeAplication 风格); 初始尺寸1354x851(实测定位),
         # 各功能页控件在该尺寸下无需拖动滚动条即可完整可见
         self.setWindowFlags(Qt.FramelessWindowHint)
-        self.resize(1900, 1220)
+        self.resize(1600, 900)
         self.setMinimumSize(1000, 640)
         self.setStyleSheet(TechStyle.QSS)
 
