@@ -4,6 +4,15 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.60（2026-10-30）
+
+OCR 初始化在打包环境（frozen）检测到内置模型缺失时快速失败并给出明确修复指引（20261030 客户机案例）：
+
+- 案例现象：客户机拷贝 8.8GB 包时 `_internal\ocr_models` 文件夹被遗漏 → paddleocr 前 3 个本地模型配置报 NotFound → 落入配置#4~7 联网下载 paddle 内置模型 → 内网客户机每个配置等超时且报 bcebos 域名解析错误，报错内容严重误导排查方向。
+- 修复：frozen 且 `has_models=False` 时直接 `raise FileNotFoundError` 并日志提示「请检查 `_internal\ocr_models`（det/rec/cls 各 3 文件），从完整包补拷该文件夹」。
+- 源码开发环境（脚本目录常无 ocr_models，依赖 paddle 缓存）保持原回退逻辑不受影响（验证通过）。
+- 客户机当时即时的解法：从完整包补拷 `_internal\ocr_models` 文件夹（约 10MB）。
+
 ## TMToolMan v3.59（2026-10-30）
 
 修复客户机（未装 VC++ Redistributable）运行报「Failed to execute script 'pyi_rth_multiprocessing'...No module named '_socket'」无法启动（用户反馈）：

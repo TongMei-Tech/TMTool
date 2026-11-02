@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.59"
+VERSION = "3.60"
 
 CHANGELOG = [
+    {
+        "version": "3.60",
+        "date": "2026-10-30",
+        "changes": [
+            "OCR初始化在打包环境(frozen)检测到内置模型缺失时快速失败并给出明确修复指引(20261030客户机案例：拷贝8.8GB包时_internal\\ocr_models文件夹被遗漏, paddleocr前3个本地模型配置报NotFound后落入配置#4~7联网下载paddle内置模型——内网客户机每个配置等超时且报bcebos域名解析错误, 报错内容严重误导排查方向)。现frozen且has_models=False时直接raise FileNotFoundError并日志提示「请检查_internal\\ocr_models(det/rec/cls各3文件), 从完整包补拷该文件夹」；源码开发环境(脚本目录常无ocr_models, 依赖paddle缓存)保持原回退逻辑不受影响(验证通过)",
+        ],
+    },
     {
         "version": "3.59",
         "date": "2026-10-30",
@@ -1476,6 +1483,19 @@ class FileSplitWorker(QThread):
             # GPU版paddle在无卡机上必须显式 use_gpu=False 覆盖默认,
             # 否则即使不带参数也按GPU初始化而报错。
             _gpu_kw = dict(use_gpu=True) if (want_gpu and gpu_ok) else dict(use_gpu=False)
+            # v3.60: 打包环境(frozen)本地模型缺失时跳过全部「联网下载内置模型」
+            # 配置——内网客户机每个配置要等超时且报域名解析错误(误导排查方向,
+            # 20261030客户机ocr_models拷贝丢失案例: 配置#4~7全报bcebos解析失败)。
+            # 直接快速失败并给出明确修复指引。源码开发环境(脚本目录常无
+            # ocr_models, 依赖paddle缓存/联网)保持原回退逻辑不受影响。
+            if not has_models and getattr(sys, 'frozen', False):
+                self.log_signal.emit(
+                    "  × 内置OCR模型缺失: " + m_det + " 等不存在。"
+                    "打包/分发不完整——请检查程序目录 _internal\\ocr_models\\"
+                    "(det/rec/cls 各含 inference.pdmodel 等3文件), "
+                    "从完整包补拷该文件夹后重试")
+                raise FileNotFoundError(
+                    f"内置OCR模型缺失: {m_det} (请补拷 _internal/ocr_models 文件夹)")
             configs = []
             if has_models:
                 configs += [
