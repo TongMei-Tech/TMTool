@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.61"
+VERSION = "3.62"
 
 CHANGELOG = [
+    {
+        "version": "3.62",
+        "date": "2026-11-04",
+        "changes": [
+            "修复客户机(程序装在中文目录如D:\\同美图像处理工具\\)OCR初始化永远失败的问题(20261104客户机日志+本机复现证实)：根因——paddle的C++层文件加载不支持非ASCII路径, 中文安装目录下报「Cannot open file ...ocr_models\\det\\inference.pdmodel」(日志[:80]截断显示为...det/, 此前v3.60/v3.61误判为模型缺失/损坏——实为文件完好但paddle打不开)；修复：模型基路径含非ASCII时自动复制三组模型(约16MB)到%TEMP%\\tmtool_ocr_models纯英文目录(已存在且大小一致跳过复制)再加载, 日志提示「检测到中文安装路径, 模型已复制到临时英文目录加载」。本机复现验证：模拟中文_MEIPASS下配置#1命中+识别11片段。另修复：JpgToPdfWorker补齐_MEM_WD_INTERVAL/_MEM_WD_COOLDOWN_RECYCLE/_MEM_WD_COOLDOWN_CACHE三个看门狗类属性别名(方法别名不携带类属性, 同v3.47 _ocr_infer教训)——客户机GPU模式MemWatchdog线程AttributeError崩溃日志暴露(本机无N卡从不启动看门狗线程故v3.45以来未发现, 看门狗在GPU模式一直失效)",
+        ],
+    },
     {
         "version": "3.61",
         "date": "2026-11-02",
@@ -1466,6 +1473,41 @@ class FileSplitWorker(QThread):
                         return False
                 return True
             has_models = all(_model_ok(m) for m in (m_det, m_rec, m_cls))
+            # v3.62: paddle的C++层文件加载不支持非ASCII路径(中文安装目录)——
+            # 客户机装在 D:\同美图像处理工具\ 下时 paddle 报
+            # 「Cannot open file ...ocr_models\det\inference.pdmodel」(本机复现
+            # 证实: 纯英文路径正常/中文路径同错)。模型路径含非ASCII时复制到
+            # %TEMP% 下纯ASCII目录再加载(模型共约16MB, 已存在且大小一致则跳过)。
+            try:
+                _nonascii = any(ord(c) > 127 for c in base)
+            except Exception:
+                _nonascii = False
+            if _nonascii and has_models:
+                import tempfile as _tf
+                _dst = os.path.join(_tf.gettempdir(), 'tmtool_ocr_models')
+                _ok = False
+                try:
+                    _names = {}
+                    for sub in ('det', 'rec', 'cls'):
+                        os.makedirs(os.path.join(_dst, sub), exist_ok=True)
+                        for fn in ('inference.pdmodel', 'inference.pdiparams',
+                                   'inference.pdiparams.info'):
+                            _s = os.path.join(base, 'ocr_models', sub, fn)
+                            _d = os.path.join(_dst, sub, fn)
+                            _names[_d] = os.path.getsize(_s)
+                            if (not os.path.isfile(_d)
+                                    or os.path.getsize(_d) != _names[_d]):
+                                shutil.copy2(_s, _d)
+                    _ok = all(_model_ok(os.path.join(_dst, s))
+                              for s in ('det', 'rec', 'cls'))
+                except Exception:
+                    _ok = False
+                if _ok:
+                    m_det = os.path.join(_dst, 'det')
+                    m_rec = os.path.join(_dst, 'rec')
+                    m_cls = os.path.join(_dst, 'cls')
+                    self.log_signal.emit("  (检测到中文安装路径, 模型已复制到"
+                                         "临时英文目录加载)")
             import warnings as _w
             _w.filterwarnings('ignore', message='.*use_angle_cls.*deprecated.*')
             # GPU OCR 请求检测: 双条件——paddle编译了CUDA支持 且 检测到GPU设备。
@@ -6463,6 +6505,12 @@ class JpgToPdfWorker(QThread):
     _run_monitor_line = FileSplitWorker._run_monitor_line
     _run_monitor_loop = FileSplitWorker._run_monitor_loop
     _mem_watchdog_loop = FileSplitWorker._mem_watchdog_loop  # v3.45: 内存看门狗
+    # v3.62: 补齐看门狗类属性别名(方法别名不携带类属性, 同v3.47 _ocr_infer教训)——
+    # 客户机GPU模式实测MemWatchdog线程AttributeError: no attribute '_MEM_WD_INTERVAL'
+    # (本机无N卡从不启动看门狗线程故未暴露, 看门狗自v3.45起在GPU模式下一直失效)
+    _MEM_WD_INTERVAL = FileSplitWorker._MEM_WD_INTERVAL
+    _MEM_WD_COOLDOWN_RECYCLE = FileSplitWorker._MEM_WD_COOLDOWN_RECYCLE
+    _MEM_WD_COOLDOWN_CACHE = FileSplitWorker._MEM_WD_COOLDOWN_CACHE
     _start_run_monitor = FileSplitWorker._start_run_monitor
     _stop_run_monitor = FileSplitWorker._stop_run_monitor
     # 类属性别名: 例行重建阈值(方法别名不携带类属性, 须显式同步)

@@ -4,6 +4,15 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.62（2026-11-04）
+
+修复客户机（程序装在中文目录如 `D:\同美图像处理工具\`）OCR 初始化永远失败的问题（20261104 客户机日志 + 本机复现证实）：
+
+- 根因：paddle 的 C++ 层文件加载**不支持非 ASCII 路径**——中文安装目录下报「Cannot open file ...ocr_models\det\inference.pdmodel」（日志 `[:80]` 截断显示为 `...det`，此前 v3.60/v3.61 误判为模型缺失/损坏，实为文件完好但 paddle 打不开）。
+- 修复：模型基路径含非 ASCII 时自动复制三组模型（约 16MB）到 `%TEMP%\tmtool_ocr_models` 纯英文目录（已存在且大小一致跳过复制）再加载，日志提示「检测到中文安装路径， 模型已复制到临时英文目录加载」。
+- 本机复现验证：模拟中文 `_MEIPASS` 下配置#1 命中 + 识别 11 片段。
+- 另修复：`JpgToPdfWorker` 补齐 `_MEM_WD_INTERVAL`/`_MEM_WD_COOLDOWN_RECYCLE`/`_MEM_WD_COOLDOWN_CACHE` 三个看门狗类属性别名（方法别名不携带类属性，同 v3.47 `_ocr_infer` 教训）——客户机 GPU 模式 MemWatchdog 线程 AttributeError 崩溃日志暴露（本机无 N 卡从不启动看门狗线程故 v3.45 以来未发现，看门狗在 GPU 模式一直失效）。
+
 ## TMToolMan v3.61（2026-11-02）
 
 OCR 内置模型完整性校验升级为「存在 + 大小门槛」（v3.60 只查存在）：
