@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.60"
+VERSION = "3.61"
 
 CHANGELOG = [
+    {
+        "version": "3.61",
+        "date": "2026-11-02",
+        "changes": [
+            "OCR内置模型完整性校验升级为「存在+大小门槛」(v3.60只查存在)：20261102客户机案例——rar传输损坏使模型文件0字节/截断, os.path.exists仍True → v3.60快速报错不触发 → paddle实际打开报NotFound(路径被[:80]截断显示为det/infer, 进一步误导) → 落入联网下载在内网机报域名解析错误。现_model_ok校验三个文件(pdmodel/pdiparams各≥100KB, pdiparams.info≥1字节), 损坏/截断即触发v3.60的「内置OCR模型缺失, 请补拷_internal\\ocr_models」明确报错。单元验证: 0字节损坏拒绝/完整文件通过",
+        ],
+    },
     {
         "version": "3.60",
         "date": "2026-10-30",
@@ -1444,8 +1451,21 @@ class FileSplitWorker(QThread):
             m_det = os.path.join(base, 'ocr_models', 'det')
             m_rec = os.path.join(base, 'ocr_models', 'rec')
             m_cls = os.path.join(base, 'ocr_models', 'cls')
-            has_models = all(os.path.exists(os.path.join(m, 'inference.pdmodel'))
-                             for m in (m_det, m_rec, m_cls))
+            # v3.61: 模型完整性校验升级——不仅存在, pdiparams(参数, MB级)还须非空。
+            # 案例(20261102客户机): rar传输损坏使模型文件0字节/截断, exists()仍True
+            # → v3.60快速报错不触发 → paddle实际打开报NotFound → 落入联网下载误导。
+            def _model_ok(m):
+                for fn, min_sz in (('inference.pdmodel', 100_000),
+                                   ('inference.pdiparams', 100_000),
+                                   ('inference.pdiparams.info', 1)):
+                    p = os.path.join(m, fn)
+                    try:
+                        if not os.path.isfile(p) or os.path.getsize(p) < min_sz:
+                            return False
+                    except OSError:
+                        return False
+                return True
+            has_models = all(_model_ok(m) for m in (m_det, m_rec, m_cls))
             import warnings as _w
             _w.filterwarnings('ignore', message='.*use_angle_cls.*deprecated.*')
             # GPU OCR 请求检测: 双条件——paddle编译了CUDA支持 且 检测到GPU设备。

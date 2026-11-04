@@ -4,6 +4,14 @@
 
 各程序内部完整变更记录见 `TMToolMan.py` / `BlackCircleRemover.py` 文件头部 `CHANGELOG`（本文件为仓库级汇总）。
 
+## TMToolMan v3.61（2026-11-02）
+
+OCR 内置模型完整性校验升级为「存在 + 大小门槛」（v3.60 只查存在）：
+
+- 案例（20261102 客户机）：rar 传输损坏使模型文件 0 字节/截断，`os.path.exists` 仍 True → v3.60 快速报错不触发 → paddle 实际打开报 NotFound（路径被 `[:80]` 截断显示为 `det/infer`，进一步误导）→ 落入联网下载在内网机报域名解析错误。
+- 修复：`_model_ok` 校验三个文件（pdmodel/pdiparams 各 ≥100KB，pdiparams.info ≥1 字节），损坏/截断即触发 v3.60 的「内置OCR模型缺失，请补拷 `_internal\ocr_models`」明确报错。
+- 单元验证：0 字节损坏拒绝 / 完整文件通过。
+
 ## TMToolMan v3.60（2026-10-30）
 
 OCR 初始化在打包环境（frozen）检测到内置模型缺失时快速失败并给出明确修复指引（20261030 客户机案例）：
