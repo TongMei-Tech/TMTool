@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.62"
+VERSION = "3.63"
 
 CHANGELOG = [
+    {
+        "version": "3.63",
+        "date": "2026-11-05",
+        "changes": [
+            "文件批量替换新增「插入式后移」(用户需求20261105)：源文件数>标注范围文件数时, 现逻辑直接同编号覆盖会把目标原有文件冲掉——改为复制前先把目标中编号大于终止编号的文件整体后移(源数-范围数)位腾出位置(例: 源0002/0003两个、范围仅0002时, 目标0003起每个+1: 0003→0004、0004→0005, 然后0002原位替换、源0003落入空位, 目标原文件全部保留)。后移从大到小改名避免目标名占用冲突; num_map映射复用v3.44机制同步Directory.txt; 与v3.43「删多余+前移」分支(range>src)互斥共存。端到端验证: 源2个/范围1个/目标4个(0002~0005)场景, 结果0002=新、0003=新、0004~0006=原0003~0005全保留",
+        ],
+    },
     {
         "version": "3.62",
         "date": "2026-11-04",
@@ -8101,6 +8108,36 @@ class FileBatchReplaceWorker(QThread):
             if n is not None:
                 target_by_num.setdefault(n, fname)
 
+        # v3.63 插入式后移: 源文件数 > 标注范围文件数时, 目标中编号大于终止编号的
+        # 文件整体后移(源数-范围数)位, 腾出位置再复制源文件——避免源的新增文件
+        # 直接覆盖目标原有文件(用户需求20261105: 源0002/0003两个、范围仅0002时,
+        # 目标0003起每个+1: 0003→0004、0004→0005, 然后0002原位替换、0003落空位)。
+        num_map = None  # {旧编号: 新编号} → Directory.txt 同步(v3.44机制复用)
+        range_count = end_num - start_num + 1
+        src_count = len(candidates)
+        if src_count > range_count:
+            shift = src_count - range_count
+            num_map = {}
+            # 从大到小改名避免目标名已被占用(0003→0004先于0004→0005)
+            for num in sorted((n for n in target_by_num if n > end_num),
+                              reverse=True):
+                old_name = target_by_num[num]
+                new_num = num + shift
+                m = _RANGE_NUM_RE.match(os.path.splitext(old_name)[0])
+                if not m:
+                    self._wlog(f"  × 后移跳过(无法解析编号): {old_name}")
+                    continue
+                new_name = f"{m.group(1)}-{new_num:04d}{os.path.splitext(old_name)[1]}"
+                try:
+                    os.rename(os.path.join(sub_path, old_name),
+                              os.path.join(sub_path, new_name))
+                    self._wlog(f"  后移让位: {old_name} → {new_name}")
+                    num_map[num] = new_num
+                    del target_by_num[num]
+                    target_by_num[new_num] = new_name
+                except Exception as e:
+                    self._wlog(f"  × 后移失败: {old_name}: {e}")
+
         ok = 0
         stems = []
         for src_num, src_path in candidates:
@@ -8121,8 +8158,8 @@ class FileBatchReplaceWorker(QThread):
 
         # v3.43: 标注范围数量 > 源文件数量 → 删除范围内源文件未覆盖的多余文件,
         # 并将范围之后(编号>终止编号)的文件向前重编号, 消除空档。
-        range_count = end_num - start_num + 1
-        src_count = len(candidates)
+        # (v3.63的后移在复制前已处理 src>range 场景; 此处仅 range>src 场景,
+        #  num_map 沿用复制前初始化的变量——本分支覆盖写入前移映射。)
         if range_count > src_count:
             src_max_num = candidates[-1][0] if candidates else (start_num - 1)
             shift = range_count - src_count  # 删除数量 = 向前偏移量
@@ -8154,8 +8191,6 @@ class FileBatchReplaceWorker(QThread):
                     target_by_num[new_num] = new_name
                 except Exception as e:
                     self._wlog(f"  × 重命名失败: {old_name}: {e}")
-        else:
-            num_map = None
 
         if ok:
             self._write_directory_txt(sub_path, stems, num_map)
