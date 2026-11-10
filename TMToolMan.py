@@ -12,9 +12,16 @@
 # 规则：每次修改本文件后，必须递增 VERSION(修订号+1，功能大变时递增次版本号)，
 # 并在 CHANGELOG 头部追加一条记录(版本号/日期/修改内容)；窗口标题会显示当前版本号，
 # 便于区分不同打包版本。
-VERSION = "3.63"
+VERSION = "3.64"
 
 CHANGELOG = [
+    {
+        "version": "3.64",
+        "date": "2026-11-10",
+        "changes": [
+            "「按目录名批量重命名」新增改名前格式化检查+排序(用户需求)：扫描导出的文件名编号常不足4位(如 1.jpg/10.jpg/2.jpg), 直接按字典序排序会导致 10 排在 2 前、多文件改名时序号错乱。新增 _normalize_and_sort：对每个目录下的文件先做格式化检查——纯数字文件名不足4位补0到4位(1→0001, 10→0010, 138→0138; 目标名已存在则跳过避免覆盖), 再按文件名排序(补0后字典序=数值序), 然后走原「单文件=目录名/多文件=目录名-0001起」改名逻辑。冒烟验证: 1/10/2/138 → 0001/0002/0010/0138 顺序正确",
+        ],
+    },
     {
         "version": "3.63",
         "date": "2026-11-05",
@@ -3579,6 +3586,33 @@ class FileRenameWorker(QThread):
         self.only_new = only_new      # 只修改新增: 与记录(原路径+原文件名)相同的跳过
         self.is_stopped = False
     
+    def _normalize_and_sort(self, subdir, files):
+        """v3.64: 改名前格式化检查 + 排序。
+        对目录下文件名(纯数字)不足4位的补0到4位(如 1.jpg→0001.jpg, 10.jpg→0010.jpg),
+        避免扫描导出编号不一时 1/10/2 这类字典序错乱导致改名顺序错误;
+        格式化完成后按文件名排序(补0后纯数字文件名字典序=数值序)。
+        返回 (格式化+排序后的文件列表)。"""
+        normalized = []
+        for f in files:
+            stem = f.stem
+            if stem.isdigit() and len(stem) < 4:
+                new_f = subdir / (stem.zfill(4) + f.suffix)
+                if new_f != f:
+                    try:
+                        if new_f.exists():
+                            # 目标名已存在(如同时有 1.jpg 和 0001.jpg), 跳过补0避免覆盖
+                            self.log_signal.emit(
+                                f"  × 格式化跳过(目标名已存在): '{f.name}' → '{new_f.name}'")
+                        else:
+                            f.rename(new_f)
+                            self.log_signal.emit(f"  格式化补0: '{f.name}' → '{new_f.name}'")
+                            f = new_f
+                    except Exception as e:
+                        self.log_signal.emit(f"  × 格式化补0失败 {f.name}: {e}")
+            normalized.append(f)
+        normalized.sort(key=lambda f: f.name.lower())
+        return normalized
+
     def run(self):
         try:
             results = {
@@ -3622,7 +3656,10 @@ class FileRenameWorker(QThread):
                 if not files:
                     processed_dirs += 1
                     continue
-                
+
+                # v3.64: 改名前格式化检查(编号不足4位补0) + 按文件名排序
+                files = self._normalize_and_sort(subdir, files)
+
                 # 获取目录名（不含路径）
                 dir_name = subdir.name
                 
