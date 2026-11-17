@@ -3,8 +3,17 @@
 # (v3.46~v3.51曾切换RapidOCR/Python3.12, 因档案大图CPU推理慢于paddle约3倍回退)
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('ofd_writer.py', '.'), ('ocr_models', 'ocr_models'), ('TMToolMan.ico', '.')]
+datas = [('ofd_writer.py', '.'), ('ocr_models', 'ocr_models'), ('TMToolMan.ico', '.'),
+         # v3.65: 档案馆标准目录内置模板(科技档案案卷级/文件级)
+         ('档案馆科技档案案卷级目录.xlsx', '.'),
+         ('档案馆科技档案文件级目录.xlsx', '.')]
 binaries = [('.venv312/Lib/site-packages/paddle/libs/*.dll', 'paddle/libs')]
+# v3.59: 显式打入VC++运行库(vcruntime140/msvcp140及_1/_2变体)——Python3.12的
+# 标准库C扩展(_socket.pyd等)与python312.dll依赖这些DLL, PyInstaller onedir默认
+# 未收集到_internal顶层, 客户机(未装VC Redistributable)加载_socket.pyd时报
+# 'No module named _socket'。取自PyQt5自带的Qt5/bin副本。
+binaries += [('.venv312/Lib/site-packages/PyQt5/Qt5/bin/vcruntime140*.dll', '.'),
+             ('.venv312/Lib/site-packages/PyQt5/Qt5/bin/msvcp140*.dll', '.')]
 # v3.53b方案B: 内置全套CUDA运行库(cudnn8.9+cudart/cublas/cufft/curand/cusolver/cusparse cu12)
 # ——exe自带CUDA, GPU机器无需安装CUDA/cuDNN(仅需N卡+驱动)。DLL放exe顶层(_MEI根)
 # 供paddle运行时加载(修复用户机器cudnn64_8.dll未配置错误)。
